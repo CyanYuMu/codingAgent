@@ -1,0 +1,26 @@
+# 阶段1 配置模板
+# 复制到 ~/.einoclaw-build/config.yaml 并填入你的模型配置。
+# 任选一个 provider 即可，也可以配多个用 /model 切换（切换功能阶段10再加）。
+
+models:
+  # 示例：DeepSeek
+  - model_name: deepseek-chat
+    model_id: deepseek-chat
+    provider: deepseek
+    api_key: sk-xxxxxxxxxxxxxxxx
+    base_url: https://api.deepseek.com
+
+  # 示例：通义千问（阿里云百炼）
+  # - model_name: qwen-plus
+  #   model_id: qwen-plus
+  #   provider: qwen
+  #   api_key: sk-xxxxxxxxxxxxxxxx
+  #   base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
+  #   enable_thinking: false
+
+  # 示例：OpenAI 兼容接口
+  # - model_name: gpt-4o
+  #   model_id: gpt-4o
+  #   provider: openai
+  #   api_key: sk-xxxxxxxxxxxxxxxx
+  #   base_url: https://api.openai.com/v1
