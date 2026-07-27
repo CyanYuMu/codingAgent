@@ -1,0 +1,15 @@
+# 配置文件（含 API Key，切勿提交）
+config.yaml
+
+# 会话事件日志
+sessions/
+
+# 编译产物
+/einoclaw-build
+/einoclaw-build.exe
+
+# 日志
+*.log
+
+# macOS
+.DS_Store
