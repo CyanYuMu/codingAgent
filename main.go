@@ -162,10 +162,12 @@ func OnAgentEvents(ctx context.Context, tc *adk.TurnContext[chatItem, adk.Agenti
 				break // EOF 或 CancelError：结束本流
 			}
 			for _, b := range chunk.ContentBlocks {
+				if b.Reasoning != nil && b.Reasoning.Text != "" {
+					program.Send(aiThinkingChunkMsg{text: b.Reasoning.Text})
+				}
 				if b.AssistantGenText != nil && b.AssistantGenText.Text != "" {
 					program.Send(aiTextChunkMsg{text: b.AssistantGenText.Text})
 				}
-				// Reasoning(思考过程)的展示留到阶段4
 			}
 		}
 	}
