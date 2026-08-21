@@ -25,8 +25,9 @@ type Usage struct {
 }
 
 // ToolCallDelta 流式下工具调用的一个增量片段。
-// 一次完整工具调用 = 多个同 CallID 的 delta 按序拼接（P1 循环负责合并）。
+// 一次完整工具调用 = 多个同 Index 的 delta 按序拼接（Index = StreamingMeta.Index，分块分组键）。
 type ToolCallDelta struct {
+	Index  int // StreamingMeta.Index：流式分块的分组键（CallID 只在首个分块出现）
 	CallID string
 	Name   string
 	Args   string

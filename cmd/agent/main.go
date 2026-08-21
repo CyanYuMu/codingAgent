@@ -3,11 +3,17 @@ package main
 import (
 	"context"
 	"log"
+	"os"
 
 	tea "charm.land/bubbletea/v2"
 
 	"einoclaw-build/internal/agent"
+	agentctx "einoclaw-build/internal/context"
 	"einoclaw-build/internal/model"
+	"einoclaw-build/internal/permission"
+	"einoclaw-build/internal/runtime"
+	"einoclaw-build/internal/session"
+	"einoclaw-build/internal/tool"
 	"einoclaw-build/internal/tui"
 )
 
@@ -28,9 +34,40 @@ func main() {
 		log.Fatal(err)
 	}
 
-	ag := agent.New("codeclaw", agentInstruction, m)
+	// 工具注册表 + bash 运行时
+	registry := tool.NewRegistry()
+	bash := runtime.NewBash(".")
+	for _, t := range tool.Builtins(bash) {
+		registry.Register(t)
+	}
 
-	program := tea.NewProgram(tui.NewModel(ag))
+	// 审批模式（默认 yolo）
+	mode := permission.ModeYolo
+	switch cfg.ApprovalMode {
+	case "always-ask":
+		mode = permission.ModeAlwaysAsk
+	case "write":
+		mode = permission.ModeWrite
+	}
+
+	ag := agent.New("codeclaw", agentInstruction, m, registry, mode)
+
+	// 固定会话文件，重启即恢复历史（多会话 /resume 在 P9）
+	os.MkdirAll("sessions", 0755)
+	st, err := session.NewFileStorage("sessions/default.jsonl")
+	if err != nil {
+		log.Fatal(err)
+	}
+	s, err := session.New("default", st)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer s.Close()
+
+	// 上下文管理器：超阈值自动压缩
+	cmgr := agentctx.New(s, agentctx.NewModelSummarizer(m), cfg.Models[0].ContextWindow, 16384)
+
+	program := tea.NewProgram(tui.NewModel(ag, s, cmgr))
 	tui.SetProgram(program)
 	if _, err := program.Run(); err != nil {
 		log.Fatal(err)

@@ -13,8 +13,8 @@ func TestAccumulatorMergesTextThinkingToolCalls(t *testing.T) {
 	acc.add(model.ModelEvent{Thinking: "think2"})
 	acc.add(model.ModelEvent{Text: "hello "})
 	acc.add(model.ModelEvent{Text: "world"})
-	acc.add(model.ModelEvent{ToolCalls: []model.ToolCallDelta{{CallID: "c1", Name: "read", Args: `{"file_`}}})
-	acc.add(model.ModelEvent{ToolCalls: []model.ToolCallDelta{{CallID: "c1", Args: `path":"a.go"}`}}})
+	acc.add(model.ModelEvent{ToolCalls: []model.ToolCallDelta{{Index: 0, CallID: "c1", Name: "read", Args: `{"file_`}}})
+	acc.add(model.ModelEvent{ToolCalls: []model.ToolCallDelta{{Index: 0, Args: `path":"a.go"}`}}}) // 后续分块 CallID 为空，靠 Index 合并
 
 	got := acc.message()
 	if got.Role != message.RoleAssistant {

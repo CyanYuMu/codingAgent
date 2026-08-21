@@ -29,6 +29,8 @@ func (f *fakeStream) Recv() (model.ModelEvent, error) {
 	return model.ModelEvent{}, io.EOF
 }
 
+func (f *fakeStream) Usage() model.Usage { return model.Usage{} }
+
 func TestConsumeStreamEventSequence(t *testing.T) {
 	fs := &fakeStream{events: []model.ModelEvent{
 		{Text: "Hello"},
@@ -76,5 +78,20 @@ func TestConsumeStreamErrorEmitsError(t *testing.T) {
 	}
 	if got[0].Type != EventMessageStart || got[1].Type != EventError || got[1].Err == nil || got[2].Type != EventMessageEnd {
 		t.Fatalf("events = %+v", got)
+	}
+}
+
+func TestToolCallsOf(t *testing.T) {
+	m := message.Message{
+		Role: message.RoleAssistant,
+		Blocks: []message.ContentBlock{
+			{Kind: message.BlockText, Text: "let me check"},
+			{Kind: message.BlockToolCall, ToolCall: &message.ToolCall{ID: "c1", Name: "read", Args: "{}"}},
+			{Kind: message.BlockToolCall, ToolCall: &message.ToolCall{ID: "c2", Name: "bash", Args: "{}"}},
+		},
+	}
+	calls := toolCallsOf(m)
+	if len(calls) != 2 || calls[0].Name != "read" || calls[1].Name != "bash" {
+		t.Fatalf("calls = %+v", calls)
 	}
 }

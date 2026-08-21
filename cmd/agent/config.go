@@ -27,11 +27,13 @@ type modelConfig struct {
 	ModelName      string        `yaml:"model_name"`
 	ModelID        string        `yaml:"model_id"`
 	EnableThinking bool          `yaml:"enable_thinking"`
+	ContextWindow  int           `yaml:"context_window"` // 上下文窗口大小，0 用默认
 }
 
 // config 顶层配置。
 type config struct {
-	Models []modelConfig `yaml:"models"`
+	Models       []modelConfig `yaml:"models"`
+	ApprovalMode string        `yaml:"approval_mode"` // always-ask/write/yolo，默认 yolo
 }
 
 // loadConfig 读取项目目录下的 ./config.yaml；不存在或未填 APIKey 则提示并退出。
@@ -51,6 +53,12 @@ func loadConfig() config {
 	if len(cfg.Models) == 0 || cfg.Models[0].APIKey == "" {
 		fmt.Println("请在配置文件中填入模型相关配置后重试。")
 		os.Exit(0)
+	}
+	if cfg.Models[0].ContextWindow == 0 {
+		cfg.Models[0].ContextWindow = 128000
+	}
+	if cfg.ApprovalMode == "" {
+		cfg.ApprovalMode = "yolo"
 	}
 	return cfg
 }

@@ -142,6 +142,27 @@ trace/eval ──▶ {session}
 
 ---
 
+## 4.5 分层 Context 架构（贯穿所有阶段的顶层设计）
+
+核心原则：**Context = Index，不是 Everything**——模型上下文里放「索引 + 精华」，原始数据存在别处（文件/磁盘/记忆库），需要时按指针取回。七层，各自生命周期不同：
+
+| 层 | 内容 | 生命周期 | 落点阶段 |
+|---|---|---|---|
+| **L0 System** | 系统提示词 + 工具定义 | 静态 | P0/P1/P4 |
+| **L1 Project** | 约定文件(AGENTS.md/CLAUDE.md) + workspace 骨架 | 会话启动加载 | P3 增补 |
+| **L2 Task** | 当前任务 + 用户消息 | 静态 | P1/P2 |
+| **L3 Recent Conversation** | 近期对话 | 增长→压缩 | P2 session |
+| **L4 Working Memory** | 六字段压缩摘要 | 每次压缩替换 | P3 compaction |
+| **L5 Retrieved Memory** | 召回的长期记忆 | 按需召回 | P5 |
+| **L6 Tool Results** | 截断/落盘的工具结果 | 索引式 | P4 OutputSink |
+| **L7 Long-term Memory** | 持久记忆 | 持久+召回 | P5 |
+
+三条关键架构决策（调研 oh-my-pi 得出）：
+
+1. **代码检索 ≠ 记忆检索，拆两个独立子系统**：grep/LSP/AST（on-demand 工具 → transcript）与语义向量检索（memory 后端 → `<memories>` 块）分开。别把符号级代码事实误当「可压缩的记忆」——这是 P4（代码检索）与 P5（记忆检索）的边界。
+2. **结构化检索靠 LSP，不建依赖图**：跨文件符号关系全靠 LSP `definition`/`references`/`workspace-symbol`。oh-my-pi 没有依赖图/git blame——这是 Go 生态可补强处（`go list -deps`/`go mod graph` 包依赖图 + `go-git blame`）。
+3. **工具结果压缩 + 落盘 = Context=Index 的实现**：`OutputSink` 头尾窗口 + artifact 指针 + 结果整形（分组/分页/`useless` 标记）。
+
 ## 5. 现状去留
 
 | 现有文件 | 处置 |
@@ -223,7 +244,7 @@ trace/eval ──▶ {session}
 **产出**：
 - `internal/context/tokenizer.go`：本地 token 估算（复用 provider 的 `usage` 作真值 + 只估算锚点后的尾部）。
 - `internal/context/manager.go`：预算模型 `threshold = window − max(0.15·window, reserve)`；`shouldCompact = contextTokens > threshold`。
-- `internal/context/compaction.go`：增量压缩——从新到旧找切点，**绝不切在 toolResult**，旧段摘要 + 保留段原样；摘要注入为一条 `compaction` entry。
+- `internal/context/compaction.go`：增量压缩——从新到旧找切点，**绝不切在 toolResult**，旧段做**六字段任务导向摘要**（目标/状态/决策/文件/失败/下一步，保留「继续任务所需信息」而非泛化总结）+ 保留段原样；摘要注入为一条 `compaction` entry。
 
 **关键机制（学到）**：`firstKeptEntryId` 边界是「摘要替换而非删除」的关键；retry 与 overflow 是两条互斥恢复通道（可重试错误→指数退避重试，溢出→压缩），绝不重试溢出的请求。
 
@@ -238,14 +259,31 @@ trace/eval ──▶ {session}
 **产出**：
 - `internal/tool/tool.go`：`Tool` 接口（name/schema/approval/execute）。
 - `internal/tool/registry.go`：统一注册表；内置工具（read/write/edit/glob/grep/bash/ls）。
+- `internal/tool/search.go`：结构化代码检索——grep（`regexp` RE2 + `regexp2` PCRE 兜底 + 字面量 fallback）+ LSP（gopls `definition`/`references`/`workspace-symbol`）+ AST（`go/parser`/`go/ast`/`go/types`）。
+- `internal/tool/cache.go`：目录清单缓存（短 TTL + 写后失效，只缓存枚举不缓存内容）。
 - `internal/tool/executor.go`：并发调度（shared/exclusive 两级）+ 结果塑形。
 - `internal/runtime/bash.go` + `sandbox.go`：`os/exec` 子进程 + 非交互 env 硬化（`PAGER=cat`/`TERM=dumb`/`NO_COLOR=1`）+ 超时/取消。
 - `internal/runtime/sink.go`：`OutputSink` 头尾窗口截断 + `artifact://` 落盘。
 - `internal/permission/policy.go`：纯函数审批 + mode 枚举（always-ask/write/yolo）。
 
-**关键机制（学到）**：Tool 与 Runtime 分离的意义——同一批 bash/read/write 工具，运行时引擎可替换；审批是纯策略，天然可测。
+**关键机制（学到）**：Tool 与 Runtime 分离——同一批工具运行时引擎可替换；审批是纯策略；**工具结果压缩 + 落盘（OutputSink + artifact）就是「Context=Index」的 L6 实现**；代码检索（grep/LSP/AST）是 on-demand 工具返回进 transcript，与 P5 记忆检索分离。
 
-**验收**：agent 能读/写文件、跑 bash；`rm -rf /` 之类触发审批弹窗；工具结果超长自动截断并落 artifact。
+**验收**：agent 能读/写文件、跑 bash；`rm -rf /` 之类被拒（返回「需要审批」）；工具结果超长自动截断并落 artifact。
+
+---
+
+### P4.5 · 权限审批 Human-in-the-loop：interrupt/resume + 审批弹窗
+
+**目标**：把审批从「纯策略」升级成「人机交互」——`Prompt` 时暂停 turn、弹窗、人决定、恢复。
+
+**产出**：
+- `internal/agent`：interrupt/resume 机制（暂停 turn → 等待决定 → 恢复继续工具循环）。
+- `internal/permission/policy.go`：`DecisionPrompt` 触发 interrupt（而非降级拒绝）。
+- `internal/tui`：审批弹窗（允许/拒绝 + 显示命令/参数）。
+
+**关键机制（学到）**：interrupt/resume 是「暂停/恢复运行中 turn」的通用机制，后续 subagent/advisor 也会复用；HITL 审批只是它的第一个应用。
+
+**验收**：危险命令弹窗 → 点允许继续执行 → 点拒绝工具被拒；点允许后 agent 继续后续工具循环。
 
 ---
 
@@ -257,7 +295,7 @@ trace/eval ──▶ {session}
 - `internal/memory/memory.go`：SQLite（`modernc.org/sqlite`，纯 Go 无 CGO）`working_memory`/`episodic_memory` 双级 + FTS5 索引。
 - `internal/memory/retrieval.go`：多信号打分 recall（lexical + FTS + importance + recency + veracity），注入为 `<memories>` 背景块。
 
-**关键机制（学到）**：记忆是**背景上下文、让位于活状态**；model 写的事实与 harness 写的转录用 `source`/`veracity` 区分；召回是打分排序而非单一匹配。
+**关键机制（学到）**：记忆是**背景上下文、让位于活状态**；model 写的事实与 harness 写的转录用 `source`/`veracity` 区分；召回是打分排序而非单一匹配；**记忆检索（L5/L7 语义向量）与 P4 代码检索（grep/LSP/AST）是两个独立子系统**——别把符号级代码事实当「可压缩的记忆」。
 
 **验收**：跨会话问「我之前偏好 X 吗」能召回；记忆注入后 agent 记得偏好但不被旧记忆误导。
 
@@ -271,7 +309,7 @@ trace/eval ──▶ {session}
 - `internal/subagent/manager.go`：markdown frontmatter 声明 + 派发（递归深度门控、借用父 tool registry）+ yield 协议（产出 = 保留的 `yield` 工具调用）。
 - `internal/tool` 增补：MCP 客户端（`github.com/mark3labs/mcp-go`，已在 module cache）把 `mcp__<server>_<tool>` 归一进 registry。
 
-**关键机制（学到）**：子 agent 是「同一循环跑在独立 session + 借用父资源」；MCP 是「多一个工具源」，250ms 启动门让慢 server 不阻塞。
+**关键机制（学到）**：子 agent 是「同一循环跑在独立 session + 借用父资源」；**Context Isolation——子 agent 有自己独立的 context/tools/task，只把结构化产出（几 KB）交还父 agent，而非复制父的整个 context**；MCP 是「多一个工具源」，250ms 启动门让慢 server 不阻塞。
 
 **验收**：`task` 工具能派子 agent 并收到结构化产出；接一个 MCP server 后其工具可被调用。
 

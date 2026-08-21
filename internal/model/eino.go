@@ -20,11 +20,14 @@ type einoModel struct {
 	base cmodel.AgenticModel // = BaseModel[*schema.AgenticMessage]
 }
 
-// Stream 把我们的消息转成 eino 的 AgenticMessage，发起流式调用并包装成 Stream。
-// P0 不传工具（冒烟无工具）；tools 参数用 _ 显式忽略，P4 实现工具时改用 WithTools。
-func (m *einoModel) Stream(ctx context.Context, msgs []message.Message, _ []ToolSpec) (*Stream, error) {
+// Stream 把我们的消息转成 eino 的 AgenticMessage，带工具定义发起流式调用。
+func (m *einoModel) Stream(ctx context.Context, msgs []message.Message, tools []ToolSpec) (*Stream, error) {
 	agenticMsgs := toAgenticMessages(msgs)
-	reader, err := m.base.Stream(ctx, agenticMsgs)
+	var opts []cmodel.Option
+	if len(tools) > 0 {
+		opts = append(opts, cmodel.WithTools(toSchemaTools(tools)))
+	}
+	reader, err := m.base.Stream(ctx, agenticMsgs, opts...)
 	if err != nil {
 		return nil, err
 	}
@@ -49,7 +52,12 @@ func (s *Stream) Recv() (ModelEvent, error) {
 			ev.Text += b.AssistantGenText.Text
 		}
 		if b.FunctionToolCall != nil {
+			idx := -1
+			if b.StreamingMeta != nil {
+				idx = b.StreamingMeta.Index
+			}
 			ev.ToolCalls = append(ev.ToolCalls, ToolCallDelta{
+				Index:  idx,
 				CallID: b.FunctionToolCall.CallID,
 				Name:   b.FunctionToolCall.Name,
 				Args:   b.FunctionToolCall.Arguments,
@@ -62,8 +70,7 @@ func (s *Stream) Recv() (ModelEvent, error) {
 // Close 释放底层 reader。
 func (s *Stream) Close() { s.reader.Close() }
 
-// toAgenticMessages 把我们的消息转成 eino 的 AgenticMessage。
-// P0 只处理 system/user（冒烟仅需这两类）；assistant/tool 在 P1 加。
+// toAgenticMessages 把我们的消息转成 eino 的 AgenticMessage（四类角色）。
 func toAgenticMessages(msgs []message.Message) []*schema.AgenticMessage {
 	out := make([]*schema.AgenticMessage, 0, len(msgs))
 	for _, m := range msgs {
@@ -72,9 +79,97 @@ func toAgenticMessages(msgs []message.Message) []*schema.AgenticMessage {
 			out = append(out, schema.SystemAgenticMessage(textOf(m)))
 		case message.RoleUser:
 			out = append(out, schema.UserAgenticMessage(textOf(m)))
+		case message.RoleAssistant:
+			out = append(out, toAssistantAgenticMessage(m))
+		case message.RoleTool:
+			out = append(out, toToolAgenticMessage(m))
 		}
 	}
 	return out
+}
+
+// toAssistantAgenticMessage 把 assistant 消息转成 AgenticMessage（正文/思考/工具调用块）。
+func toAssistantAgenticMessage(m message.Message) *schema.AgenticMessage {
+	am := &schema.AgenticMessage{Role: schema.AgenticRoleTypeAssistant}
+	for _, b := range m.Blocks {
+		switch b.Kind {
+		case message.BlockText:
+			am.ContentBlocks = append(am.ContentBlocks, schema.NewContentBlock(&schema.AssistantGenText{Text: b.Text}))
+		case message.BlockThinking:
+			am.ContentBlocks = append(am.ContentBlocks, schema.NewContentBlock(&schema.Reasoning{Text: b.Thinking}))
+		case message.BlockToolCall:
+			if b.ToolCall != nil {
+				am.ContentBlocks = append(am.ContentBlocks, schema.NewContentBlock(&schema.FunctionToolCall{
+					CallID:    b.ToolCall.ID,
+					Name:      b.ToolCall.Name,
+					Arguments: b.ToolCall.Args,
+				}))
+			}
+		}
+	}
+	return am
+}
+
+// toToolAgenticMessage 把 tool 消息转成 AgenticMessage（工具结果用 user 角色 + FunctionToolResult 块）。
+func toToolAgenticMessage(m message.Message) *schema.AgenticMessage {
+	tm := &schema.AgenticMessage{Role: schema.AgenticRoleTypeUser}
+	for _, b := range m.Blocks {
+		if b.Kind == message.BlockToolResult && b.ToolResult != nil {
+			tm.ContentBlocks = append(tm.ContentBlocks, schema.NewContentBlock(&schema.FunctionToolResult{
+				CallID: b.ToolResult.ToolCallID,
+				Name:   b.ToolResult.Name,
+				Content: []*schema.FunctionToolResultContentBlock{
+					{Type: schema.FunctionToolResultContentBlockTypeText, Text: &schema.UserInputText{Text: b.ToolResult.Content}},
+				},
+			}))
+		}
+	}
+	return tm
+}
+
+// toSchemaTools 把我们的 ToolSpec 转成 eino 的 ToolInfo（用 params 形式描述参数）。
+func toSchemaTools(tools []ToolSpec) []*schema.ToolInfo {
+	out := make([]*schema.ToolInfo, 0, len(tools))
+	for _, t := range tools {
+		params := map[string]*schema.ParameterInfo{}
+		for name, spec := range t.Parameters {
+			params[name] = &schema.ParameterInfo{
+				Type:     dataTypeOf(spec),
+				Required: true,
+			}
+		}
+		out = append(out, &schema.ToolInfo{
+			Name:        t.Name,
+			Desc:        t.Description,
+			ParamsOneOf: schema.NewParamsOneOfByParams(params),
+		})
+	}
+	return out
+}
+
+// dataTypeOf 从参数的 JSON-schema 描述里取 type，默认 string。
+func dataTypeOf(spec any) schema.DataType {
+	m, ok := spec.(map[string]any)
+	if !ok {
+		return schema.String
+	}
+	ts, _ := m["type"].(string)
+	switch ts {
+	case "object":
+		return schema.Object
+	case "number":
+		return schema.Number
+	case "integer":
+		return schema.Integer
+	case "array":
+		return schema.Array
+	case "boolean":
+		return schema.Boolean
+	case "null":
+		return schema.Null
+	default:
+		return schema.String
+	}
 }
 
 // textOf 拼接消息里的所有文本块。

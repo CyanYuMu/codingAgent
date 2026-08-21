@@ -2,6 +2,7 @@ package tui
 
 import (
 	"context"
+	"fmt"
 	"strings"
 
 	"charm.land/bubbles/v2/key"
@@ -10,7 +11,9 @@ import (
 	"charm.land/lipgloss/v2"
 
 	"einoclaw-build/internal/agent"
+	agentctx "einoclaw-build/internal/context"
 	"einoclaw-build/internal/message"
+	"einoclaw-build/internal/session"
 )
 
 // P1：从阶段5的 tui.go 重建 + 改造。
@@ -38,9 +41,11 @@ type teaModel struct {
 	streamingThinking string // 当前流式思考(原文)
 	inputArea        textarea.Model
 	agent            *agent.Agent
+	session          *session.Session
+	cmgr             *agentctx.ContextManager
 }
 
-func NewModel(ag *agent.Agent) teaModel {
+func NewModel(ag *agent.Agent, s *session.Session, cmgr *agentctx.ContextManager) teaModel {
 	ta := textarea.New()
 	ta.Placeholder = " Type your message... (Enter=send, Ctrl+J=newline, Ctrl+C=quit)"
 	ta.SetHeight(3)
@@ -48,7 +53,12 @@ func NewModel(ag *agent.Agent) teaModel {
 	ta.CharLimit = 0
 	ta.KeyMap.InsertNewline = key.NewBinding(key.WithKeys("ctrl+j"), key.WithHelp("ctrl+j", "newline"))
 	ta.Focus()
-	return teaModel{inputArea: ta, agent: ag}
+	m := teaModel{inputArea: ta, agent: ag, session: s, cmgr: cmgr}
+	// 恢复历史：replay 后渲染进聊天区
+	if msgs, err := s.Replay(); err == nil {
+		m.chatLines = renderHistory(msgs)
+	}
+	return m
 }
 
 func (m teaModel) Init() tea.Cmd {
@@ -93,6 +103,11 @@ func (m teaModel) handleAgentEvent(ev agent.AgentEvent) (teaModel, tea.Cmd) {
 		}
 	case agent.EventMessageEnd:
 		m = m.finalizeStreaming() // 正文定稿进 chatLines
+	case agent.EventToolStart:
+		m = m.finalizeStreaming() // 工具调用前收尾正文（若还有流式残留）
+		m.chatLines = append(m.chatLines, renderToolCall(ev.ToolStart))
+	case agent.EventToolEnd:
+		m.chatLines = append(m.chatLines, renderToolResult(ev.ToolEnd)...)
 	case agent.EventError:
 		m.chatLines = append(m.chatLines, renderError(ev.Err))
 	}
@@ -144,6 +159,12 @@ func (m teaModel) handleKey(msg tea.KeyPressMsg) (teaModel, tea.Cmd) {
 		if text == "" {
 			return m, nil
 		}
+		if text == "/clear" {
+			_ = m.session.Reset()
+			m.chatLines = nil
+			m.inputArea.Reset()
+			return m, nil
+		}
 		m.inputArea.Reset()
 		m = m.finalizeStreaming() // 收尾当前 AI 消息(若有)
 		// 追加用户消息行(首行加前缀)
@@ -165,11 +186,31 @@ func (m teaModel) handleKey(msg tea.KeyPressMsg) (teaModel, tea.Cmd) {
 	return m, cmd
 }
 
-// runAgent 在后台 goroutine 跑 agent，把 AgentEvent 经 program.Send 桥接回 TUI。
+// runAgent 在后台 goroutine 跑 agent：记录 user → 跑 agent → 记录 assistant。
 func (m teaModel) runAgent(ctx context.Context, text string) {
-	for ev := range m.agent.Run(ctx, []message.Message{message.NewUserMessage(text)}) {
+	userMsg := message.NewUserMessage(text)
+
+	// 1. 加载历史（到最后一个 reset_boundary）
+	history, err := m.session.Replay()
+	if err != nil {
+		history = nil
+	}
+	// 2. 记录用户消息
+	_ = m.session.Append(userMsg)
+	// 3. 跑 agent：输入 = 历史 + 用户消息
+	input := append(history, userMsg)
+	for ev := range m.agent.Run(ctx, input) {
 		if program != nil {
 			program.Send(ev)
+		}
+		switch ev.Type {
+		case agent.EventMessageEnd:
+			// 4. 定稿后记录 assistant 消息
+			_ = m.session.Append(ev.Ended.Message)
+			_ = m.cmgr.AfterTurn(ctx, ev.Ended.Usage) // P3：超阈值则压缩
+		case agent.EventToolEnd:
+			// 记录工具结果，否则 replay 时 tool_calls 缺配对 tool 消息，API 报 insufficient tool messages
+			_ = m.session.Append(message.NewToolMessage(ev.ToolEnd.ID, ev.ToolEnd.Name, ev.ToolEnd.Content, false))
 		}
 	}
 }
@@ -200,4 +241,55 @@ func renderAIMessage(text string, width int) []string {
 // renderError 渲染一行错误提示。
 func renderError(err error) string {
 	return lipgloss.NewStyle().Foreground(lipgloss.Color("1")).Bold(true).Render("✗ " + err.Error())
+}
+
+// renderToolCall 渲染一行工具调用（名 + 参数）。
+func renderToolCall(ts *agent.ToolStart) string {
+	name := lipgloss.NewStyle().Foreground(lipgloss.Color("208")).Bold(true).Render(ts.Name)
+	args := lipgloss.NewStyle().Foreground(lipgloss.Color("250")).Render(ts.Args)
+	return "  " + name + " " + args
+}
+
+// renderToolResult 渲染工具结果（头部 + 内容行，超长截断预览）。
+func renderToolResult(te *agent.ToolEnd) []string {
+	head := lipgloss.NewStyle().Foreground(lipgloss.Color("250")).Bold(true).Render("← " + te.Name)
+	lines := strings.Split(te.Content, "\n")
+	const maxLines = 10
+	out := []string{"  " + head}
+	for i, l := range lines {
+		if i >= maxLines {
+			out = append(out, fmt.Sprintf("  ...(%d more lines)", len(lines)-maxLines))
+			break
+		}
+		out = append(out, "    "+l)
+	}
+	return out
+}
+
+// renderHistory 把历史消息渲染成终端行（user 加 ┃ 前缀，assistant 加 ● 前缀）。
+func renderHistory(msgs []message.Message) []string {
+	var out []string
+	for _, m := range msgs {
+		lines := strings.Split(messageText(m), "\n")
+		switch m.Role {
+		case message.RoleUser:
+			lines[0] = userPrefix + lines[0]
+			out = append(out, lines...)
+		case message.RoleAssistant:
+			out = append(out, aiPrefix+lines[0])
+			out = append(out, lines[1:]...)
+		}
+	}
+	return out
+}
+
+// messageText 拼接消息里所有文本块。
+func messageText(m message.Message) string {
+	var sb strings.Builder
+	for _, b := range m.Blocks {
+		if b.Kind == message.BlockText {
+			sb.WriteString(b.Text)
+		}
+	}
+	return sb.String()
 }
