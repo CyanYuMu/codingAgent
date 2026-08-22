@@ -2,6 +2,12 @@
 # 复制到 ~/.einoclaw-build/config.yaml 并填入你的模型配置。
 # 任选一个 provider 即可，也可以配多个用 /model 切换（切换功能阶段10再加）。
 
+# 审批模式：控制哪些工具需要弹出「人机审批」窗口
+#   yolo       —— 全部放行（默认，无弹窗）
+#   write      —— read/write 放行，exec（bash 执行命令等）询问
+#   always-ask —— 只有 read 放行，write/exec 都询问
+approval_mode: write
+
 models:
   # 示例：DeepSeek
   - model_name: deepseek-chat

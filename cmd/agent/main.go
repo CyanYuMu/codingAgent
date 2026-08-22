@@ -50,7 +50,7 @@ func main() {
 		mode = permission.ModeWrite
 	}
 
-	ag := agent.New("codeclaw", agentInstruction, m, registry, mode)
+	ag := agent.New("codeclaw", agentInstruction, m, registry, mode, tui.NewApprover())
 
 	// 固定会话文件，重启即恢复历史（多会话 /resume 在 P9）
 	os.MkdirAll("sessions", 0755)

@@ -16,14 +16,14 @@ type Agent struct {
 	maxIterations int             // 工具循环上限，防失控
 }
 
-// New 创建一个 Agent。
-func New(name, instruction string, m model.Model, tools *tool.Registry, mode permission.Mode) *Agent {
+// New 创建一个 Agent。approver 为 nil 时退化为「拒绝+说明」（无 HITL）。
+func New(name, instruction string, m model.Model, tools *tool.Registry, mode permission.Mode, approver tool.Approver) *Agent {
 	return &Agent{
 		name:          name,
 		instruction:   instruction,
 		model:         m,
 		tools:         tools,
-		executor:      tool.NewExecutor(tools, mode),
+		executor:      tool.NewExecutor(tools, mode, approver),
 		maxIterations: 50,
 	}
 }

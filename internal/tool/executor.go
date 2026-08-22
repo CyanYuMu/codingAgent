@@ -15,14 +15,21 @@ const (
 	sinkTailLimit = 4000
 )
 
+// Approver 是审批的中断点：blocking 等待用户决定。
+// true = 允许执行，false = 拒绝；ctx 取消时返回 error（中断）。
+type Approver interface {
+	Approve(ctx context.Context, call message.ToolCall) (bool, error)
+}
+
 // Executor 执行工具调用：查表 → 审批 → 执行 → 塑形结果。
 type Executor struct {
 	registry *Registry
 	mode     permission.Mode
+	approver Approver // nil = 无 HITL（Prompt 降级拒绝）
 }
 
-func NewExecutor(r *Registry, mode permission.Mode) *Executor {
-	return &Executor{registry: r, mode: mode}
+func NewExecutor(r *Registry, mode permission.Mode, approver Approver) *Executor {
+	return &Executor{registry: r, mode: mode, approver: approver}
 }
 
 // Execute 执行一次工具调用，返回给模型的结果文本。
@@ -33,7 +40,17 @@ func (e *Executor) Execute(ctx context.Context, call message.ToolCall) string {
 	}
 	decision := permission.Resolve(t.Tier(), e.mode)
 	if decision == permission.DecisionPrompt {
-		return "tool denied: requires approval (tier=" + string(t.Tier()) + ")"
+		if e.approver == nil {
+			return "tool denied: requires approval (tier=" + string(t.Tier()) + ")"
+		}
+		approved, err := e.approver.Approve(ctx, call)
+		if err != nil {
+			return "tool approval interrupted: " + err.Error()
+		}
+		if !approved {
+			return "tool denied by user"
+		}
+		// 批准：继续执行
 	}
 
 	var args map[string]any

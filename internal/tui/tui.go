@@ -43,6 +43,7 @@ type teaModel struct {
 	agent            *agent.Agent
 	session          *session.Session
 	cmgr             *agentctx.ContextManager
+	pendingApproval  *approvalRequestMsg // nil = 无待审批
 }
 
 func NewModel(ag *agent.Agent, s *session.Session, cmgr *agentctx.ContextManager) teaModel {
@@ -78,6 +79,10 @@ func (m teaModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case agent.AgentEvent:
 		return m.handleAgentEvent(msg)
+
+	case approvalRequestMsg:
+		m.pendingApproval = &msg // 弹审批窗
+		return m, nil
 	}
 	var cmd tea.Cmd
 	m.inputArea, cmd = m.inputArea.Update(msg)
@@ -142,11 +147,28 @@ func (m teaModel) View() tea.View {
 	}
 
 	chatView := strings.Join(all, "\n")
-	content := lipgloss.JoinVertical(lipgloss.Top, chatView, "", m.inputArea.View())
+	bottom := m.inputArea.View()
+	if m.pendingApproval != nil {
+		bottom = renderApprovalDialog(m.pendingApproval.call)
+	}
+	content := lipgloss.JoinVertical(lipgloss.Top, chatView, "", bottom)
 	return tea.View{Content: content, AltScreen: true}
 }
 
 func (m teaModel) handleKey(msg tea.KeyPressMsg) (teaModel, tea.Cmd) {
+	// 审批弹窗是 modal：待审批时只响应 y/n/esc
+	if m.pendingApproval != nil {
+		switch {
+		case key.Matches(msg, key.NewBinding(key.WithKeys("y", "enter"))):
+			m.pendingApproval.resp <- true
+			m.pendingApproval = nil
+		case key.Matches(msg, key.NewBinding(key.WithKeys("n", "esc"))):
+			m.pendingApproval.resp <- false
+			m.pendingApproval = nil
+		}
+		return m, nil
+	}
+
 	switch {
 	case key.Matches(msg, key.NewBinding(key.WithKeys("ctrl+c"))):
 		if currentCancel != nil {
@@ -248,6 +270,13 @@ func renderToolCall(ts *agent.ToolStart) string {
 	name := lipgloss.NewStyle().Foreground(lipgloss.Color("208")).Bold(true).Render(ts.Name)
 	args := lipgloss.NewStyle().Foreground(lipgloss.Color("250")).Render(ts.Args)
 	return "  " + name + " " + args
+}
+
+// renderApprovalDialog 渲染审批弹窗。
+func renderApprovalDialog(call message.ToolCall) string {
+	title := lipgloss.NewStyle().Foreground(lipgloss.Color("208")).Bold(true).Render("⚠ 审批")
+	cmd := lipgloss.NewStyle().Foreground(lipgloss.Color("250")).Render(call.Name + " " + call.Args)
+	return fmt.Sprintf("%s\n\n  %s\n\n  [y] 允许   [n] 拒绝", title, cmd)
 }
 
 // renderToolResult 渲染工具结果（头部 + 内容行，超长截断预览）。
