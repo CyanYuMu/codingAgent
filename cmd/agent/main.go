@@ -9,6 +9,7 @@ import (
 
 	"einoclaw-build/internal/agent"
 	agentctx "einoclaw-build/internal/context"
+	"einoclaw-build/internal/memory"
 	"einoclaw-build/internal/model"
 	"einoclaw-build/internal/permission"
 	"einoclaw-build/internal/runtime"
@@ -17,7 +18,7 @@ import (
 	"einoclaw-build/internal/tui"
 )
 
-const agentInstruction = "你是一个编程智能体, 你的名字叫做 codeclaw, 擅长解决编程问题。"
+const agentInstruction = "你是一个编程智能体, 你的名字叫做 codeclaw, 擅长解决编程问题。当用户表达偏好、关键事实或重要决策时，调用 remember 工具记录，以便后续会话召回。"
 
 // 双协程架构：
 //   主 goroutine —— program.Run()（BubbleTea 事件循环）
@@ -41,6 +42,17 @@ func main() {
 		registry.Register(t)
 	}
 
+	// 记忆库（跨会话持久），不可用则降级为无记忆
+	mem, err := memory.Open("memory.db")
+	if err != nil {
+		log.Printf("记忆库不可用，禁用记忆: %v", err)
+		mem = nil
+	}
+	if mem != nil {
+		defer mem.Close()
+		registry.Register(tool.NewRememberTool(mem))
+	}
+
 	// 审批模式（默认 yolo）
 	mode := permission.ModeYolo
 	switch cfg.ApprovalMode {
@@ -50,7 +62,7 @@ func main() {
 		mode = permission.ModeWrite
 	}
 
-	ag := agent.New("codeclaw", agentInstruction, m, registry, mode, tui.NewApprover())
+	ag := agent.New("codeclaw", agentInstruction, m, registry, mode, tui.NewApprover(), mem)
 
 	// 固定会话文件，重启即恢复历史（多会话 /resume 在 P9）
 	os.MkdirAll("sessions", 0755)

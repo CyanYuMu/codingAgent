@@ -3,8 +3,11 @@ package agent
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
+	"strings"
 
+	"einoclaw-build/internal/memory"
 	"einoclaw-build/internal/message"
 	"einoclaw-build/internal/model"
 )
@@ -32,7 +35,14 @@ func (a *Agent) Run(ctx context.Context, input []message.Message) <-chan AgentEv
 		emit(AgentEvent{Type: EventAgentStart})
 		emit(AgentEvent{Type: EventTurnStart})
 
-		msgs := append([]message.Message{message.NewSystemMessage(a.instruction)}, input...)
+		msgs := []message.Message{message.NewSystemMessage(a.instruction)}
+		// 召回记忆，注入 <memories> 背景块（让位于活状态）
+		if a.memory != nil {
+			if mems, err := a.memory.Recall(lastUserText(input), 5); err == nil && len(mems) > 0 {
+				msgs = append(msgs, message.NewSystemMessage(renderMemories(mems)))
+			}
+		}
+		msgs = append(msgs, input...)
 		for step := 0; step < a.maxIterations; step++ {
 			stream, err := a.model.Stream(ctx, msgs, a.tools.Specs())
 			if err != nil {
@@ -98,4 +108,31 @@ func toolCallsOf(m message.Message) []message.ToolCall {
 		}
 	}
 	return calls
+}
+
+// lastUserText 返回最后一条 user 消息的文本（作为召回 query）。
+func lastUserText(msgs []message.Message) string {
+	for i := len(msgs) - 1; i >= 0; i-- {
+		if msgs[i].Role == message.RoleUser {
+			var sb strings.Builder
+			for _, b := range msgs[i].Blocks {
+				if b.Kind == message.BlockText {
+					sb.WriteString(b.Text)
+				}
+			}
+			return sb.String()
+		}
+	}
+	return ""
+}
+
+// renderMemories 把召回的记忆渲染成 <memories> 背景块。
+func renderMemories(mems []memory.Memory) string {
+	var sb strings.Builder
+	sb.WriteString("<memories>\n")
+	for _, m := range mems {
+		fmt.Fprintf(&sb, "- [%s] %s（置信 %.1f）\n", m.MemoryType, m.Content, m.Veracity)
+	}
+	sb.WriteString("</memories>\n（以上是背景上下文，当前用户消息和工具结果优先。）")
+	return sb.String()
 }
