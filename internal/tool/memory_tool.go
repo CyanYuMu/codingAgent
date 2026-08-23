@@ -27,7 +27,8 @@ func (rememberTool) Parameters() map[string]any {
 		"memory_type": map[string]any{"type": "string"},
 	}
 }
-func (rememberTool) Tier() permission.Tier { return permission.TierWrite }
+func (rememberTool) Tier() permission.Tier    { return permission.TierWrite }
+func (rememberTool) Concurrency() Concurrency { return ConcurrencyShared }
 
 func (r rememberTool) Execute(ctx context.Context, args map[string]any, sink *runtime.Sink) error {
 	content, _ := args["content"].(string)

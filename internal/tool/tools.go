@@ -35,7 +35,8 @@ func (readFileTool) Parameters() map[string]any {
 		"limit":     map[string]any{"type": "integer"},
 	}
 }
-func (readFileTool) Tier() permission.Tier { return permission.TierRead }
+func (readFileTool) Tier() permission.Tier        { return permission.TierRead }
+func (readFileTool) Concurrency() Concurrency     { return ConcurrencyShared }
 
 func (readFileTool) Execute(ctx context.Context, args map[string]any, sink *runtime.Sink) error {
 	path, _ := args["file_path"].(string)
@@ -75,7 +76,8 @@ func (writeFileTool) Parameters() map[string]any {
 		"content":   map[string]any{"type": "string"},
 	}
 }
-func (writeFileTool) Tier() permission.Tier { return permission.TierWrite }
+func (writeFileTool) Tier() permission.Tier        { return permission.TierWrite }
+func (writeFileTool) Concurrency() Concurrency     { return ConcurrencyExclusive }
 
 func (writeFileTool) Execute(ctx context.Context, args map[string]any, sink *runtime.Sink) error {
 	path, _ := args["file_path"].(string)
@@ -99,7 +101,8 @@ func (globTool) Description() string { return "按 pattern 匹配文件名" }
 func (globTool) Parameters() map[string]any {
 	return map[string]any{"pattern": map[string]any{"type": "string"}}
 }
-func (globTool) Tier() permission.Tier { return permission.TierRead }
+func (globTool) Tier() permission.Tier        { return permission.TierRead }
+func (globTool) Concurrency() Concurrency     { return ConcurrencyShared }
 
 func (globTool) Execute(ctx context.Context, args map[string]any, sink *runtime.Sink) error {
 	pattern, _ := args["pattern"].(string)
@@ -126,7 +129,8 @@ func (bashTool) Description() string { return "执行 shell 命令" }
 func (bashTool) Parameters() map[string]any {
 	return map[string]any{"command": map[string]any{"type": "string"}}
 }
-func (bashTool) Tier() permission.Tier { return permission.TierExec }
+func (bashTool) Tier() permission.Tier        { return permission.TierExec }
+func (bashTool) Concurrency() Concurrency     { return ConcurrencyExclusive }
 
 func (b bashTool) Execute(ctx context.Context, args map[string]any, sink *runtime.Sink) error {
 	command, _ := args["command"].(string)

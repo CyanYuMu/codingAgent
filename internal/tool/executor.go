@@ -3,6 +3,7 @@ package tool
 import (
 	"context"
 	"encoding/json"
+	"sync"
 
 	"einoclaw-build/internal/message"
 	"einoclaw-build/internal/permission"
@@ -66,4 +67,26 @@ func (e *Executor) Execute(ctx context.Context, call message.ToolCall) string {
 		return result + "\n[tool error: " + err.Error() + "]"
 	}
 	return result
+}
+
+// ExecuteAll 并行执行多个工具调用：Shared 用 goroutine 并行，Exclusive 串行，结果按调用序返回。
+func (e *Executor) ExecuteAll(ctx context.Context, calls []message.ToolCall) []string {
+	results := make([]string, len(calls))
+	var wg sync.WaitGroup
+
+	for i, call := range calls {
+		t, ok := e.registry.Get(call.Name)
+		if ok && t.Concurrency() == ConcurrencyExclusive {
+			wg.Wait() // 等之前并行的完成，再串行执行
+			results[i] = e.Execute(ctx, call)
+			continue
+		}
+		wg.Add(1)
+		go func(i int, call message.ToolCall) {
+			defer wg.Done()
+			results[i] = e.Execute(ctx, call)
+		}(i, call)
+	}
+	wg.Wait()
+	return results
 }

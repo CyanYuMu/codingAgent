@@ -313,6 +313,11 @@ trace/eval ──▶ {session}
 
 **验收**：`task` 工具能派子 agent 并收到结构化产出；接一个 MCP server 后其工具可被调用。
 
+**多 agent 主动委派 + 并行编排升级**（详见 [multi-agent-orchestration.md](multi-agent-orchestration.md)，分三层按杠杆落地）：
+- **P6-L1 委派策略**：`delegation_mode` 配置（conservative/preferred/always）+ coordinator 角色 + 触发清单/反例 + orchestrator/worker 能力边界 + whenToUse。
+- **P6-L2 派发运行时**：统一 `SubagentSpec` + `tasks[]` 批量派发 + Semaphore 并发控制 + `yield`/outputSchema 完成度保证 + 状态机 + failure control。
+- **P6-L3 通信+隔离**（延后）：mailbox bus + worktree 隔离 + session 持久化 + 审计 hook。
+
 ---
 
 ### P7 · Trace + Eval：审计闭环

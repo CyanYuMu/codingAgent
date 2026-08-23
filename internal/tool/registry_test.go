@@ -17,6 +17,7 @@ func (f fakeTool) Name() string               { return f.name }
 func (f fakeTool) Description() string        { return "d" }
 func (f fakeTool) Parameters() map[string]any { return nil }
 func (f fakeTool) Tier() permission.Tier      { return f.tier }
+func (f fakeTool) Concurrency() Concurrency   { return ConcurrencyShared }
 func (f fakeTool) Execute(ctx context.Context, args map[string]any, sink *runtime.Sink) error {
 	sink.Write([]byte("ok"))
 	return nil

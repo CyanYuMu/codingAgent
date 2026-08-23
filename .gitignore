@@ -13,3 +13,6 @@ sessions/
 
 # macOS
 .DS_Store
+
+# 记忆库（运行时产物）
+memory.db

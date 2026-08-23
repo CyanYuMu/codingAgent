@@ -32,6 +32,35 @@ func (r *Registry) Get(name string) (Tool, bool) {
 	return t, ok
 }
 
+// Without 返回一个不含指定名字工具的新注册表（供子 agent 用，防递归派发）。
+func (r *Registry) Without(name string) *Registry {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	nr := NewRegistry()
+	for n, t := range r.tools {
+		if n != name {
+			nr.tools[n] = t
+		}
+	}
+	return nr
+}
+
+// List 返回所有工具（按名字排序），供复制/枚举。
+func (r *Registry) List() []Tool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	names := make([]string, 0, len(r.tools))
+	for n := range r.tools {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+	out := make([]Tool, 0, len(names))
+	for _, n := range names {
+		out = append(out, r.tools[n])
+	}
+	return out
+}
+
 // Specs 转成给模型的工具定义（按名字排序，保证稳定）。
 func (r *Registry) Specs() []model.ToolSpec {
 	r.mu.RLock()

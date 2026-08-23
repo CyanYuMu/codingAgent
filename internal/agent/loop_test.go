@@ -37,7 +37,10 @@ func TestConsumeStreamEventSequence(t *testing.T) {
 		{Thinking: "think"},
 	}}
 	var got []AgentEvent
-	consumeStream(context.Background(), fs, func(e AgentEvent) { got = append(got, e) })
+	_, _, streamErr := consumeStream(context.Background(), fs, func(e AgentEvent) { got = append(got, e) })
+	if streamErr != nil {
+		t.Fatalf("正常流不应返回错误，got %v", streamErr)
+	}
 
 	wantTypes := []EventType{EventMessageStart, EventMessageUpdate, EventMessageUpdate, EventMessageEnd}
 	if len(got) != len(wantTypes) {
@@ -70,7 +73,10 @@ func TestConsumeStreamEventSequence(t *testing.T) {
 func TestConsumeStreamErrorEmitsError(t *testing.T) {
 	fs := &fakeStream{err: errors.New("boom")}
 	var got []AgentEvent
-	consumeStream(context.Background(), fs, func(e AgentEvent) { got = append(got, e) })
+	_, _, streamErr := consumeStream(context.Background(), fs, func(e AgentEvent) { got = append(got, e) })
+	if streamErr == nil {
+		t.Fatal("流错误应返回 error")
+	}
 
 	// 出错也发 message_end（定稿已累积内容）
 	if len(got) != 3 { // message_start, error, message_end

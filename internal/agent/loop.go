@@ -49,22 +49,29 @@ func (a *Agent) Run(ctx context.Context, input []message.Message) <-chan AgentEv
 				emit(AgentEvent{Type: EventError, Err: err})
 				break
 			}
-			assistant, _ := consumeStream(ctx, stream, emit)
+			assistant, _, streamErr := consumeStream(ctx, stream, emit)
 			stream.Close()
+			if streamErr != nil {
+				break // 流错误：不执行工具（参数可能被截断）
+			}
 			msgs = append(msgs, assistant)
 
 			calls := toolCallsOf(assistant)
 			if len(calls) == 0 {
 				break // 无工具调用，turn 结束
 			}
+			// 三档中断「跳过」：未启动的工具不执行
+			if ctx.Err() != nil {
+				break
+			}
 			for _, tc := range calls {
-				if ctx.Err() != nil {
-					break // 三档中断「跳过」：未启动的工具不执行
-				}
 				emit(AgentEvent{Type: EventToolStart, ToolStart: &ToolStart{ID: tc.ID, Name: tc.Name, Args: tc.Args}})
-				result := a.executor.Execute(ctx, tc)
-				emit(AgentEvent{Type: EventToolEnd, ToolEnd: &ToolEnd{ID: tc.ID, Name: tc.Name, Content: result}})
-				msgs = append(msgs, message.NewToolMessage(tc.ID, tc.Name, result, false))
+			}
+			// 并行执行（Shared 并行 goroutine，Exclusive 串行）
+			results := a.executor.ExecuteAll(ctx, calls)
+			for i, tc := range calls {
+				emit(AgentEvent{Type: EventToolEnd, ToolEnd: &ToolEnd{ID: tc.ID, Name: tc.Name, Content: results[i]}})
+				msgs = append(msgs, message.NewToolMessage(tc.ID, tc.Name, results[i], false))
 			}
 		}
 
@@ -74,10 +81,12 @@ func (a *Agent) Run(ctx context.Context, input []message.Message) <-chan AgentEv
 	return ch
 }
 
-// consumeStream 消费一个事件流，累积成完整消息并 emit 对应事件，返回累积消息 + 用量。
-func consumeStream(ctx context.Context, stream eventStream, emit func(AgentEvent)) (message.Message, model.Usage) {
+// consumeStream 消费一个事件流，累积成完整消息并 emit 对应事件，返回累积消息 + 用量 + 流错误。
+// 流中途出错时返回 error，让 Run 停止工具执行（参数可能被截断）。
+func consumeStream(ctx context.Context, stream eventStream, emit func(AgentEvent)) (message.Message, model.Usage, error) {
 	emit(AgentEvent{Type: EventMessageStart})
 	acc := newStreamAccumulator()
+	var streamErr error
 	for {
 		ev, err := stream.Recv()
 		if errors.Is(err, io.EOF) {
@@ -88,6 +97,7 @@ func consumeStream(ctx context.Context, stream eventStream, emit func(AgentEvent
 				break // 取消：正常收尾，不报错
 			}
 			emit(AgentEvent{Type: EventError, Err: err})
+			streamErr = err
 			break
 		}
 		acc.add(ev)
@@ -96,7 +106,7 @@ func consumeStream(ctx context.Context, stream eventStream, emit func(AgentEvent
 	m := acc.message()
 	usage := stream.Usage()
 	emit(AgentEvent{Type: EventMessageEnd, Ended: &MessageEnd{Message: m, Usage: usage}})
-	return m, usage
+	return m, usage, streamErr
 }
 
 // toolCallsOf 提取消息里的工具调用块。
