@@ -26,11 +26,12 @@ type Approver interface {
 type Executor struct {
 	registry *Registry
 	mode     permission.Mode
-	approver Approver // nil = 无 HITL（Prompt 降级拒绝）
+	approver Approver     // nil = 无 HITL（Prompt 降级拒绝）
+	sem      chan struct{} // 并发上限（Shared 工具并行数）
 }
 
 func NewExecutor(r *Registry, mode permission.Mode, approver Approver) *Executor {
-	return &Executor{registry: r, mode: mode, approver: approver}
+	return &Executor{registry: r, mode: mode, approver: approver, sem: make(chan struct{}, 8)}
 }
 
 // Execute 执行一次工具调用，返回给模型的结果文本。
@@ -69,7 +70,7 @@ func (e *Executor) Execute(ctx context.Context, call message.ToolCall) string {
 	return result
 }
 
-// ExecuteAll 并行执行多个工具调用：Shared 用 goroutine 并行，Exclusive 串行，结果按调用序返回。
+// ExecuteAll 并行执行多个工具调用：Shared 用 goroutine 并行（Semaphore 限并发），Exclusive 串行，结果按调用序返回。
 func (e *Executor) ExecuteAll(ctx context.Context, calls []message.ToolCall) []string {
 	results := make([]string, len(calls))
 	var wg sync.WaitGroup
@@ -81,12 +82,28 @@ func (e *Executor) ExecuteAll(ctx context.Context, calls []message.ToolCall) []s
 			results[i] = e.Execute(ctx, call)
 			continue
 		}
+		if err := e.acquire(ctx); err != nil {
+			results[i] = "tool error: " + err.Error()
+			continue
+		}
 		wg.Add(1)
 		go func(i int, call message.ToolCall) {
 			defer wg.Done()
+			defer e.release()
 			results[i] = e.Execute(ctx, call)
 		}(i, call)
 	}
 	wg.Wait()
 	return results
 }
+
+func (e *Executor) acquire(ctx context.Context) error {
+	select {
+	case e.sem <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (e *Executor) release() { <-e.sem }

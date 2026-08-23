@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"strings"
+	"time"
 
 	"einoclaw-build/internal/memory"
 	"einoclaw-build/internal/message"
@@ -28,7 +29,8 @@ func (a *Agent) Run(ctx context.Context, input []message.Message) <-chan AgentEv
 		emit := func(e AgentEvent) {
 			select {
 			case ch <- e:
-			case <-ctx.Done():
+			case <-time.After(time.Second):
+				// 消费者 1s 没读才丢弃；取消时也照发（保证 MessageEnd 等收尾事件持久化）
 			}
 		}
 

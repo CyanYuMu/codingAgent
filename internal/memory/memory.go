@@ -76,7 +76,14 @@ func (s *Store) Remember(content string, opts MemoryOpts) error {
 		opts.MemoryType = "fact"
 	}
 
-	res, err := s.db.Exec(
+	// 两表写入用事务，避免 working_memory 与 memory_fts 不一致（FTS 孤儿行）
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	res, err := tx.Exec(
 		`INSERT INTO working_memory (content, source, veracity, importance, memory_type, created_at)
 		 VALUES (?, ?, ?, ?, ?, ?)`,
 		content, opts.Source, opts.Veracity, opts.Importance, opts.MemoryType, time.Now().Unix(),
@@ -88,8 +95,10 @@ func (s *Store) Remember(content string, opts MemoryOpts) error {
 	if err != nil {
 		return err
 	}
-	_, err = s.db.Exec(`INSERT INTO memory_fts(rowid, content) VALUES (?, ?)`, id, content)
-	return err
+	if _, err := tx.Exec(`INSERT INTO memory_fts(rowid, content) VALUES (?, ?)`, id, content); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // Close 关闭数据库。

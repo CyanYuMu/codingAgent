@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"sync"
 
 	"charm.land/bubbles/v2/key"
 	"charm.land/bubbles/v2/textarea"
@@ -27,6 +28,7 @@ var (
 	// 双协程桥接用（沿用旧「全局 program + program.Send」模式）
 	program       *tea.Program
 	currentCancel context.CancelFunc
+	runMu         sync.Mutex // 保证同一时刻只有一个 run（防双 run 竞态）
 )
 
 // SetProgram 注入 BubbleTea program，供后台 goroutine 把事件塞回 TUI 主循环。
@@ -194,10 +196,11 @@ func (m teaModel) handleKey(msg tea.KeyPressMsg) (teaModel, tea.Cmd) {
 		userLines[0] = userPrefix + userLines[0]
 		m.chatLines = append(m.chatLines, userLines...)
 
-		// 取消上一轮，起新一轮 agent run
+		// 取消上一轮，清掉可能残留的审批弹窗，起新一轮 agent run
 		if currentCancel != nil {
 			currentCancel()
 		}
+		m.pendingApproval = nil
 		ctx, cancel := context.WithCancel(context.Background())
 		currentCancel = cancel
 		go m.runAgent(ctx, text)
@@ -210,6 +213,9 @@ func (m teaModel) handleKey(msg tea.KeyPressMsg) (teaModel, tea.Cmd) {
 
 // runAgent 在后台 goroutine 跑 agent：记录 user → 跑 agent → 记录 assistant。
 func (m teaModel) runAgent(ctx context.Context, text string) {
+	runMu.Lock() // 等上一个 run 结束（cancel 后它会快速退出），避免新旧两轮并发写 session
+	defer runMu.Unlock()
+
 	userMsg := message.NewUserMessage(text)
 
 	// 1. 加载历史（到最后一个 reset_boundary）
