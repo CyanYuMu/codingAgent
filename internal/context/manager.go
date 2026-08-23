@@ -57,6 +57,7 @@ type Manager struct {
 	summarizer Summarizer
 	window     int
 	keepRecent int
+	lastPrompt int                                          // 最近一次 provider 报告的 prompt tokens（估算校准用）
 	system     func(ctx context.Context) []message.Message // 系统提示 + 记忆块等前缀，由装配方注入
 }
 
@@ -103,20 +104,47 @@ func (m *Manager) Record(msg message.Message, u model.Usage) error {
 	return m.session.AppendWithUsage(msg, u)
 }
 
-// ShouldCompact 判断上一次调用的 prompt 用量是否超阈值。
-func (m *Manager) ShouldCompact(u model.Usage) bool { return u.PromptTokens > m.threshold() }
+// ShouldCompact 判断上一次调用的 prompt 用量是否超阈值；同时记下真值供估算校准。
+func (m *Manager) ShouldCompact(u model.Usage) bool {
+	if u.PromptTokens > 0 {
+		m.lastPrompt = u.PromptTokens
+	}
+	return u.PromptTokens > m.threshold()
+}
 
-// Compact 正常压缩：保留最近 keepRecent token，更早的段落摘要化。返回是否发生了压缩。
-func (m *Manager) Compact(ctx context.Context) (bool, error) { return m.compact(ctx, m.keepRecent) }
+// keepBudget 保留段预算（provider token）：不超过阈值的一半，否则小窗口下整段对话都"最近"，无可压内容。
+func (m *Manager) keepBudget() int {
+	return max(min(m.keepRecent, m.threshold()/2), 1)
+}
+
+// Compact 正常压缩：保留最近 keepBudget 的内容，更早的段落摘要化。返回是否发生了压缩。
+func (m *Manager) Compact(ctx context.Context) (bool, error) { return m.compact(ctx, m.keepBudget()) }
 
 // RecoverOverflow 溢出恢复：把保留量减半再压缩；仍无可压内容则只保留最后一段。
 func (m *Manager) RecoverOverflow(ctx context.Context) (bool, error) {
-	keep := max(m.keepRecent/2, 512)
+	keep := max(m.keepBudget()/2, 512)
 	did, err := m.compact(ctx, keep)
 	if err != nil || did {
 		return did, err
 	}
 	return m.compact(ctx, 1)
+}
+
+// calibrationMinEstimate 低于此估算量时不做比值校准（小样本下比值是噪声）。
+const calibrationMinEstimate = 2000
+
+// keepInEstimateUnits 把 provider token 预算换算成本地估算单位：
+// 本地估算按 rune/2，中文/代码的真实 token 密度可能高数倍，用「上次 prompt 真值 / 本地估算总量」校准。
+func (m *Manager) keepInEstimateUnits(keepProvider int, msgs []message.Message) int {
+	est := 0
+	for _, mm := range msgs {
+		est += estimateTokens(mm)
+	}
+	if m.lastPrompt <= 0 || est < calibrationMinEstimate {
+		return keepProvider
+	}
+	ratio := min(max(float64(m.lastPrompt)/float64(est), 0.25), 8)
+	return max(int(float64(keepProvider)/ratio), 1)
 }
 
 // AfterTurn 兼容旧接口：若超阈值则压缩。
@@ -136,7 +164,7 @@ func (m *Manager) compact(ctx context.Context, keep int) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	cut := findCutPoint(msgs, keep)
+	cut := findCutPoint(msgs, m.keepInEstimateUnits(keep, msgs))
 	if cut <= 0 {
 		return false, nil
 	}

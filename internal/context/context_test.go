@@ -159,12 +159,12 @@ func TestCompactKeepsToolPairsIntact(t *testing.T) {
 func TestRecoverOverflowCutsDeeper(t *testing.T) {
 	s, _ := session.New("s1", &session.MemoryStorage{})
 	fs := &fakeSummarizer{out: "S"}
-	cm := New(s, fs, 1000, 1000, nil)
+	cm := New(s, fs, 100000, 1000, nil)
 	for range 6 {
 		_ = cm.Record(ctxMsg(message.RoleUser, strings.Repeat("u", 50)), model.Usage{})
 		_ = cm.Record(ctxMsg(message.RoleAssistant, strings.Repeat("a", 50)), model.Usage{})
 	}
-	// keep=1000 覆盖全部 → 正常 Compact 无可压内容
+	// keep=1000 覆盖全部（总估算 ≈ 348）→ 正常 Compact 无可压内容
 	if did, _ := cm.Compact(context.Background()); did {
 		t.Fatal("nothing to compact at keep=1000")
 	}
@@ -175,6 +175,51 @@ func TestRecoverOverflowCutsDeeper(t *testing.T) {
 	msgs, _ := cm.Build(context.Background())
 	if len(msgs) >= 12 {
 		t.Fatalf("overflow recovery should shrink context, got %d", len(msgs))
+	}
+}
+
+func TestSmallWindowStillCompacts(t *testing.T) {
+	// 窗口 6000 → 阈值 3000 → 保留预算 min(16384, 1500)=1500；对话估算 ~4000 时必须能压
+	s, _ := session.New("s1", &session.MemoryStorage{})
+	fs := &fakeSummarizer{out: "S"}
+	cm := New(s, fs, 6000, 16384, nil)
+	for range 4 {
+		_ = cm.Record(ctxMsg(message.RoleUser, "read next"), model.Usage{})
+		_ = cm.Record(callMsg("c", "read_file", `{"file_path":"x.go"}`), model.Usage{})
+		_ = cm.Record(message.NewToolMessage("c", "read_file", strings.Repeat("func X() {}\n", 150), false), model.Usage{})
+	}
+	if !cm.ShouldCompact(model.Usage{PromptTokens: 4500}) {
+		t.Fatal("4500 > 3000 should compact")
+	}
+	did, err := cm.Compact(context.Background())
+	if err != nil || !did {
+		t.Fatalf("small window must compact: did=%v err=%v", did, err)
+	}
+	msgs, _ := cm.Build(context.Background())
+	if len(msgs) >= 12 || msgs[0].Blocks[0].Text != "S" {
+		t.Fatalf("build = %d msgs", len(msgs))
+	}
+	// 保留段仍以 user 开头（tool 对完整）
+	if msgs[1].Role != message.RoleUser {
+		t.Fatalf("kept segment must start at user, got %s", msgs[1].Role)
+	}
+}
+
+func TestCalibrationShrinksKeepWhenProviderCountsHigher(t *testing.T) {
+	s, _ := session.New("s1", &session.MemoryStorage{})
+	cm := New(s, &fakeSummarizer{out: "S"}, 100000, 2000, nil)
+	var msgs []message.Message
+	for range 10 {
+		msgs = append(msgs, ctxMsg(message.RoleUser, strings.Repeat("中", 400))) // 每条估算 204
+	}
+	// 无真值：原样
+	if got := cm.keepInEstimateUnits(1000, msgs); got != 1000 {
+		t.Fatalf("no calibration expected, got %d", got)
+	}
+	// 真值是估算的 4 倍 → 预算按估算单位缩到 1/4
+	cm.ShouldCompact(model.Usage{PromptTokens: 2040 * 4})
+	if got := cm.keepInEstimateUnits(1000, msgs); got < 240 || got > 260 {
+		t.Fatalf("calibrated keep = %d, want ~250", got)
 	}
 }
 

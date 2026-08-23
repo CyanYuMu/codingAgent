@@ -59,8 +59,10 @@ func (taskTool) Parameters() map[string]any {
 		},
 	}
 }
-func (taskTool) Required() []string    { return []string{"tasks"} }
-func (taskTool) Tier() permission.Tier { return permission.TierExec }
+func (taskTool) Required() []string { return []string{"tasks"} }
+
+// Tier 派发本身按 write 处理：子 agent 内部的每个工具都按继承的审批模式单独裁决，派发不是放行。
+func (taskTool) Tier() permission.Tier { return permission.TierWrite }
 func (taskTool) Concurrency() tool.Concurrency {
 	return tool.ConcurrencyShared // 可并行
 }
