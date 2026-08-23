@@ -31,4 +31,11 @@ func New(name, instruction string, m model.Model, tools *tool.Registry, mode per
 	}
 }
 
+// SetMaxIterations 覆盖工具循环上限（子 agent 用，0 表示不覆盖）。
+func (a *Agent) SetMaxIterations(n int) {
+	if n > 0 {
+		a.maxIterations = n
+	}
+}
+
 // Run 的实现见 loop.go。

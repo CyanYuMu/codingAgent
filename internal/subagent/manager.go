@@ -2,8 +2,10 @@ package subagent
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"strings"
+	"sync"
 
 	"einoclaw-build/internal/agent"
 	"einoclaw-build/internal/memory"
@@ -13,27 +15,23 @@ import (
 	"einoclaw-build/internal/tool"
 )
 
-// SubagentSpec 一个子 agent 的声明。
-type SubagentSpec struct {
-	Name         string
-	Description  string
-	SystemPrompt string
-	WhenToUse    string // 触发场景，task 描述枚举时带上
-}
-
 // Manager 派发子 agent：借用父的模型/工具/记忆，但独立 context。
 type Manager struct {
 	model  model.Model
 	tools  *tool.Registry
 	memory memory.Recaller
-	defs   []SubagentSpec // 保序（供 task 工具枚举）
+	defs   []SubagentSpec
+	sem    chan struct{} // 并发上限（Semaphore）
 }
 
 func NewManager(m model.Model, tools *tool.Registry, mem memory.Recaller, defs []SubagentSpec) *Manager {
-	return &Manager{model: m, tools: tools, memory: mem, defs: defs}
+	return &Manager{
+		model: m, tools: tools, memory: mem, defs: defs,
+		sem: make(chan struct{}, 4), // 默认并发上限 4
+	}
 }
 
-// List 返回子 agent 定义（确定性顺序，供 task 工具枚举可用子 agent）。
+// List 返回子 agent 定义（确定性顺序，供 task 工具枚举）。
 func (m *Manager) List() []SubagentSpec { return m.defs }
 
 func (m *Manager) find(name string) (SubagentSpec, bool) {
@@ -45,32 +43,91 @@ func (m *Manager) find(name string) (SubagentSpec, bool) {
 	return SubagentSpec{}, false
 }
 
-// Run 派发一个子 agent，返回最终结论文本。
-// Context Isolation：只传 [prompt]，不传父的历史；父只拿 result，不拿子 agent 的中间过程。
-func (m *Manager) Run(ctx context.Context, name, prompt string) (string, error) {
+// Run 派发一个子 agent，返回 Result。
+// Context Isolation：只传 [prompt]，不传父历史；拦截 yield 的结构化产出。
+func (m *Manager) Run(ctx context.Context, name, prompt string) Result {
 	def, ok := m.find(name)
 	if !ok {
-		return "", fmt.Errorf("unknown subagent %q", name)
+		return Result{ID: name, Status: StatusFailed, Err: fmt.Errorf("unknown subagent %q", name)}
 	}
-	// 子 agent：同模型、同工具、同记忆，headless（yolo，无审批）。
-	// 去掉 task 工具，防止子 agent 再派子 agent（递归）。
-	sub := agent.New(def.Name, def.SystemPrompt, m.model, m.tools.Without("task"), permission.ModeYolo, nil, m.memory)
 
-	var result string
+	// 子 agent 工具：worker 工具（无 task）+ yield
+	subTools := m.tools.Without("task")
+	subTools.Register(NewYieldTool())
+	sub := agent.New(def.Name, def.SystemPrompt, m.model, subTools, permission.ModeYolo, nil, m.memory)
+	sub.SetMaxIterations(def.MaxTurns)
+
+	// wall-clock 超时
+	runCtx := ctx
+	var cancel context.CancelFunc
+	if def.Timeout > 0 {
+		runCtx, cancel = context.WithTimeout(ctx, def.Timeout)
+		defer cancel()
+	}
+
+	var data map[string]any
+	var text string
 	var runErr error
-	for ev := range sub.Run(ctx, []message.Message{message.NewUserMessage(prompt)}) {
+	status := StatusCompleted
+	for ev := range sub.Run(runCtx, []message.Message{message.NewUserMessage(prompt)}) {
 		switch ev.Type {
+		case agent.EventToolStart:
+			if ev.ToolStart.Name == "yield" {
+				var args map[string]any
+				if json.Unmarshal([]byte(ev.ToolStart.Args), &args) == nil {
+					if d, ok := args["data"].(map[string]any); ok {
+						data = d
+					}
+				}
+			}
 		case agent.EventMessageEnd:
-			result = textOf(ev.Ended.Message) // 最后一个定稿消息 = 最终结论
+			text = textOf(ev.Ended.Message)
 		case agent.EventError:
 			runErr = ev.Err
+			status = StatusFailed
 		}
 	}
-	if runErr != nil {
-		return "", runErr // 传播子 agent 的错误（如模型调用失败）
+
+	// outputSchema 校验（基本）：要求了 schema 却没产出 data → failed
+	if def.OutputSchema != nil && data == nil {
+		status = StatusFailed
+		if runErr == nil {
+			runErr = fmt.Errorf("子 agent 未产出符合 schema 的结构化数据")
+		}
 	}
-	return result, nil
+	return Result{ID: name, Status: status, Data: data, Text: text, Err: runErr}
 }
+
+// RunMany 并行派发多个子 agent（Semaphore 限并发），结果按序返回。
+func (m *Manager) RunMany(ctx context.Context, tasks []Task) []Result {
+	results := make([]Result, len(tasks))
+	var wg sync.WaitGroup
+	for i, t := range tasks {
+		if err := m.acquire(ctx); err != nil {
+			results[i] = Result{ID: t.Subagent, Status: StatusFailed, Err: err}
+			continue
+		}
+		wg.Add(1)
+		go func(i int, t Task) {
+			defer wg.Done()
+			defer m.release()
+			results[i] = m.Run(ctx, t.Subagent, t.Prompt)
+		}(i, t)
+	}
+	wg.Wait()
+	return results
+}
+
+func (m *Manager) acquire(ctx context.Context) error {
+	select {
+	case m.sem <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (m *Manager) release() { <-m.sem }
 
 func textOf(m message.Message) string {
 	var sb strings.Builder

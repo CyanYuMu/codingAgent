@@ -49,3 +49,17 @@ func TestSinkOffloadsArtifact(t *testing.T) {
 		t.Fatalf("artifact 内容 = %q", data)
 	}
 }
+
+func TestSinkNoArtifactDirNoPanic(t *testing.T) {
+	s := NewSink(4, 4)
+	defer s.Close()
+	// 不 SetArtifactDir：大输出应只截断、不 panic、不显示 artifact 指针
+	s.Write([]byte("0123456789abcdef")) // 16 bytes > 8 窗口
+	r := s.Result()
+	if !strings.Contains(r, "elided") {
+		t.Fatalf("应截断，got %q", r)
+	}
+	if strings.Contains(r, "artifact://") {
+		t.Fatalf("未配置目录不应有 artifact 指针，got %q", r)
+	}
+}

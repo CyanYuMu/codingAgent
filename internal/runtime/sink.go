@@ -43,7 +43,7 @@ func (s *Sink) Write(p []byte) (int, error) {
 	defer s.mu.Unlock()
 
 	// 已截断：新内容也要写进 artifact 保持完整
-	if s.truncated {
+	if s.truncated && s.artifact != nil {
 		s.artifact.Write(p)
 	}
 
@@ -53,7 +53,9 @@ func (s *Sink) Write(p []byte) (int, error) {
 	if len(s.buf) > s.headLimit+s.tailLimit {
 		if !s.truncated {
 			s.openArtifactLocked()
-			s.artifact.Write(s.buf) // 首次截断：把当前完整内容落盘
+			if s.artifact != nil {
+				s.artifact.Write(s.buf) // 首次截断：把当前完整内容落盘
+			}
 			s.truncated = true
 		}
 		// 窗口截断：头 headLimit + 尾 tailLimit
@@ -76,7 +78,7 @@ func (s *Sink) Result() string {
 	sb.Write(s.buf[:s.headLimit])
 	fmt.Fprintf(&sb, "\n...(%d bytes elided)...\n", elided)
 	sb.Write(s.buf[s.headLimit:])
-	if s.artifactID != "" {
+	if s.artifact != nil {
 		fmt.Fprintf(&sb, "\n[完整输出已保存: artifact://%s]", s.artifactID)
 	}
 	return sb.String()
@@ -93,12 +95,13 @@ func (s *Sink) Close() error {
 }
 
 func (s *Sink) openArtifactLocked() {
+	if s.artifactDir == "" {
+		return // 未配置落盘目录：只截断不落盘（artifact 保持 nil，Result 不显示指针）
+	}
 	id := sinkCounter.Add(1)
 	s.artifactID = fmt.Sprintf("artifact-%d", id)
-	if s.artifactDir != "" {
-		f, err := os.Create(filepath.Join(s.artifactDir, s.artifactID+".log"))
-		if err == nil {
-			s.artifact = f
-		}
+	f, err := os.Create(filepath.Join(s.artifactDir, s.artifactID+".log"))
+	if err == nil {
+		s.artifact = f
 	}
 }
