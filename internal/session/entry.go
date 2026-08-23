@@ -1,6 +1,9 @@
 package session
 
-import "einoclaw-build/internal/message"
+import (
+	"einoclaw-build/internal/message"
+	"einoclaw-build/internal/model"
+)
 
 // EntryType 区分 JSONL 一行的类型。
 type EntryType string
@@ -19,6 +22,7 @@ type Entry struct {
 	ID         string           `json:"id,omitempty"`         // EntrySession: 会话 id
 	Message    *message.Message `json:"message,omitempty"`    // EntryMessage: 消息内容
 	Compaction *Compaction      `json:"compaction,omitempty"` // EntryCompaction: 摘要
+	Usage      model.Usage      `json:"usage,omitzero"`       // EntryMessage(assistant): 本轮用量
 }
 
 // Compaction 记录一次上下文压缩：把更早的消息浓缩成一段摘要。

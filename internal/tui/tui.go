@@ -233,8 +233,8 @@ func (m teaModel) runAgent(ctx context.Context, text string) {
 		}
 		switch ev.Type {
 		case agent.EventMessageEnd:
-			// 4. 定稿后记录 assistant 消息
-			_ = m.session.Append(ev.Ended.Message)
+			// 4. 定稿后记录 assistant 消息 + 用量（供 trace 审计）
+			_ = m.session.AppendWithUsage(ev.Ended.Message, ev.Ended.Usage)
 			_ = m.cmgr.AfterTurn(ctx, ev.Ended.Usage) // P3：超阈值则压缩
 		case agent.EventToolEnd:
 			// 记录工具结果，否则 replay 时 tool_calls 缺配对 tool 消息，API 报 insufficient tool messages

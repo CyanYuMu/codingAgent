@@ -4,6 +4,7 @@ import (
 	"sync"
 
 	"einoclaw-build/internal/message"
+	"einoclaw-build/internal/model"
 )
 
 // Session 在 Storage 之上加语义：reset 封存、replay 重建、fork 分支。
@@ -23,9 +24,21 @@ func New(id string, st Storage) (*Session, error) {
 
 // Append 记录一条消息（user/assistant/tool）。
 func (s *Session) Append(m message.Message) error {
+	return s.AppendWithUsage(m, model.Usage{})
+}
+
+// AppendWithUsage 记录一条消息并附带用量（assistant 消息用，供 trace 聚合）。
+func (s *Session) AppendWithUsage(m message.Message, u model.Usage) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.storage.Append(Entry{Type: EntryMessage, Message: &m})
+	return s.storage.Append(Entry{Type: EntryMessage, Message: &m, Usage: u})
+}
+
+// Entries 返回原始条目（含用量，供 trace 用）。
+func (s *Session) Entries() ([]Entry, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.storage.Entries()
 }
 
 // Reset 写一条 reset_boundary，封存之前的历史。
