@@ -2,6 +2,8 @@ package runtime
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -22,6 +24,29 @@ func TestParseCd(t *testing.T) {
 	}
 	if _, _, ok := parseCd("ls -la"); ok {
 		t.Fatal("无 cd 前缀应返回 ok=false")
+	}
+}
+
+func TestBashDefaultCwdAndRelativeCd(t *testing.T) {
+	dir := t.TempDir()
+	dir, _ = filepath.EvalSymlinks(dir)
+	_ = os.MkdirAll(filepath.Join(dir, "sub"), 0o755)
+	b := NewBash(dir)
+	sink := NewSink(4000, 4000)
+	defer sink.Close()
+	if err := b.Execute(context.Background(), "cd sub && pwd", sink); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasSuffix(strings.TrimSpace(sink.Result()), "sub") || b.CWD() != filepath.Join(dir, "sub") {
+		t.Fatalf("cwd = %q out = %q", b.CWD(), sink.Result())
+	}
+	if NewBash("").CWD() == "" {
+		t.Fatal("empty cwd should default to os.Getwd")
+	}
+	// 两个实例互不影响
+	other := NewBash(dir)
+	if other.CWD() != dir {
+		t.Fatalf("other cwd = %q", other.CWD())
 	}
 }
 

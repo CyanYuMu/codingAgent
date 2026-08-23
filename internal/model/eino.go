@@ -2,6 +2,7 @@ package model
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"strings"
 
@@ -11,6 +12,7 @@ import (
 	"github.com/cloudwego/eino-ext/components/model/agenticqwen"
 	cmodel "github.com/cloudwego/eino/components/model"
 	"github.com/cloudwego/eino/schema"
+	"github.com/eino-contrib/jsonschema"
 
 	"einoclaw-build/internal/message"
 )
@@ -21,7 +23,7 @@ type einoModel struct {
 }
 
 // Stream 把我们的消息转成 eino 的 AgenticMessage，带工具定义发起流式调用。
-func (m *einoModel) Stream(ctx context.Context, msgs []message.Message, tools []ToolSpec) (*Stream, error) {
+func (m *einoModel) Stream(ctx context.Context, msgs []message.Message, tools []ToolSpec) (ModelStream, error) {
 	agenticMsgs := toAgenticMessages(msgs)
 	var opts []cmodel.Option
 	if len(tools) > 0 {
@@ -127,49 +129,44 @@ func toToolAgenticMessage(m message.Message) *schema.AgenticMessage {
 	return tm
 }
 
-// toSchemaTools 把我们的 ToolSpec 转成 eino 的 ToolInfo（用 params 形式描述参数）。
+// toSchemaTools 把我们的 ToolSpec 转成 eino 的 ToolInfo：
+// 把 {type:object, properties, required} 整体编码再解析为 *jsonschema.Schema，嵌套的 items/properties/enum/description 原样透传。
 func toSchemaTools(tools []ToolSpec) []*schema.ToolInfo {
 	out := make([]*schema.ToolInfo, 0, len(tools))
 	for _, t := range tools {
-		params := map[string]*schema.ParameterInfo{}
-		for name, spec := range t.Parameters {
-			params[name] = &schema.ParameterInfo{
-				Type:     dataTypeOf(spec),
-				Required: true,
-			}
+		js, err := toolJSONSchema(t)
+		if err != nil {
+			continue
 		}
 		out = append(out, &schema.ToolInfo{
 			Name:        t.Name,
 			Desc:        t.Description,
-			ParamsOneOf: schema.NewParamsOneOfByParams(params),
+			ParamsOneOf: schema.NewParamsOneOfByJSONSchema(js),
 		})
 	}
 	return out
 }
 
-// dataTypeOf 从参数的 JSON-schema 描述里取 type，默认 string。
-func dataTypeOf(spec any) schema.DataType {
-	m, ok := spec.(map[string]any)
-	if !ok {
-		return schema.String
+// toolJSONSchema 把 ToolSpec 的参数描述转成完整的对象 JSON Schema。
+func toolJSONSchema(t ToolSpec) (*jsonschema.Schema, error) {
+	props := t.Parameters
+	if props == nil {
+		props = map[string]any{}
 	}
-	ts, _ := m["type"].(string)
-	switch ts {
-	case "object":
-		return schema.Object
-	case "number":
-		return schema.Number
-	case "integer":
-		return schema.Integer
-	case "array":
-		return schema.Array
-	case "boolean":
-		return schema.Boolean
-	case "null":
-		return schema.Null
-	default:
-		return schema.String
+	required := t.Required
+	if required == nil {
+		required = []string{}
 	}
+	raw := map[string]any{"type": "object", "properties": props, "required": required}
+	b, err := json.Marshal(raw)
+	if err != nil {
+		return nil, err
+	}
+	var js jsonschema.Schema
+	if err := json.Unmarshal(b, &js); err != nil {
+		return nil, err
+	}
+	return &js, nil
 }
 
 // textOf 拼接消息里的所有文本块。

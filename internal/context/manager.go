@@ -3,6 +3,7 @@ package context
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"strings"
 
@@ -11,10 +12,12 @@ import (
 	"einoclaw-build/internal/session"
 )
 
-// summarizer 抽象摘要能力（生产用 model.Model，测试用假实现）。
-type summarizer interface {
+// Summarizer 抽象摘要能力（生产用 model.Model，测试用假实现）。
+type Summarizer interface {
 	Summarize(ctx context.Context, msgs []message.Message) (string, error)
 }
+
+type summarizer = Summarizer
 
 // modelSummarizer 用 model.Model 实现摘要。
 type modelSummarizer struct {
@@ -22,7 +25,7 @@ type modelSummarizer struct {
 }
 
 // NewModelSummarizer 构造基于 model.Model 的摘要器。
-func NewModelSummarizer(m model.Model) summarizer {
+func NewModelSummarizer(m model.Model) Summarizer {
 	return &modelSummarizer{model: m}
 }
 
@@ -47,47 +50,119 @@ func (m *modelSummarizer) Summarize(ctx context.Context, msgs []message.Message)
 	return sb.String(), nil
 }
 
-// ContextManager 管理上下文预算：超阈值自动压缩。
-type ContextManager struct {
-	session          *session.Session
-	summarizer       summarizer
-	window           int
-	keepRecentTokens int
+// Manager 是循环的真相源：从 session 重建输入、记录消息、超阈值压缩、溢出恢复。
+// 它实现 agent.Context。
+type Manager struct {
+	session    *session.Session
+	summarizer Summarizer
+	window     int
+	keepRecent int
+	system     func(ctx context.Context) []message.Message // 系统提示 + 记忆块等前缀，由装配方注入
 }
 
-func New(s *session.Session, sum summarizer, window, keepRecentTokens int) *ContextManager {
-	return &ContextManager{session: s, summarizer: sum, window: window, keepRecentTokens: keepRecentTokens}
+// New 构造 Manager。system 为 nil 时不注入前缀；summarizer 为 nil 时不压缩（Compact 恒返回 false）。
+func New(s *session.Session, sum Summarizer, window, keepRecent int, system func(context.Context) []message.Message) *Manager {
+	if system == nil {
+		system = func(context.Context) []message.Message { return nil }
+	}
+	if keepRecent <= 0 {
+		keepRecent = 16384
+	}
+	return &Manager{session: s, summarizer: sum, window: window, keepRecent: keepRecent, system: system}
 }
+
+// Session 返回当前会话。
+func (m *Manager) Session() *session.Session { return m.session }
+
+// SetSession 切换当前会话（多会话 /new /resume 时跟随）。
+func (m *Manager) SetSession(s *session.Session) { m.session = s }
 
 // threshold 预算阈值：window − reserve，reserve = max(15%·window, 16384)。
-func (cm *ContextManager) threshold() int {
-	reserve := max(cm.window*15/100, 16384)
-	if reserve >= cm.window {
-		reserve = cm.window / 2
+func (m *Manager) threshold() int {
+	reserve := max(m.window*15/100, 16384)
+	if reserve >= m.window {
+		reserve = m.window / 2
 	}
-	return cm.window - reserve
+	return m.window - reserve
 }
 
-// AfterTurn 每轮结束后调用；若上下文超阈值则压缩。
-func (cm *ContextManager) AfterTurn(ctx context.Context, usage model.Usage) error {
-	if usage.PromptTokens <= cm.threshold() {
+// Build 重建模型输入：system 前缀 + 会话回放（含压缩展开与悬空修复）。
+func (m *Manager) Build(ctx context.Context) ([]message.Message, error) {
+	hist, err := m.session.Replay()
+	if err != nil {
+		return nil, err
+	}
+	prefix := m.system(ctx)
+	out := make([]message.Message, 0, len(prefix)+len(hist))
+	out = append(out, prefix...)
+	return append(out, hist...), nil
+}
+
+// Record 记录一条消息到会话（assistant 消息带用量）。
+func (m *Manager) Record(msg message.Message, u model.Usage) error {
+	return m.session.AppendWithUsage(msg, u)
+}
+
+// ShouldCompact 判断上一次调用的 prompt 用量是否超阈值。
+func (m *Manager) ShouldCompact(u model.Usage) bool { return u.PromptTokens > m.threshold() }
+
+// Compact 正常压缩：保留最近 keepRecent token，更早的段落摘要化。返回是否发生了压缩。
+func (m *Manager) Compact(ctx context.Context) (bool, error) { return m.compact(ctx, m.keepRecent) }
+
+// RecoverOverflow 溢出恢复：把保留量减半再压缩；仍无可压内容则只保留最后一段。
+func (m *Manager) RecoverOverflow(ctx context.Context) (bool, error) {
+	keep := max(m.keepRecent/2, 512)
+	did, err := m.compact(ctx, keep)
+	if err != nil || did {
+		return did, err
+	}
+	return m.compact(ctx, 1)
+}
+
+// AfterTurn 兼容旧接口：若超阈值则压缩。
+func (m *Manager) AfterTurn(ctx context.Context, usage model.Usage) error {
+	if !m.ShouldCompact(usage) {
 		return nil
 	}
-	return cm.compact(ctx)
+	_, err := m.Compact(ctx)
+	return err
 }
 
-func (cm *ContextManager) compact(ctx context.Context) error {
-	msgs, err := cm.session.Replay()
-	if err != nil {
-		return err
+func (m *Manager) compact(ctx context.Context, keep int) (bool, error) {
+	if m.summarizer == nil {
+		return false, nil
 	}
-	cut := findCutPoint(msgs, cm.keepRecentTokens)
+	msgs, err := m.session.Replay()
+	if err != nil {
+		return false, err
+	}
+	cut := findCutPoint(msgs, keep)
 	if cut <= 0 {
-		return nil // 无更早内容可压
+		return false, nil
 	}
-	summary, err := cm.summarizer.Summarize(ctx, msgs[:cut])
+	summary, err := m.summarizer.Summarize(ctx, msgs[:cut])
 	if err != nil {
-		return err
+		return false, err
 	}
-	return cm.session.Compact(summary, msgs[cut:])
+	firstKept, err := m.entryIDOfMessageIndex(cut)
+	if err != nil {
+		return false, err
+	}
+	before := 0
+	for _, mm := range msgs {
+		before += estimateTokens(mm)
+	}
+	return true, m.session.Compact(summary, firstKept, before)
+}
+
+// entryIDOfMessageIndex 把 Replay 下标映射回 session 条目 id（与 Replay 一一对应）。
+func (m *Manager) entryIDOfMessageIndex(idx int) (string, error) {
+	ids, err := m.session.ContextEntryIDs()
+	if err != nil {
+		return "", err
+	}
+	if idx < 0 || idx >= len(ids) {
+		return "", fmt.Errorf("cut index %d out of range %d", idx, len(ids))
+	}
+	return ids[idx], nil
 }

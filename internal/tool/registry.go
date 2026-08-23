@@ -73,11 +73,15 @@ func (r *Registry) Specs() []model.ToolSpec {
 	specs := make([]model.ToolSpec, 0, len(names))
 	for _, n := range names {
 		t := r.tools[n]
-		specs = append(specs, model.ToolSpec{
+		spec := model.ToolSpec{
 			Name:        t.Name(),
 			Description: t.Description(),
 			Parameters:  t.Parameters(),
-		})
+		}
+		if rp, ok := t.(RequiredParams); ok {
+			spec.Required = rp.Required()
+		}
+		specs = append(specs, spec)
 	}
 	return specs
 }

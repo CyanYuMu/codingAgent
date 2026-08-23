@@ -13,50 +13,58 @@ import (
 
 	"einoclaw-build/internal/agent"
 	agentctx "einoclaw-build/internal/context"
+	"einoclaw-build/internal/memory"
 	"einoclaw-build/internal/message"
+	"einoclaw-build/internal/model"
 	"einoclaw-build/internal/session"
 )
 
-// P1：从阶段5的 tui.go 重建 + 改造。
-// 事件源从「eino 的 OnAgentEvents 消息」换成「我们自己的 agent.AgentEvent」；
-// 移除 eino 依赖与工具渲染（工具展示 P4 加）。
+// 事件源是我们自己的 agent.AgentEvent；持久化由循环内的 Context 完成，TUI 只负责渲染与会话切换。
 
 var (
 	userPrefix = lipgloss.NewStyle().Foreground(lipgloss.Color("63")).Bold(true).Render("┃ ")
 	aiPrefix   = lipgloss.NewStyle().Foreground(lipgloss.Color("14")).Render("● ")
+	dimStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("244"))
 
-	// 双协程桥接用（沿用旧「全局 program + program.Send」模式）
+	// 双协程桥接用（沿用「全局 program + program.Send」模式）
 	program       *tea.Program
 	currentCancel context.CancelFunc
-	runMu         sync.Mutex // 保证同一时刻只有一个 run（防双 run 竞态）
+	currentSteer  chan message.Message // 当前 run 的 steering 通道
+	runMu         sync.Mutex           // 保证同一时刻只有一个 run（防双 run 竞态）
 )
 
 // SetProgram 注入 BubbleTea program，供后台 goroutine 把事件塞回 TUI 主循环。
 func SetProgram(p *tea.Program) { program = p }
 
 type teaModel struct {
-	width            int
-	height           int
-	chatLines        []string // 已完成的终端行(已渲染、已带前缀)
-	streaming        string   // 当前流式 AI 正文(Markdown 原文)
-	stream           *streamingMarkdown
+	width             int
+	height            int
+	chatLines         []string // 已完成的终端行(已渲染、已带前缀)
+	streaming         string   // 当前流式 AI 正文(Markdown 原文)
+	stream            *streamingMarkdown
 	streamingThinking string // 当前流式思考(原文)
-	inputArea        textarea.Model
-	agent            *agent.Agent
-	session          *session.Session
-	cmgr             *agentctx.ContextManager
-	pendingApproval  *approvalRequestMsg // nil = 无待审批
+	inputArea         textarea.Model
+	agent             *agent.Agent
+	session           *session.Session
+	mgr               *session.Manager // 多会话管理（/new /resume）
+	cmgr              *agentctx.Manager
+	mem               *memory.Store       // 长期记忆（/forget 用）
+	cwd               string              // 新建会话时写入 header
+	pendingApproval   *approvalRequestMsg // nil = 无待审批
+	scrollOffset      int                 // 聊天滚动偏移（0=底部，>0=上滚 N 行）
 }
 
-func NewModel(ag *agent.Agent, s *session.Session, cmgr *agentctx.ContextManager) teaModel {
+// NewModel 构造 TUI 模型；cmgr 持有当前会话，cwd 用于新建会话。
+func NewModel(ag *agent.Agent, mgr *session.Manager, cmgr *agentctx.Manager, mem *memory.Store, cwd string) teaModel {
 	ta := textarea.New()
-	ta.Placeholder = " Type your message... (Enter=send, Ctrl+J=newline, Ctrl+C=quit)"
+	ta.Placeholder = " Type your message... (Enter=send, Ctrl+J=newline, Ctrl+E=steer, Ctrl+C=quit)"
 	ta.SetHeight(3)
 	ta.ShowLineNumbers = false
 	ta.CharLimit = 0
 	ta.KeyMap.InsertNewline = key.NewBinding(key.WithKeys("ctrl+j"), key.WithHelp("ctrl+j", "newline"))
 	ta.Focus()
-	m := teaModel{inputArea: ta, agent: ag, session: s, cmgr: cmgr}
+	s := cmgr.Session()
+	m := teaModel{inputArea: ta, agent: ag, session: s, mgr: mgr, cmgr: cmgr, mem: mem, cwd: cwd}
 	// 恢复历史：replay 后渲染进聊天区
 	if msgs, err := s.Replay(); err == nil {
 		m.chatLines = renderHistory(msgs)
@@ -84,6 +92,18 @@ func (m teaModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case approvalRequestMsg:
 		m.pendingApproval = &msg // 弹审批窗
+		return m, nil
+
+	case tea.MouseWheelMsg:
+		switch msg.Button {
+		case tea.MouseWheelUp:
+			m.scrollOffset += 3 // 上滚
+		case tea.MouseWheelDown:
+			m.scrollOffset -= 3 // 下滚
+			if m.scrollOffset < 0 {
+				m.scrollOffset = 0
+			}
+		}
 		return m, nil
 	}
 	var cmd tea.Cmd
@@ -115,6 +135,13 @@ func (m teaModel) handleAgentEvent(ev agent.AgentEvent) (teaModel, tea.Cmd) {
 		m.chatLines = append(m.chatLines, renderToolCall(ev.ToolStart))
 	case agent.EventToolEnd:
 		m.chatLines = append(m.chatLines, renderToolResult(ev.ToolEnd)...)
+	case agent.EventCompaction:
+		m = m.finalizeStreaming()
+		m.chatLines = append(m.chatLines, dimStyle.Render("── 上下文已压缩（"+ev.Compaction.Reason+"）──"))
+	case agent.EventRetry:
+		m.chatLines = append(m.chatLines, dimStyle.Render(fmt.Sprintf("⟳ 模型错误，%v 后重试（%d/3）：%v", ev.Retry.Delay, ev.Retry.Attempt, ev.Retry.Err)))
+	case agent.EventTerminated:
+		m.chatLines = append(m.chatLines, dimStyle.Render("  ✓ "+ev.Terminated.ToolName))
 	case agent.EventError:
 		m.chatLines = append(m.chatLines, renderError(ev.Err))
 	}
@@ -141,9 +168,10 @@ func (m teaModel) View() tea.View {
 		}
 		all = append(all, lines...)
 	}
-	if len(all) > chatHeight {
-		all = all[len(all)-chatHeight:]
-	}
+	// 虚拟滚动：只渲染可见窗口（start..end），scrollOffset 控制上滚量
+	start := max(len(all)-chatHeight-m.scrollOffset, 0)
+	end := min(start+chatHeight, len(all))
+	all = all[start:end]
 	for len(all) < chatHeight {
 		all = append(all, "")
 	}
@@ -154,7 +182,7 @@ func (m teaModel) View() tea.View {
 		bottom = renderApprovalDialog(m.pendingApproval.call)
 	}
 	content := lipgloss.JoinVertical(lipgloss.Top, chatView, "", bottom)
-	return tea.View{Content: content, AltScreen: true}
+	return tea.View{Content: content, AltScreen: true, MouseMode: tea.MouseModeCellMotion}
 }
 
 func (m teaModel) handleKey(msg tea.KeyPressMsg) (teaModel, tea.Cmd) {
@@ -172,6 +200,26 @@ func (m teaModel) handleKey(msg tea.KeyPressMsg) (teaModel, tea.Cmd) {
 	}
 
 	switch {
+	case key.Matches(msg, key.NewBinding(key.WithKeys("pgup"))):
+		m.scrollOffset += max(1, m.height/2) // 上滚半屏
+		return m, nil
+	case key.Matches(msg, key.NewBinding(key.WithKeys("pgdown"))):
+		m.scrollOffset -= max(1, m.height/2) // 下滚半屏
+		if m.scrollOffset < 0 {
+			m.scrollOffset = 0
+		}
+		return m, nil
+
+	case key.Matches(msg, key.NewBinding(key.WithKeys("ctrl+e"))):
+		// steering：注入当前输入作为修正，不取消当前 run
+		if currentSteer != nil {
+			if t := strings.TrimSpace(m.inputArea.Value()); t != "" {
+				currentSteer <- message.NewUserMessage(t)
+				m.inputArea.Reset()
+			}
+		}
+		return m, nil
+
 	case key.Matches(msg, key.NewBinding(key.WithKeys("ctrl+c"))):
 		if currentCancel != nil {
 			currentCancel() // 停当前流
@@ -183,11 +231,8 @@ func (m teaModel) handleKey(msg tea.KeyPressMsg) (teaModel, tea.Cmd) {
 		if text == "" {
 			return m, nil
 		}
-		if text == "/clear" {
-			_ = m.session.Reset()
-			m.chatLines = nil
-			m.inputArea.Reset()
-			return m, nil
+		if handled, nm := m.handleSlash(text); handled {
+			return nm, nil
 		}
 		m.inputArea.Reset()
 		m = m.finalizeStreaming() // 收尾当前 AI 消息(若有)
@@ -195,6 +240,7 @@ func (m teaModel) handleKey(msg tea.KeyPressMsg) (teaModel, tea.Cmd) {
 		userLines := strings.Split(text, "\n")
 		userLines[0] = userPrefix + userLines[0]
 		m.chatLines = append(m.chatLines, userLines...)
+		m.scrollOffset = 0 // 发新消息跳到底部
 
 		// 取消上一轮，清掉可能残留的审批弹窗，起新一轮 agent run
 		if currentCancel != nil {
@@ -203,7 +249,9 @@ func (m teaModel) handleKey(msg tea.KeyPressMsg) (teaModel, tea.Cmd) {
 		m.pendingApproval = nil
 		ctx, cancel := context.WithCancel(context.Background())
 		currentCancel = cancel
-		go m.runAgent(ctx, text)
+		steer := make(chan message.Message, 8)
+		currentSteer = steer
+		go m.runAgent(ctx, text, steer)
 		return m, nil
 	}
 	var cmd tea.Cmd
@@ -211,34 +259,94 @@ func (m teaModel) handleKey(msg tea.KeyPressMsg) (teaModel, tea.Cmd) {
 	return m, cmd
 }
 
-// runAgent 在后台 goroutine 跑 agent：记录 user → 跑 agent → 记录 assistant。
-func (m teaModel) runAgent(ctx context.Context, text string) {
+// handleSlash 处理斜杠命令；返回是否已处理。
+func (m teaModel) handleSlash(text string) (bool, teaModel) {
+	switch {
+	case text == "/clear":
+		_ = m.session.Reset()
+		m.chatLines = nil
+		m.inputArea.Reset()
+		return true, m
+	case text == "/forget":
+		if m.mem != nil {
+			_ = m.mem.Clear()
+		}
+		m.chatLines = append(m.chatLines, "已清空本项目的长期记忆")
+		m.inputArea.Reset()
+		return true, m
+	case text == "/new":
+		if currentCancel != nil {
+			currentCancel()
+		}
+		ns, err := m.mgr.New(m.cwd)
+		if err != nil {
+			m.chatLines = append(m.chatLines, renderError(err))
+			return true, m
+		}
+		m.session.Close()
+		m.session = ns
+		m.cmgr.SetSession(ns)
+		m.chatLines = nil
+		m.inputArea.Reset()
+		return true, m
+	case text == "/sessions":
+		infos, err := m.mgr.List()
+		if err != nil {
+			m.chatLines = append(m.chatLines, renderError(err))
+			return true, m
+		}
+		m.chatLines = append(m.chatLines, "会话列表（/resume <id前缀> 切换）：")
+		for _, in := range infos {
+			mark := "  "
+			if in.ID == m.session.Header().ID {
+				mark = "* "
+			}
+			m.chatLines = append(m.chatLines, fmt.Sprintf("%s%s  %s  %s", mark, in.ID, dimStyle.Render(in.ModTime.Format("01-02 15:04")), in.Label()))
+		}
+		m.inputArea.Reset()
+		return true, m
+	case strings.HasPrefix(text, "/resume "):
+		id := strings.TrimSpace(strings.TrimPrefix(text, "/resume "))
+		if currentCancel != nil {
+			currentCancel()
+		}
+		ns, err := m.mgr.Switch(id)
+		if err != nil {
+			m.chatLines = append(m.chatLines, renderError(err))
+			m.inputArea.Reset()
+			return true, m
+		}
+		m.session.Close()
+		m.session = ns
+		m.cmgr.SetSession(ns)
+		m.chatLines = nil
+		if msgs, err := ns.Replay(); err == nil {
+			m.chatLines = renderHistory(msgs)
+		}
+		m.inputArea.Reset()
+		return true, m
+	case strings.HasPrefix(text, "/title "):
+		title := strings.TrimSpace(strings.TrimPrefix(text, "/title "))
+		if title != "" {
+			_ = m.session.SetTitle(title)
+			m.chatLines = append(m.chatLines, dimStyle.Render("标题已设为："+title))
+		}
+		m.inputArea.Reset()
+		return true, m
+	}
+	return false, m
+}
+
+// runAgent 在后台 goroutine 跑 agent：记录用户消息 → 跑循环（循环内记录 assistant/tool）。
+func (m teaModel) runAgent(ctx context.Context, text string, steer chan message.Message) {
 	runMu.Lock() // 等上一个 run 结束（cancel 后它会快速退出），避免新旧两轮并发写 session
 	defer runMu.Unlock()
+	defer func() { currentSteer = nil }()
 
-	userMsg := message.NewUserMessage(text)
-
-	// 1. 加载历史（到最后一个 reset_boundary）
-	history, err := m.session.Replay()
-	if err != nil {
-		history = nil
-	}
-	// 2. 记录用户消息
-	_ = m.session.Append(userMsg)
-	// 3. 跑 agent：输入 = 历史 + 用户消息
-	input := append(history, userMsg)
-	for ev := range m.agent.Run(ctx, input) {
+	_ = m.cmgr.Record(message.NewUserMessage(text), model.Usage{})
+	for ev := range m.agent.Run(ctx, steer) {
 		if program != nil {
 			program.Send(ev)
-		}
-		switch ev.Type {
-		case agent.EventMessageEnd:
-			// 4. 定稿后记录 assistant 消息 + 用量（供 trace 审计）
-			_ = m.session.AppendWithUsage(ev.Ended.Message, ev.Ended.Usage)
-			_ = m.cmgr.AfterTurn(ctx, ev.Ended.Usage) // P3：超阈值则压缩
-		case agent.EventToolEnd:
-			// 记录工具结果，否则 replay 时 tool_calls 缺配对 tool 消息，API 报 insufficient tool messages
-			_ = m.session.Append(message.NewToolMessage(ev.ToolEnd.ID, ev.ToolEnd.Name, ev.ToolEnd.Content, false))
 		}
 	}
 }
@@ -278,7 +386,7 @@ func renderToolCall(ts *agent.ToolStart) string {
 	return "  " + name + " " + args
 }
 
-// renderApprovalDialog 渲染审批弹窗。
+// renderApprovalDialog 渲染审批弹窗（子 agent 升级审批时 call.Name 带 [子 agent X] 标签）。
 func renderApprovalDialog(call message.ToolCall) string {
 	title := lipgloss.NewStyle().Foreground(lipgloss.Color("208")).Bold(true).Render("⚠ 审批")
 	cmd := lipgloss.NewStyle().Foreground(lipgloss.Color("250")).Render(call.Name + " " + call.Args)
@@ -287,7 +395,11 @@ func renderApprovalDialog(call message.ToolCall) string {
 
 // renderToolResult 渲染工具结果（头部 + 内容行，超长截断预览）。
 func renderToolResult(te *agent.ToolEnd) []string {
-	head := lipgloss.NewStyle().Foreground(lipgloss.Color("250")).Bold(true).Render("← " + te.Name)
+	mark := "← "
+	if te.IsError {
+		mark = "✗ "
+	}
+	head := lipgloss.NewStyle().Foreground(lipgloss.Color("250")).Bold(true).Render(mark + te.Name)
 	lines := strings.Split(te.Content, "\n")
 	const maxLines = 10
 	out := []string{"  " + head}
@@ -305,7 +417,11 @@ func renderToolResult(te *agent.ToolEnd) []string {
 func renderHistory(msgs []message.Message) []string {
 	var out []string
 	for _, m := range msgs {
-		lines := strings.Split(messageText(m), "\n")
+		text := messageText(m)
+		if text == "" {
+			continue
+		}
+		lines := strings.Split(text, "\n")
 		switch m.Role {
 		case message.RoleUser:
 			lines[0] = userPrefix + lines[0]

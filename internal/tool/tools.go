@@ -11,10 +11,10 @@ import (
 	"einoclaw-build/internal/runtime"
 )
 
-// Builtins 返回 P4 首批内置工具。
-func Builtins(bash *runtime.Bash) []Tool {
+// Builtins 返回内置工具。bash 为该 agent 专属实例（cwd 隔离）；store 为会话产物存储（可 nil）。
+func Builtins(bash *runtime.Bash, store *runtime.ArtifactStore) []Tool {
 	return []Tool{
-		readFileTool{},
+		readFileTool{store: store},
 		writeFileTool{},
 		globTool{},
 		grepTool{},
@@ -24,43 +24,60 @@ func Builtins(bash *runtime.Bash) []Tool {
 
 // ---------- read_file ----------
 
-type readFileTool struct{}
+type readFileTool struct {
+	store *runtime.ArtifactStore
+}
 
-func (readFileTool) Name() string        { return "read_file" }
-func (readFileTool) Description() string { return "读取文件内容，可指定 offset/limit" }
+func (readFileTool) Name() string { return "read_file" }
+func (readFileTool) Description() string {
+	return "按行读取文件内容；offset 为起始行号（1 起），limit 为读取行数（默认 300）。file_path 支持 artifact://N 读取被截断的完整工具输出。"
+}
 func (readFileTool) Parameters() map[string]any {
 	return map[string]any{
-		"file_path": map[string]any{"type": "string"},
-		"offset":    map[string]any{"type": "integer"},
-		"limit":     map[string]any{"type": "integer"},
+		"file_path": map[string]any{"type": "string", "description": "文件路径，或 artifact://N"},
+		"offset":    map[string]any{"type": "integer", "description": "起始行号（1 起）"},
+		"limit":     map[string]any{"type": "integer", "description": "读取行数，默认 300"},
 	}
 }
-func (readFileTool) Tier() permission.Tier        { return permission.TierRead }
-func (readFileTool) Concurrency() Concurrency     { return ConcurrencyShared }
+func (readFileTool) Required() []string          { return []string{"file_path"} }
+func (readFileTool) Tier() permission.Tier       { return permission.TierRead }
+func (readFileTool) Concurrency() Concurrency    { return ConcurrencyShared }
 
-func (readFileTool) Execute(ctx context.Context, args map[string]any, sink *runtime.Sink) error {
+const defaultReadLines = 300
+
+func (t readFileTool) Execute(ctx context.Context, args map[string]any, sink *runtime.Sink) error {
 	path, _ := args["file_path"].(string)
 	if path == "" {
 		return fmt.Errorf("file_path 必填")
+	}
+	if strings.HasPrefix(path, runtime.ArtifactScheme) {
+		if t.store == nil {
+			return fmt.Errorf("本会话没有产物目录，无法读取 %s", path)
+		}
+		p, err := t.store.Resolve(path)
+		if err != nil {
+			return err
+		}
+		path = p
 	}
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return err
 	}
-	text := string(data)
-	if off, ok := args["offset"].(float64); ok && off > 0 {
-		start := int(off)
-		if start < len(text) {
-			text = text[start:]
-		}
+	lines := strings.Split(string(data), "\n")
+	start := 0
+	if off, ok := args["offset"].(float64); ok && off > 1 {
+		start = min(int(off)-1, len(lines))
 	}
+	limit := defaultReadLines
 	if lim, ok := args["limit"].(float64); ok && lim > 0 {
-		l := int(lim)
-		if l < len(text) {
-			text = text[:l]
-		}
+		limit = int(lim)
 	}
-	sink.Write([]byte(text))
+	end := min(start+limit, len(lines))
+	sink.Write([]byte(strings.Join(lines[start:end], "\n")))
+	if end < len(lines) {
+		fmt.Fprintf(sink, "\n[共 %d 行，已显示 %d-%d；继续读取请用 offset=%d]", len(lines), start+1, end, end+1)
+	}
 	return nil
 }
 
@@ -76,8 +93,9 @@ func (writeFileTool) Parameters() map[string]any {
 		"content":   map[string]any{"type": "string"},
 	}
 }
-func (writeFileTool) Tier() permission.Tier        { return permission.TierWrite }
-func (writeFileTool) Concurrency() Concurrency     { return ConcurrencyExclusive }
+func (writeFileTool) Required() []string        { return []string{"file_path", "content"} }
+func (writeFileTool) Tier() permission.Tier     { return permission.TierWrite }
+func (writeFileTool) Concurrency() Concurrency  { return ConcurrencyExclusive }
 
 func (writeFileTool) Execute(ctx context.Context, args map[string]any, sink *runtime.Sink) error {
 	path, _ := args["file_path"].(string)
@@ -85,10 +103,13 @@ func (writeFileTool) Execute(ctx context.Context, args map[string]any, sink *run
 	if path == "" {
 		return fmt.Errorf("file_path 必填")
 	}
-	if err := os.WriteFile(path, []byte(content), 0644); err != nil {
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return err
 	}
-	sink.Write([]byte(fmt.Sprintf("wrote %d bytes to %s", len(content), path)))
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		return err
+	}
+	fmt.Fprintf(sink, "wrote %d bytes to %s", len(content), path)
 	return nil
 }
 
@@ -101,8 +122,9 @@ func (globTool) Description() string { return "按 pattern 匹配文件名" }
 func (globTool) Parameters() map[string]any {
 	return map[string]any{"pattern": map[string]any{"type": "string"}}
 }
-func (globTool) Tier() permission.Tier        { return permission.TierRead }
-func (globTool) Concurrency() Concurrency     { return ConcurrencyShared }
+func (globTool) Required() []string        { return []string{"pattern"} }
+func (globTool) Tier() permission.Tier     { return permission.TierRead }
+func (globTool) Concurrency() Concurrency  { return ConcurrencyShared }
 
 func (globTool) Execute(ctx context.Context, args map[string]any, sink *runtime.Sink) error {
 	pattern, _ := args["pattern"].(string)
@@ -129,8 +151,9 @@ func (bashTool) Description() string { return "执行 shell 命令" }
 func (bashTool) Parameters() map[string]any {
 	return map[string]any{"command": map[string]any{"type": "string"}}
 }
-func (bashTool) Tier() permission.Tier        { return permission.TierExec }
-func (bashTool) Concurrency() Concurrency     { return ConcurrencyExclusive }
+func (bashTool) Required() []string        { return []string{"command"} }
+func (bashTool) Tier() permission.Tier     { return permission.TierExec }
+func (bashTool) Concurrency() Concurrency  { return ConcurrencyExclusive }
 
 func (b bashTool) Execute(ctx context.Context, args map[string]any, sink *runtime.Sink) error {
 	command, _ := args["command"].(string)

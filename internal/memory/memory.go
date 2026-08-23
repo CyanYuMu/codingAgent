@@ -101,5 +101,21 @@ func (s *Store) Remember(content string, opts MemoryOpts) error {
 	return tx.Commit()
 }
 
+// Clear 清空所有记忆（/forget 用）。
+func (s *Store) Clear() error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(`DELETE FROM working_memory`); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`DELETE FROM memory_fts`); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
 // Close 关闭数据库。
 func (s *Store) Close() error { return s.db.Close() }

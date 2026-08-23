@@ -19,6 +19,12 @@ type Tool interface {
 	Execute(ctx context.Context, args map[string]any, sink *runtime.Sink) error
 }
 
+// Terminal 可选接口：工具执行成功后终止本次 run（如子 agent 的 yield）。
+type Terminal interface{ IsTerminal() bool }
+
+// RequiredParams 可选接口：声明必填参数名（进入工具定义的 required）。
+type RequiredParams interface{ Required() []string }
+
 // Concurrency 工具的并发性。
 type Concurrency int
 

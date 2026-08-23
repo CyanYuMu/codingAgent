@@ -3,10 +3,8 @@ package runtime
 import (
 	"fmt"
 	"os"
-	"path/filepath"
 	"strings"
 	"sync"
-	"sync/atomic"
 )
 
 // Sink 累积工具输出，做「头尾窗口截断 + artifact 落盘」——分层 Context 的 L6 实现。
@@ -18,23 +16,23 @@ type Sink struct {
 	buf        []byte // 当前窗口（head + tail，中间被 elide）
 	total      int    // 总写入字节数
 	truncated  bool
-	artifactDir string
+	store      *ArtifactStore
+	tool       string
 	artifact   *os.File
 	artifactID string
 }
-
-var sinkCounter atomic.Int64
 
 // NewSink 创建 sink；headLimit/tailLimit 是保留的头部/尾部字节数。
 func NewSink(headLimit, tailLimit int) *Sink {
 	return &Sink{headLimit: headLimit, tailLimit: tailLimit}
 }
 
-// SetArtifactDir 设置截断时落盘的目录。
-func (s *Sink) SetArtifactDir(dir string) {
+// SetArtifactStore 设置截断时落盘用的产物存储与工具名。
+func (s *Sink) SetArtifactStore(store *ArtifactStore, tool string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.artifactDir = dir
+	s.store = store
+	s.tool = tool
 }
 
 // Write 累积输出；超窗口时保留头尾、中间截断，并把完整内容落盘。
@@ -44,7 +42,7 @@ func (s *Sink) Write(p []byte) (int, error) {
 
 	// 已截断：新内容也要写进 artifact 保持完整
 	if s.truncated && s.artifact != nil {
-		s.artifact.Write(p)
+		_, _ = s.artifact.Write(p)
 	}
 
 	s.buf = append(s.buf, p...)
@@ -54,7 +52,7 @@ func (s *Sink) Write(p []byte) (int, error) {
 		if !s.truncated {
 			s.openArtifactLocked()
 			if s.artifact != nil {
-				s.artifact.Write(s.buf) // 首次截断：把当前完整内容落盘
+				_, _ = s.artifact.Write(s.buf) // 首次截断：把当前完整内容落盘
 			}
 			s.truncated = true
 		}
@@ -79,9 +77,23 @@ func (s *Sink) Result() string {
 	fmt.Fprintf(&sb, "\n...(%d bytes elided)...\n", elided)
 	sb.Write(s.buf[s.headLimit:])
 	if s.artifact != nil {
-		fmt.Fprintf(&sb, "\n[完整输出已保存: artifact://%s]", s.artifactID)
+		fmt.Fprintf(&sb, "\n[完整输出已保存: %s%s ；用 read_file 的 file_path=\"%s%s\" 可按行读取]", ArtifactScheme, s.artifactID, ArtifactScheme, s.artifactID)
 	}
 	return sb.String()
+}
+
+// Truncated 报告输出是否被截断。
+func (s *Sink) Truncated() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.truncated
+}
+
+// ArtifactID 返回落盘产物 id（未落盘为空）。
+func (s *Sink) ArtifactID() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.artifactID
 }
 
 // Close 关闭 artifact 文件。
@@ -95,13 +107,13 @@ func (s *Sink) Close() error {
 }
 
 func (s *Sink) openArtifactLocked() {
-	if s.artifactDir == "" {
-		return // 未配置落盘目录：只截断不落盘（artifact 保持 nil，Result 不显示指针）
+	if s.store == nil {
+		return // 未配置产物存储：只截断不落盘（Result 不显示指针）
 	}
-	id := sinkCounter.Add(1)
-	s.artifactID = fmt.Sprintf("artifact-%d", id)
-	f, err := os.Create(filepath.Join(s.artifactDir, s.artifactID+".log"))
-	if err == nil {
-		s.artifact = f
+	id, f, err := s.store.Create(s.tool)
+	if err != nil {
+		return
 	}
+	s.artifactID = id
+	s.artifact = f
 }

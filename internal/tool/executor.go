@@ -22,37 +22,55 @@ type Approver interface {
 	Approve(ctx context.Context, call message.ToolCall) (bool, error)
 }
 
+// DenyReasoner 可选接口：审批器拒绝时给模型的说明（如 headless 无法弹窗）。
+type DenyReasoner interface{ DenyReason() string }
+
+// Result 是一次工具执行给模型的结果。
+type Result struct {
+	Content string
+	IsError bool
+}
+
 // Executor 执行工具调用：查表 → 审批 → 执行 → 塑形结果。
 type Executor struct {
 	registry *Registry
 	mode     permission.Mode
-	approver Approver     // nil = 无 HITL（Prompt 降级拒绝）
+	approver Approver      // nil = 无 HITL（Prompt 降级拒绝）
 	sem      chan struct{} // 并发上限（Shared 工具并行数）
+	store    *runtime.ArtifactStore
 }
 
 func NewExecutor(r *Registry, mode permission.Mode, approver Approver) *Executor {
 	return &Executor{registry: r, mode: mode, approver: approver, sem: make(chan struct{}, 8)}
 }
 
-// Execute 执行一次工具调用，返回给模型的结果文本。
-func (e *Executor) Execute(ctx context.Context, call message.ToolCall) string {
+// SetArtifactStore 设置截断落盘用的产物存储（nil = 只截断不落盘）。
+func (e *Executor) SetArtifactStore(s *runtime.ArtifactStore) { e.store = s }
+
+// Mode 返回审批模式。
+func (e *Executor) Mode() permission.Mode { return e.mode }
+
+// Execute 执行一次工具调用，返回给模型的结果。
+func (e *Executor) Execute(ctx context.Context, call message.ToolCall) Result {
 	t, ok := e.registry.Get(call.Name)
 	if !ok {
-		return "tool not found: " + call.Name
+		return Result{Content: "tool not found: " + call.Name, IsError: true}
 	}
-	decision := permission.Resolve(t.Tier(), e.mode)
-	if decision == permission.DecisionPrompt {
+	if permission.Resolve(t.Tier(), e.mode) == permission.DecisionPrompt {
 		if e.approver == nil {
-			return "tool denied: requires approval (tier=" + string(t.Tier()) + ")"
+			return Result{Content: "tool denied: requires approval (tier=" + string(t.Tier()) + ", no approver)", IsError: true}
 		}
 		approved, err := e.approver.Approve(ctx, call)
 		if err != nil {
-			return "tool approval interrupted: " + err.Error()
+			return Result{Content: "tool approval interrupted: " + err.Error(), IsError: true}
 		}
 		if !approved {
-			return "tool denied by user"
+			reason := "tool denied by user"
+			if r, ok := e.approver.(DenyReasoner); ok && r.DenyReason() != "" {
+				reason = r.DenyReason()
+			}
+			return Result{Content: reason, IsError: true}
 		}
-		// 批准：继续执行
 	}
 
 	var args map[string]any
@@ -61,18 +79,21 @@ func (e *Executor) Execute(ctx context.Context, call message.ToolCall) string {
 	}
 
 	sink := runtime.NewSink(sinkHeadLimit, sinkTailLimit)
+	if e.store != nil {
+		sink.SetArtifactStore(e.store, call.Name)
+	}
 	defer sink.Close()
 	err := t.Execute(ctx, args, sink)
-	result := sink.Result()
+	res := sink.Result()
 	if err != nil {
-		return result + "\n[tool error: " + err.Error() + "]"
+		return Result{Content: res + "\n[tool error: " + err.Error() + "]", IsError: true}
 	}
-	return result
+	return Result{Content: res}
 }
 
 // ExecuteAll 并行执行多个工具调用：Shared 用 goroutine 并行（Semaphore 限并发），Exclusive 串行，结果按调用序返回。
-func (e *Executor) ExecuteAll(ctx context.Context, calls []message.ToolCall) []string {
-	results := make([]string, len(calls))
+func (e *Executor) ExecuteAll(ctx context.Context, calls []message.ToolCall) []Result {
+	results := make([]Result, len(calls))
 	var wg sync.WaitGroup
 
 	for i, call := range calls {
@@ -83,7 +104,7 @@ func (e *Executor) ExecuteAll(ctx context.Context, calls []message.ToolCall) []s
 			continue
 		}
 		if err := e.acquire(ctx); err != nil {
-			results[i] = "tool error: " + err.Error()
+			results[i] = Result{Content: "tool error: " + err.Error(), IsError: true}
 			continue
 		}
 		wg.Add(1)

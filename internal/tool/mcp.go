@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"strings"
+	"time"
 
 	"github.com/mark3labs/mcp-go/client"
 	"github.com/mark3labs/mcp-go/mcp"
@@ -11,6 +12,9 @@ import (
 	"einoclaw-build/internal/permission"
 	"einoclaw-build/internal/runtime"
 )
+
+// mcpCallTimeout 单次 MCP 工具调用上限，防止慢 server 卡死 turn。
+const mcpCallTimeout = 60 * time.Second
 
 // MCPConfig 描述一个 stdio MCP server。
 type MCPConfig struct {
@@ -25,16 +29,22 @@ type mcpTool struct {
 	name     string
 	desc     string
 	schema   map[string]any
+	required []string
 	callTool func(ctx context.Context, args map[string]any) (string, error)
 }
 
 func (m mcpTool) Name() string               { return "mcp__" + m.server + "_" + m.name }
 func (m mcpTool) Description() string        { return m.desc }
 func (m mcpTool) Parameters() map[string]any { return m.schema }
-func (m mcpTool) Tier() permission.Tier      { return permission.TierRead }
-func (m mcpTool) Concurrency() Concurrency   { return ConcurrencyShared }
+func (m mcpTool) Required() []string         { return m.required }
+
+// Tier 外部工具默认按 write 处理（未知副作用不能当只读放行）。
+func (m mcpTool) Tier() permission.Tier    { return permission.TierWrite }
+func (m mcpTool) Concurrency() Concurrency { return ConcurrencyShared }
 
 func (m mcpTool) Execute(ctx context.Context, args map[string]any, sink *runtime.Sink) error {
+	ctx, cancel := context.WithTimeout(ctx, mcpCallTimeout)
+	defer cancel()
 	result, err := m.callTool(ctx, args)
 	if err != nil {
 		return err
@@ -60,12 +70,13 @@ func ConnectMCP(ctx context.Context, reg *Registry, cfg MCPConfig) error {
 	}
 
 	for _, t := range res.Tools {
-		t := t // 避免闭包捕获循环变量
+		props, required := inputSchemaToMap(t.InputSchema)
 		mt := mcpTool{
-			server: cfg.Name,
-			name:   t.Name,
-			desc:   t.Description,
-			schema: inputSchemaToMap(t.InputSchema),
+			server:   cfg.Name,
+			name:     t.Name,
+			desc:     t.Description,
+			schema:   props,
+			required: required,
 			callTool: func(ctx context.Context, args map[string]any) (string, error) {
 				cr, err := c.CallTool(ctx, mcp.CallToolRequest{
 					Params: mcp.CallToolParams{Name: t.Name, Arguments: args},
@@ -81,20 +92,20 @@ func ConnectMCP(ctx context.Context, reg *Registry, cfg MCPConfig) error {
 	return nil
 }
 
-// inputSchemaToMap 从 MCP 工具的 JSON Schema 里提取 properties（给模型的参数定义）。
-func inputSchemaToMap(schema any) map[string]any {
+// inputSchemaToMap 从 MCP 工具的 JSON Schema 里提取 properties 与 required（给模型的参数定义）。
+func inputSchemaToMap(schema any) (map[string]any, []string) {
 	b, err := json.Marshal(schema)
 	if err != nil {
-		return nil
+		return nil, nil
 	}
-	var full map[string]any
+	var full struct {
+		Properties map[string]any `json:"properties"`
+		Required   []string       `json:"required"`
+	}
 	if err := json.Unmarshal(b, &full); err != nil {
-		return nil
+		return nil, nil
 	}
-	if props, ok := full["properties"].(map[string]any); ok {
-		return props
-	}
-	return nil
+	return full.Properties, full.Required
 }
 
 // toolResultText 提取 MCP 工具结果的文本内容。
