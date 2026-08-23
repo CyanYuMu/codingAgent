@@ -68,7 +68,7 @@ type Result struct {
 	Text        string         // 最后一段 assistant 文本（失败/无 yield 时的 partial）
 	Err         error
 	Usage       model.Usage
-	Requests    int   // 模型调用次数
-	DurationMs  int64 // 耗时
+	Requests    int    // 模型调用次数
+	DurationMs  int64  // 耗时
 	SessionFile string // sidecar 转录路径（MemoryStorage 时为空）
 }

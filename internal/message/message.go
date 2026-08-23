@@ -28,8 +28,8 @@ type ToolResult struct {
 // ContentBlock 是消息的一个内容块。用 Kind + 对应字段表达；每块只填一种。
 type ContentBlock struct {
 	Kind       BlockKind   `json:"kind"`
-	Text       string      `json:"text,omitempty"`    // BlockText
-	Thinking   string      `json:"thinking,omitempty"` // BlockThinking
+	Text       string      `json:"text,omitempty"`        // BlockText
+	Thinking   string      `json:"thinking,omitempty"`    // BlockThinking
 	ToolCall   *ToolCall   `json:"tool_call,omitempty"`   // BlockToolCall
 	ToolResult *ToolResult `json:"tool_result,omitempty"` // BlockToolResult
 }

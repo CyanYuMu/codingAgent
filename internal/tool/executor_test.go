@@ -24,7 +24,7 @@ func (f *fakeApprover) Approve(ctx context.Context, call message.ToolCall) (bool
 type reasonApprover struct{}
 
 func (reasonApprover) Approve(context.Context, message.ToolCall) (bool, error) { return false, nil }
-func (reasonApprover) DenyReason() string                                     { return "headless subagent cannot prompt" }
+func (reasonApprover) DenyReason() string                                      { return "headless subagent cannot prompt" }
 
 func TestExecuteToolAllowAndPrompt(t *testing.T) {
 	r := NewRegistry()

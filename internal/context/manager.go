@@ -57,7 +57,7 @@ type Manager struct {
 	summarizer Summarizer
 	window     int
 	keepRecent int
-	lastPrompt int                                          // 最近一次 provider 报告的 prompt tokens（估算校准用）
+	lastPrompt int                                         // 最近一次 provider 报告的 prompt tokens（估算校准用）
 	system     func(ctx context.Context) []message.Message // 系统提示 + 记忆块等前缀，由装配方注入
 }
 

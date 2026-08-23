@@ -38,8 +38,10 @@ func (f *fakeStream) Recv() (model.ModelEvent, error) {
 	}
 	return model.ModelEvent{}, io.EOF
 }
-func (f *fakeStream) Usage() model.Usage { return model.Usage{PromptTokens: 10, CompletionTokens: 5, TotalTokens: 15} }
-func (f *fakeStream) Close()             {}
+func (f *fakeStream) Usage() model.Usage {
+	return model.Usage{PromptTokens: 10, CompletionTokens: 5, TotalTokens: 15}
+}
+func (f *fakeStream) Close() {}
 
 // scriptModel 每步返回一个预置事件；脚本耗尽后返回纯文本 "idle"（无工具调用 → 循环结束）。
 type scriptModel struct {

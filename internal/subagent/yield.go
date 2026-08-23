@@ -19,10 +19,10 @@ func (yieldTool) Description() string {
 func (yieldTool) Parameters() map[string]any {
 	return map[string]any{"data": map[string]any{"type": "object", "description": "结构化产出；按任务要求的字段填写"}}
 }
-func (yieldTool) Required() []string         { return []string{"data"} }
-func (yieldTool) Tier() permission.Tier      { return permission.TierRead }
+func (yieldTool) Required() []string            { return []string{"data"} }
+func (yieldTool) Tier() permission.Tier         { return permission.TierRead }
 func (yieldTool) Concurrency() tool.Concurrency { return tool.ConcurrencyShared }
-func (yieldTool) IsTerminal() bool           { return true }
+func (yieldTool) IsTerminal() bool              { return true }
 
 func (yieldTool) Execute(ctx context.Context, args map[string]any, sink *runtime.Sink) error {
 	sink.Write([]byte("result submitted"))

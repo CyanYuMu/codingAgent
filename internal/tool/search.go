@@ -65,8 +65,8 @@ func (grepTool) Parameters() map[string]any {
 		"path":    map[string]any{"type": "string"},
 	}
 }
-func (grepTool) Tier() permission.Tier        { return permission.TierRead }
-func (grepTool) Concurrency() Concurrency     { return ConcurrencyShared }
+func (grepTool) Tier() permission.Tier    { return permission.TierRead }
+func (grepTool) Concurrency() Concurrency { return ConcurrencyShared }
 
 func (grepTool) Execute(ctx context.Context, args map[string]any, sink *runtime.Sink) error {
 	pattern, _ := args["pattern"].(string)

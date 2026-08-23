@@ -19,8 +19,10 @@ func NewRememberTool(store *memory.Store) Tool {
 	return rememberTool{store: store}
 }
 
-func (rememberTool) Name() string        { return "remember" }
-func (rememberTool) Description() string { return "记录一条需要长期记住的信息（用户偏好/事实/决策）" }
+func (rememberTool) Name() string { return "remember" }
+func (rememberTool) Description() string {
+	return "记录一条需要长期记住的信息（用户偏好/事实/决策）"
+}
 func (rememberTool) Parameters() map[string]any {
 	return map[string]any{
 		"content":     map[string]any{"type": "string"},

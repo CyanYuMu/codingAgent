@@ -75,11 +75,13 @@ func (e echoTool) Name() string {
 	}
 	return "echo"
 }
-func (echoTool) Description() string            { return "" }
-func (echoTool) Parameters() map[string]any     { return map[string]any{"v": map[string]any{"type": "string"}} }
-func (echoTool) Tier() permission.Tier          { return permission.TierRead }
-func (echoTool) Concurrency() tool.Concurrency  { return tool.ConcurrencyShared }
-func (e echoTool) IsTerminal() bool             { return e.terminal }
+func (echoTool) Description() string { return "" }
+func (echoTool) Parameters() map[string]any {
+	return map[string]any{"v": map[string]any{"type": "string"}}
+}
+func (echoTool) Tier() permission.Tier         { return permission.TierRead }
+func (echoTool) Concurrency() tool.Concurrency { return tool.ConcurrencyShared }
+func (e echoTool) IsTerminal() bool            { return e.terminal }
 func (echoTool) Execute(_ context.Context, args map[string]any, sink *runtime.Sink) error {
 	v, _ := args["v"].(string)
 	sink.Write([]byte("echo:" + v))
@@ -123,7 +125,9 @@ func TestLoopRecordsToolRoundTrip(t *testing.T) {
 	if !hasEvent(evs, func(e AgentEvent) bool { return e.Type == EventAgentEnd }) {
 		t.Fatal("no agent_end")
 	}
-	if !hasEvent(evs, func(e AgentEvent) bool { return e.Type == EventToolEnd && e.ToolEnd.Content == "echo:hi" && !e.ToolEnd.IsError }) {
+	if !hasEvent(evs, func(e AgentEvent) bool {
+		return e.Type == EventToolEnd && e.ToolEnd.Content == "echo:hi" && !e.ToolEnd.IsError
+	}) {
 		t.Fatal("no tool_end with content")
 	}
 }
