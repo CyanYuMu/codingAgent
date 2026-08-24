@@ -1,6 +1,7 @@
 package runtime
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -107,5 +108,39 @@ func TestSinkSpillsToArtifactStore(t *testing.T) {
 	b, _ := os.ReadFile(p)
 	if len(b) != 100 {
 		t.Fatalf("artifact bytes = %d, want 100", len(b))
+	}
+}
+
+func TestArtifactStoreSchemeDispatch(t *testing.T) {
+	s := NewArtifactStore(t.TempDir())
+	id, f, err := s.Create("bash")
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.WriteString("hello")
+	f.Close()
+
+	s.AddScheme("agent", func(rest string) (string, error) {
+		if rest != "Reviewer" {
+			return "", fmt.Errorf("no such agent %q", rest)
+		}
+		return "/tmp/Reviewer.md", nil
+	})
+
+	if p, err := s.Resolve("artifact://" + id); err != nil || !strings.HasSuffix(p, id+".bash.log") {
+		t.Fatalf("artifact:// = %q err %v", p, err)
+	}
+	if p, err := s.Resolve(id); err != nil || !strings.HasSuffix(p, id+".bash.log") {
+		t.Fatalf("裸 id 应保持兼容：%q err %v", p, err)
+	}
+	if p, err := s.Resolve("agent://Reviewer"); err != nil || p != "/tmp/Reviewer.md" {
+		t.Fatalf("agent:// = %q err %v", p, err)
+	}
+	if _, err := s.Resolve("agent://Nope"); err == nil {
+		t.Fatal("未知 agent 应报错")
+	}
+	_, err = s.Resolve("memory://3")
+	if err == nil || !strings.Contains(err.Error(), "agent") {
+		t.Fatalf("未注册方案的错误应列出可用方案：%v", err)
 	}
 }

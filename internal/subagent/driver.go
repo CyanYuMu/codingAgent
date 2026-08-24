@@ -155,6 +155,16 @@ func (r *Run) setStatus(s Status) {
 	r.mu.Unlock()
 }
 
+// statusNow 返回当前状态。
+func (r *Run) statusNow() Status {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.status
+}
+
+// settled 表示已结算（不再消耗模型请求，可读产出与转录）。
+func (r *Run) settled() bool { return r.statusNow().Settled() }
+
 // drive 驱动一个 Run 走完 turn 阶梯：每 turn 一个可单独取消的 ctx；turn 结束若没 terminal yield
 // 就注入提醒（最后一次只给 yield 工具）；软预算越界先通知、再停机强制收尾、宽限耗尽硬杀。
 func (m *Manager) drive(parent context.Context, r *Run, rs *runtimeSet) Result {

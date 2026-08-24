@@ -12,11 +12,13 @@ import (
 	"charm.land/lipgloss/v2"
 
 	"einoclaw-build/internal/agent"
+	"einoclaw-build/internal/bus"
 	agentctx "einoclaw-build/internal/context"
 	"einoclaw-build/internal/memory"
 	"einoclaw-build/internal/message"
 	"einoclaw-build/internal/model"
 	"einoclaw-build/internal/session"
+	"einoclaw-build/internal/subagent"
 )
 
 // 事件源是我们自己的 agent.AgentEvent；持久化由循环内的 Context 完成，TUI 只负责渲染与会话切换。
@@ -52,10 +54,15 @@ type teaModel struct {
 	cwd               string              // 新建会话时写入 header
 	pendingApproval   *approvalRequestMsg // nil = 无待审批
 	scrollOffset      int                 // 聊天滚动偏移（0=底部，>0=上滚 N 行）
+
+	sub     *subagent.Manager   // 子 agent 名册（Agent Hub 面板 / /agent 转发）
+	hubCh   <-chan bus.Envelope // 子 agent 事件（唤醒重绘）
+	hubOpen bool
+	hubSel  int
 }
 
-// NewModel 构造 TUI 模型；cmgr 持有当前会话，cwd 用于新建会话。
-func NewModel(ag *agent.Agent, mgr *session.Manager, cmgr *agentctx.Manager, mem *memory.Store, cwd string) teaModel {
+// NewModel 构造 TUI 模型；cmgr 持有当前会话，cwd 用于新建会话，sub/b 提供 Agent Hub。
+func NewModel(ag *agent.Agent, mgr *session.Manager, cmgr *agentctx.Manager, mem *memory.Store, cwd string, sub *subagent.Manager, b *bus.Bus) teaModel {
 	ta := textarea.New()
 	ta.Placeholder = " Type your message... (Enter=send, Ctrl+J=newline, Ctrl+E=steer, Ctrl+C=quit)"
 	ta.SetHeight(3)
@@ -64,7 +71,8 @@ func NewModel(ag *agent.Agent, mgr *session.Manager, cmgr *agentctx.Manager, mem
 	ta.KeyMap.InsertNewline = key.NewBinding(key.WithKeys("ctrl+j"), key.WithHelp("ctrl+j", "newline"))
 	ta.Focus()
 	s := cmgr.Session()
-	m := teaModel{inputArea: ta, agent: ag, session: s, mgr: mgr, cmgr: cmgr, mem: mem, cwd: cwd}
+	m := teaModel{inputArea: ta, agent: ag, session: s, mgr: mgr, cmgr: cmgr, mem: mem, cwd: cwd,
+		sub: sub, hubCh: mergeHubEvents(b)}
 	// 恢复历史：replay 后渲染进聊天区
 	if msgs, err := s.Replay(); err == nil {
 		m.chatLines = renderHistory(msgs)
@@ -73,7 +81,7 @@ func NewModel(ag *agent.Agent, mgr *session.Manager, cmgr *agentctx.Manager, mem
 }
 
 func (m teaModel) Init() tea.Cmd {
-	return tea.Batch(textarea.Blink, tea.RequestWindowSize)
+	return tea.Batch(textarea.Blink, tea.RequestWindowSize, waitHubEvent(m.hubCh))
 }
 
 func (m teaModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -93,6 +101,9 @@ func (m teaModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case approvalRequestMsg:
 		m.pendingApproval = &msg // 弹审批窗
 		return m, nil
+
+	case hubTickMsg:
+		return m, waitHubEvent(m.hubCh) // 名册在渲染时读，这里只需重新挂等待
 
 	case tea.MouseWheelMsg:
 		switch msg.Button {
@@ -150,6 +161,11 @@ func (m teaModel) handleAgentEvent(ev agent.AgentEvent) (teaModel, tea.Cmd) {
 
 func (m teaModel) View() tea.View {
 	chatHeight := max(1, m.height-4)
+	var hubLines []string
+	if m.hubOpen {
+		hubLines = renderHub(m.roster(), m.hubSel, m.width, max(3, m.height/3))
+		chatHeight = max(1, chatHeight-len(hubLines)-1)
+	}
 
 	var all []string
 	all = append(all, m.chatLines...)
@@ -181,8 +197,20 @@ func (m teaModel) View() tea.View {
 	if m.pendingApproval != nil {
 		bottom = renderApprovalDialog(m.pendingApproval.call)
 	}
-	content := lipgloss.JoinVertical(lipgloss.Top, chatView, "", bottom)
+	parts := []string{chatView, ""}
+	if len(hubLines) > 0 {
+		parts = append(parts, strings.Join(hubLines, "\n"), "")
+	}
+	content := lipgloss.JoinVertical(lipgloss.Top, append(parts, bottom)...)
 	return tea.View{Content: content, AltScreen: true, MouseMode: tea.MouseModeCellMotion}
+}
+
+// roster 返回子 agent 名册快照（未装配 Manager 时为空）。
+func (m teaModel) roster() []subagent.RunView {
+	if m.sub == nil {
+		return nil
+	}
+	return m.sub.Roster()
 }
 
 func (m teaModel) handleKey(msg tea.KeyPressMsg) (teaModel, tea.Cmd) {
@@ -199,7 +227,36 @@ func (m teaModel) handleKey(msg tea.KeyPressMsg) (teaModel, tea.Cmd) {
 		return m, nil
 	}
 
+	// Agent Hub 打开时接管导航键；输入仍然可打字（j/k 只在输入框为空时当导航用）
+	if m.hubOpen {
+		empty := strings.TrimSpace(m.inputArea.Value()) == ""
+		switch {
+		case key.Matches(msg, key.NewBinding(key.WithKeys("esc"))):
+			m.hubOpen = false
+			return m, nil
+		case empty && key.Matches(msg, key.NewBinding(key.WithKeys("j", "down"))):
+			m.hubSel = min(m.hubSel+1, max(len(m.roster())-1, 0))
+			return m, nil
+		case empty && key.Matches(msg, key.NewBinding(key.WithKeys("k", "up"))):
+			m.hubSel = max(m.hubSel-1, 0)
+			return m, nil
+		case empty && key.Matches(msg, key.NewBinding(key.WithKeys("x"))):
+			rows := m.roster()
+			if m.sub != nil && m.hubSel < len(rows) {
+				if n := m.sub.Cancel([]string{rows[m.hubSel].Name}); n > 0 {
+					m.chatLines = append(m.chatLines, dimStyle.Render("已终止子 agent "+rows[m.hubSel].Name))
+				}
+			}
+			return m, nil
+		}
+	}
+
 	switch {
+	case key.Matches(msg, key.NewBinding(key.WithKeys("ctrl+a"))):
+		m.hubOpen = !m.hubOpen
+		m.hubSel = 0
+		return m, nil
+
 	case key.Matches(msg, key.NewBinding(key.WithKeys("pgup"))):
 		m.scrollOffset += max(1, m.height/2) // 上滚半屏
 		return m, nil
@@ -322,6 +379,31 @@ func (m teaModel) handleSlash(text string) (bool, teaModel) {
 		m.chatLines = nil
 		if msgs, err := ns.Replay(); err == nil {
 			m.chatLines = renderHistory(msgs)
+		}
+		m.inputArea.Reset()
+		return true, m
+	case text == "/agents":
+		rows := m.roster()
+		if len(rows) == 0 {
+			m.chatLines = append(m.chatLines, dimStyle.Render("还没有派发过子 agent（ctrl+a 可随时打开 Agent Hub）"))
+		} else {
+			m.chatLines = append(m.chatLines, renderHub(rows, -1, m.width, 0)...)
+		}
+		m.inputArea.Reset()
+		return true, m
+	case strings.HasPrefix(text, "/agent "):
+		name, body, ok := parseAgentCommand(text)
+		switch {
+		case !ok:
+			m.chatLines = append(m.chatLines, dimStyle.Render("用法：/agent <子agent名> <要说的话>"))
+		case m.sub == nil:
+			m.chatLines = append(m.chatLines, dimStyle.Render("本实例未装配子 agent"))
+		default:
+			if err := m.sub.Send("Main", name, body); err != nil {
+				m.chatLines = append(m.chatLines, renderError(err))
+			} else {
+				m.chatLines = append(m.chatLines, dimStyle.Render("→ "+name+"："+body))
+			}
 		}
 		m.inputArea.Reset()
 		return true, m

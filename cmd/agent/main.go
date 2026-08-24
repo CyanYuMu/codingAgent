@@ -238,6 +238,8 @@ func main() {
 		MinTaskChars: cfg.Subagent.MinTaskChars, AllowBackground: cfg.Subagent.BackgroundEnabled(),
 	})
 
+	mgr.RegisterSchemes(store) // read_file 可读 agent://<子agent名> 与 history://<子agent名>
+
 	// 主 agent 工具集（按委派模式）：always = 只读工具 + task + remember；其它 = 全套 + task
 	mainRegistry := tool.NewRegistry()
 	full := workerTools(cwd, store)
@@ -279,7 +281,7 @@ func main() {
 		os.Exit(runHeadless(context.Background(), ag, cmgr, *prompt))
 	}
 
-	program := tea.NewProgram(tui.NewModel(ag, sessMgr, cmgr, mem, cwd))
+	program := tea.NewProgram(tui.NewModel(ag, sessMgr, cmgr, mem, cwd, mgr, evbus))
 	tui.SetProgram(program)
 	if _, err := program.Run(); err != nil {
 		log.Fatal(err)

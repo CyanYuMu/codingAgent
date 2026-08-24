@@ -342,3 +342,120 @@ func TestResolveDefAppliesDefaultsAndBudgetCeiling(t *testing.T) {
 		t.Fatalf("-1 应表示关闭护栏，got %d", got.SoftBudget)
 	}
 }
+
+func TestRosterKeepsParkedRunsAndResolvesURLs(t *testing.T) {
+	dir := t.TempDir()
+	m := &scriptModel{steps: []model.ModelEvent{call("c1", "yield", `{"data":{"files":["a.go"]}}`)}}
+	mgr := NewManager(baseOpts(m, dir))
+	b := one("explorer", "梳理结构")
+	b.Tasks[0].Name = "Scout"
+	r := runOne(t, mgr, context.Background(), b)
+
+	roster := mgr.Roster()
+	if len(roster) != 1 || roster[0].Name != "Scout" || roster[0].Status != "parked" {
+		t.Fatalf("名册 = %+v（结束后应留 parked 行）", roster)
+	}
+	if roster[0].OutputFile == "" || roster[0].SessionFile == "" || roster[0].Requests != 1 {
+		t.Fatalf("名册行缺内容：%+v", roster[0])
+	}
+
+	if p, err := mgr.ResolveAgentURL("Scout"); err != nil || p != r.OutputFile {
+		t.Fatalf("agent://Scout = %q err %v", p, err)
+	}
+	if p, err := mgr.ResolveHistoryURL("Scout"); err != nil || p != r.SessionFile {
+		t.Fatalf("history://Scout = %q err %v", p, err)
+	}
+	if _, err := mgr.ResolveAgentURL("Nope"); err == nil || !strings.Contains(err.Error(), "Scout") {
+		t.Fatalf("未知名字的错误应列出名册：%v", err)
+	}
+
+	// 名册外（模拟 resume 后新进程）：按产物目录回落也能找到
+	fresh := NewManager(baseOpts(&scriptModel{}, dir))
+	if p, err := fresh.ResolveAgentURL("Scout"); err != nil || p != r.OutputFile {
+		t.Fatalf("回落解析 agent:// 失败：%q %v", p, err)
+	}
+	if p, err := fresh.ResolveHistoryURL("Scout"); err != nil || p != r.SessionFile {
+		t.Fatalf("回落解析 history:// 失败：%q %v", p, err)
+	}
+}
+
+func TestRosterNamesAreNotReused(t *testing.T) {
+	mgr := NewManager(baseOpts(&scriptModel{}, t.TempDir()))
+	runOne(t, mgr, context.Background(), one("explorer", "一"))
+	runOne(t, mgr, context.Background(), one("explorer", "二"))
+	names := mgr.names()
+	if len(names) != 2 || names[0] == names[1] {
+		t.Fatalf("名册 = %v（parked 的名字不该被复用）", names)
+	}
+}
+
+func TestSendToRunningAndParked(t *testing.T) {
+	dir := t.TempDir()
+	mgr := NewManager(baseOpts(&scriptModel{}, dir))
+	if err := mgr.Send("Main", "Nope", "在吗"); err == nil || !strings.Contains(err.Error(), "没有名为") {
+		t.Fatalf("err = %v", err)
+	}
+	runOne(t, mgr, context.Background(), one("explorer", "x"))
+	name := mgr.names()[0]
+	if err := mgr.Send("Main", name, "补充一点"); err == nil || !strings.Contains(err.Error(), "已结束") {
+		t.Fatalf("给 parked 发消息应说明暂不支持唤醒：%v", err)
+	}
+	// 运行中的：消息进 steer 队列
+	run := newRun("Live", "explorer", 1)
+	mgr.register(run)
+	run.setStatus(StatusRunning)
+	if err := mgr.Send("Main", "Live", "改用接口 B"); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case msg := <-run.steer:
+		if !strings.Contains(messageText(msg), "[hub from Main] 改用接口 B") {
+			t.Fatalf("steer 消息 = %q", messageText(msg))
+		}
+	default:
+		t.Fatal("消息没进 steer 队列")
+	}
+}
+
+// messageText 拼接消息文本（测试辅助）。
+func messageText(m message.Message) string {
+	var sb strings.Builder
+	for _, b := range m.Blocks {
+		if b.Kind == message.BlockText {
+			sb.WriteString(b.Text)
+		}
+	}
+	return sb.String()
+}
+
+func TestReadFileResolvesAgentAndHistoryURLs(t *testing.T) {
+	dir := t.TempDir()
+	mgr := NewManager(baseOpts(&scriptModel{steps: []model.ModelEvent{
+		call("c1", "yield", `{"data":{"files":["a.go"],"notes":"入口在 main.go"}}`),
+	}}, dir))
+	b := one("explorer", "梳理结构")
+	b.Tasks[0].Name = "Scout"
+	runOne(t, mgr, context.Background(), b)
+
+	// 父 agent 的产物存储挂上 agent:// 与 history:// 之后，read_file 就能读回
+	store := runtime.NewArtifactStore(dir)
+	mgr.RegisterSchemes(store)
+	reg := tool.NewRegistry()
+	for _, tl := range tool.Builtins(runtime.NewBash(dir), store) {
+		reg.Register(tl)
+	}
+	exec := tool.NewExecutor(reg, permission.ModeYolo, nil)
+
+	res := exec.Execute(context.Background(), message.ToolCall{ID: "r1", Name: "read_file", Args: `{"file_path":"agent://Scout"}`})
+	if res.IsError || !strings.Contains(res.Content, "入口在 main.go") || !strings.Contains(res.Content, "## data") {
+		t.Fatalf("agent://Scout 读回失败：%+v", res)
+	}
+	res = exec.Execute(context.Background(), message.ToolCall{ID: "r2", Name: "read_file", Args: `{"file_path":"history://Scout"}`})
+	if res.IsError || !strings.Contains(res.Content, "session_init") {
+		t.Fatalf("history://Scout 读回失败：%+v", res)
+	}
+	res = exec.Execute(context.Background(), message.ToolCall{ID: "r3", Name: "read_file", Args: `{"file_path":"agent://Nope"}`})
+	if !res.IsError || !strings.Contains(res.Content, "Scout") {
+		t.Fatalf("未知名字应报错并列出名册：%+v", res)
+	}
+}

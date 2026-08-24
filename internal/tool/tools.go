@@ -30,7 +30,8 @@ type readFileTool struct {
 
 func (readFileTool) Name() string { return "read_file" }
 func (readFileTool) Description() string {
-	return "按行读取文件内容；offset 为起始行号（1 起），limit 为读取行数（默认 300）。file_path 支持 artifact://N 读取被截断的完整工具输出。"
+	return "按行读取文件内容；offset 为起始行号（1 起），limit 为读取行数（默认 300）。" +
+		"file_path 还支持会话内 URL：artifact://N（被截断的完整工具输出）、agent://<子agent名>（它的完整产出）、history://<子agent名>（它的转录）。"
 }
 func (readFileTool) Parameters() map[string]any {
 	return map[string]any{
@@ -50,7 +51,7 @@ func (t readFileTool) Execute(ctx context.Context, args map[string]any, sink *ru
 	if path == "" {
 		return fmt.Errorf("file_path 必填")
 	}
-	if strings.HasPrefix(path, runtime.ArtifactScheme) {
+	if strings.Contains(path, "://") { // 会话内 URL：artifact / agent / history 都由产物存储路由
 		if t.store == nil {
 			return fmt.Errorf("本会话没有产物目录，无法读取 %s", path)
 		}

@@ -64,13 +64,13 @@
 **Interfaces:**
 - Produces: `bus.Envelope{Channel string; Payload any; At time.Time}`、`bus.New() *Bus`、`(*Bus).Publish(channel string, payload any)`、`(*Bus).Subscribe(channel string, buf int) (<-chan Envelope, func())`
 
-- [ ] **Step 1: 写失败测试**（`bus_test.go`）
+- [x] **Step 1: 写失败测试**（`bus_test.go`）
   - `TestPublishFanOut`：两个订阅者各收到同一条。
   - `TestPublishNonBlockingWhenFull`：`Subscribe(ch, 1)` 后连发 100 条，`Publish` 不阻塞（用 `time.After(100ms)` 断言整体耗时），通道里能取到第一条。
   - `TestUnsubscribeIdempotentAndSafe`：取消两次不 panic；取消后 `Publish` 不 panic，通道已关闭（`_, ok := <-ch; ok == false`）。
   - `TestOtherChannelNotDelivered`：订阅 A，发 B，读不到。
 
-- [ ] **Step 2: 实现**
+- [x] **Step 2: 实现**
   ```go
   type Bus struct {
       mu   sync.RWMutex
@@ -82,7 +82,7 @@
   - `Subscribe`：`Lock` → 分配 `id = seq++` → 建缓冲通道 → 返回 `cancel`：`sync.Once` 包住 `Lock` + `delete` + `close(ch)`。
   - 不变量注释：`Publish` 持 RLock 期间不可能有人 `close`（取消要写锁），所以不会向已关闭通道发送。
 
-- [ ] **Step 3: 验证** `go test ./internal/bus/ -race`
+- [x] **Step 3: 验证** `go test ./internal/bus/ -race`
 
 ---
 
@@ -93,18 +93,18 @@
 **Interfaces:**
 - Produces: `subagent.AgentDef`、`subagent.TaskItem`、`subagent.TaskBatch`、`subagent.Status`（新增 `StatusIdle`/`StatusBudgetStop`/`StatusParked`）、`subagent.Result`（扩展）、`paths.UserAgentsDir()`、`paths.ProjectAgentsDir(cwd)`
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
   - `paths_test.go`：`TestAgentsDirs`——`CODECLAW_HOME` 覆盖下 `UserAgentsDir()` = `<home>/agents`；`ProjectAgentsDir("/x/y")` = `/x/y/.codeclaw/agents`。
   - `spec_test.go`（新）：`TestStatusString` 覆盖全部状态（含新增三个）。
 
-- [ ] **Step 2: 实现**
+- [x] **Step 2: 实现**
   - `AgentDef` 按 spec §2.1 全字段；删除 `SubagentSpec`（全局改名，注意 `cmd/agent/main.go`、`manager.go`、测试）。
   - `TaskItem`/`TaskBatch` 按 spec §3.1；保留 `Task`→`TaskItem` 改名。
   - `Result` 增 `Agent`、`Sections`、`Warning`、`ToolCalls`、`Reminders`、`BudgetStopped`、`OutputFile`；`Data` 类型从 `map[string]any` 改为 `any`（yield 允许数组/标量产出）。
   - `RunView`：`{ID, Name, Agent, Status, CurrentTool string; Depth, Requests, ToolCalls, Tokens, ContextTokens, Unread, Revives int; Age time.Duration; SessionFile, OutputFile string}`。
   - `paths`：两个目录函数（不创建目录，缺失按空处理）。
 
-- [ ] **Step 3: 验证** 编译通过（`renderResult` 里 `Data` 的类型断言要跟着改），`go test ./internal/paths/ ./internal/subagent/`
+- [x] **Step 3: 验证** 编译通过（`renderResult` 里 `Data` 的类型断言要跟着改），`go test ./internal/paths/ ./internal/subagent/`
 
 ---
 
@@ -116,14 +116,14 @@
 - Produces: `subagent.ParseAgentFile(path string, data []byte, source string) (AgentDef, error)`、`subagent.Discover(projectDir, userDir string, bundled []AgentDef) DiscoverResult`、`subagent.Bundled() []AgentDef`
 - Consumes: `paths.UserAgentsDir` / `paths.ProjectAgentsDir`
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
   - `TestParseFullFrontmatter`：全字段（CSV `tools`、数组 `spawns`、`output` 嵌套 schema、`timeout: 10m`、`read_only: true`）解析正确，`SystemPrompt` = 正文（trim）。
   - `TestParseMissingNameOrBody`：缺 `name`、缺 `description`、正文空 → error。
   - `TestParseBadYAMLAndBadDuration`：坏 YAML → error；`timeout: 十分钟` → 不报错但 `Timeout == 0`（用默认值），且返回的 error 为 nil（宽容字段单独降级）。
   - `TestDiscoverPrecedence`：临时目录里 project 与 user 各放一个 `reviewer.md`，bundled 里也有 → 取 project；`Warns` 收集坏文件；同目录多文件按字典序。
   - `TestBundledParses`：`Bundled()` 四个都能解析且都有非空 `SystemPrompt`，`explorer`/`reviewer`/`planner` 有 `OutputSchema`。
 
-- [ ] **Step 2: 实现**
+- [x] **Step 2: 实现**
   - `splitFrontmatter(data []byte) (fm []byte, body string, ok bool)`：要求首行是 `---`，找下一行 `---`。
   - `frontmatter` 结构体用 `yaml` tag：`name/description/when_to_use/tools/spawns/model/output/schema_mode/max_turns/soft_budget/timeout/read_only/blocking`；`tools`/`spawns` 用 `stringList` 自定义 `UnmarshalYAML`（接受标量 CSV 与序列）。
   - `Discover`：按目录顺序（project、user）`os.ReadDir` → 只取 `.md` → 字典序 → 解析 → `seen[name]` first-wins；最后追加 bundled 里未出现的名字。目录不存在按空。
@@ -131,7 +131,7 @@
   - `//go:embed agents/*.md` + 解析缓存（`sync.Once`）；解析失败直接 `panic`（内置定义写错必须在启动时暴露）。
   - `main.go`：`defs := subagent.Discover(paths.ProjectAgentsDir(cwd), userAgentsDir, subagent.Bundled())`，`Warns` 用 `log.Printf` 打印。
 
-- [ ] **Step 3: 验证** `go test ./internal/subagent/ -run 'Parse|Discover|Bundled'`
+- [x] **Step 3: 验证** `go test ./internal/subagent/ -run 'Parse|Discover|Bundled'`
 
 ---
 
@@ -142,17 +142,17 @@
 **Interfaces:**
 - Produces: `subagent.Env`、`subagent.Resolved`、`subagent.Preflight(b TaskBatch, env Env) ([]Resolved, error)`
 
-- [ ] **Step 1: 写失败测试**（表驱动，每条断言 error 文本含关键提示词）
+- [x] **Step 1: 写失败测试**（表驱动，每条断言 error 文本含关键提示词）
   - 空 `tasks` / 空 `context` / `task` < `MinTaskChars` / 未知 agent（错误里列出可用名） / `Depth >= MaxDepth` / `Spawns` 不含目标 / `agent == SelfAgent`。
   - `TestPreflightNamingAndDedup`：两项同 agent 且都没给 name → `worker-1`/`worker-2`；显式重名 → 第二个变 `X-2`；name 里的空格/斜杠被 sanitize。
   - `TestPreflightSchemaPrecedence`：item 的 `OutputSchema` 覆盖 def；`SchemaMode` 缺省 `permissive`，item 覆盖 def。
 
-- [ ] **Step 2: 实现**
+- [x] **Step 2: 实现**
   - 按 spec §3.2 的顺序检查；错误文本面向模型（说"怎么改"，不只说"错了"）。
   - `SeqNext` 缺省用 Manager 的 `atomic.Int64`；测试里注入确定性实现。
   - `sanitizeName` 复用 `manager.go` 里已有的实现（移到 preflight.go 并加导出注释）。
 
-- [ ] **Step 3: 验证** `go test ./internal/subagent/ -run Preflight`
+- [x] **Step 3: 验证** `go test ./internal/subagent/ -run Preflight`
 
 ---
 
@@ -164,22 +164,22 @@
 - Produces: `(*Manager).RunBatch(ctx, TaskBatch, Env) ([]Result, error)`、`(*Manager).Env(depth int, self string, spawns []string) Env`、`subagent.NewTaskTool(mgr *Manager, depth int, self string, spawns []string) tool.Tool`
 - Consumes: `Preflight`、`Discover` 的结果（`Options.Defs`）
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
   - `TestToolSetReadOnly`：`read_only: true` 的 def → 子 agent 拿到的工具名集合 == `{read_file, glob, grep, yield}`（hub 在 Task 14 加）。断言方式：给 `scriptModel` 记录它收到的 `[]model.ToolSpec`，取最后一次。
   - `TestToolSetSpawnsAndDepth`：`spawns: [worker]` 且 `depth+1 < maxDepth` → 工具集含 `task`；`depth+1 == maxDepth` → 不含。
   - `TestRunBatchRejectsThinPrompt`：一行 prompt 的批次 → `RunBatch` 返回 error，且**没有**任何 sidecar 文件生成（预检先于子进程）。
   - `TestTaskToolLegacyArgs`：`{"tasks":[{"subagent":"explorer","prompt":"<足够长的描述>"}]}` 仍能跑（兼容映射），结果文本里提示新字段名。
 
-- [ ] **Step 2: 实现**
+- [x] **Step 2: 实现**
   - `Options` 增 `MaxDepth`、`MinTaskChars`、`SoftBudget`、`Bus *bus.Bus`、`AllowBackground bool`。
   - `Manager.RunBatch`：`Preflight` → 为每项建 Run → 并发闸 → `drive`（Task 9 之前先保留现有 `Run` 逻辑，本任务只接线，测试用现有行为）。
   - 工具集构造抽成 `func (m *Manager) buildTools(def AgentDef, depth int, store *runtime.ArtifactStore, ys *YieldState) (*tool.Registry, *tool.Registry)`（第二个返回值 = 只含 yield 的注册表，Task 9 用）。
   - `task.go`：新参数 schema（`context` 必填、`tasks[].{name,agent,task,output_schema,schema_mode,effort}`、`background`）；旧字段 `subagent`/`prompt` 兼容映射；描述里动态枚举 agent（带 `[READ-ONLY]`/`[BLOCKING]`/`[schema]` 标记）+ 三句硬约束。
   - `background` 参数在 Task 12 之前：`AllowBackground == false` 或未实现时忽略并在结果里说明"已同步执行"。
 
-- [ ] **Step 3: 验证** `go test ./internal/subagent/`（旧测试按新 API 更新：`Task{Subagent,Prompt}` → `TaskBatch{Context, Tasks:[]TaskItem{{Agent,Task}}}`）
+- [x] **Step 3: 验证** `go test ./internal/subagent/`（旧测试按新 API 更新：`Task{Subagent,Prompt}` → `TaskBatch{Context, Tasks:[]TaskItem{{Agent,Task}}}`）
 
-- [ ] **Step 4: 提交** `feat: P9.1 契约与发现（bus / frontmatter agent / TaskBatch 预检 / 工具集与深度）`
+- [x] **Step 4: 提交** `feat: P9.1 契约与发现（bus / frontmatter agent / TaskBatch 预检 / 工具集与深度）`
 
 ---
 
@@ -192,16 +192,16 @@
 **Interfaces:**
 - Produces: `tool.Terminal interface{ IsTerminal(args map[string]any, err error) bool }`、`tool.Result{Content string; IsError bool; Terminal bool}`
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
   - `executor_test.go`：`TestResultTerminalFromTool`——假工具 `IsTerminal(args, err)` 在 `args["stop"]==true && err==nil` 时为真 → `Result.Terminal` 相应为 true/false；执行出错时 `Terminal == false`。
   - `loop_test.go`：`TestLoopStopsOnTerminalResult`——终止型工具返回 `Terminal:true` → 循环结束且发 `EventTerminated`；同一 assistant 消息里终止工具在前、普通工具在后 → 两个工具都执行（结果都记录），然后终止。
 
-- [ ] **Step 2: 实现**
+- [x] **Step 2: 实现**
   - `Executor.Execute`：解析 args 后执行，然后 `if t, ok := t.(Terminal); ok { res.Terminal = t.IsTerminal(args, err) }`。
   - `loop.go`：删掉注册表查找，改 `if results[i].Terminal { terminated = tc.Name }`；保留"先记录所有 tool 结果再终止"的顺序。
   - `yield.go`：`IsTerminal(args, err) = err == nil && strings.TrimSpace(str(args["section"])) == ""`（增量提交不终止；工具内退回重试时 err != nil 也不终止）。
 
-- [ ] **Step 3: 验证** `go test ./internal/tool/ ./internal/agent/ ./internal/subagent/`
+- [x] **Step 3: 验证** `go test ./internal/tool/ ./internal/agent/ ./internal/subagent/`
 
 ---
 
@@ -212,7 +212,7 @@
 **Interfaces:**
 - Produces: `Validate(schema map[string]any, value any) []string`、`deriveDataSchema(map[string]any) map[string]any`、`sectionSchema(schema map[string]any, label string) (map[string]any, bool)`、`closedSchema(map[string]any) bool`
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
   - `TestValidateObjectRequired`：缺字段 → issue 文本含字段名与路径（`findings[0].file`）。
   - `TestValidateTypes`：string/number/integer/boolean/array/object/null 的正反例；`integer` 接受 `float64(3)` 拒绝 `3.5`（JSON 解出来都是 float64）。
   - `TestValidateEnum`、`TestValidateNestedArrayItems`。
@@ -221,12 +221,12 @@
   - `TestSectionSchemaArrayItems`：`findings` 是数组 → 返回其 `items`；`verdict` 是标量 → 返回该属性 schema；未知名 → `false`。
   - `TestClosedSchema`：有 `properties` 且无 `additionalProperties:true` → true。
 
-- [ ] **Step 2: 实现**
+- [x] **Step 2: 实现**
   - `Validate` 递归，路径用 `$`/`.field`/`[i]` 拼接；issue 上限 20 条（多了截断并附 `…`）。
   - 不支持的关键字（`$ref`/`oneOf`/`anyOf`/`allOf`/`pattern`/`format`/min/max）**忽略**，文件头注释声明限制。
   - `deriveDataSchema` 深拷贝（`map[string]any`/`[]any` 递归）。
 
-- [ ] **Step 3: 验证** `go test ./internal/subagent/ -run 'Validate|Derive|Section|Closed'`
+- [x] **Step 3: 验证** `go test ./internal/subagent/ -run 'Validate|Derive|Section|Closed'`
 
 ---
 
@@ -237,7 +237,7 @@
 **Interfaces:**
 - Produces: `YieldState`（`Data any`、`Sections map[string][]any`、`Error string`、`SchemaOverridden bool`、`SchemaViolation bool`、`Issues []string`）、`NewYieldTool(st *YieldState, schema map[string]any, mode string) tool.Tool`
 
-- [ ] **Step 1: 写失败测试**（直接调 `Execute`，用 `runtime.NewSink` 取文本）
+- [x] **Step 1: 写失败测试**（直接调 `Execute`，用 `runtime.NewSink` 取文本）
   - `TestYieldTerminalSuccess`：`{"data":{...}}` → 无 error、`st.Data` 设好、`IsTerminal` 为 true、sink 文本"结果已提交"。
   - `TestYieldIncrementalAccumulates`：两次 `{"section":"findings","data":{...}}` → `st.Sections["findings"]` 长度 2，`IsTerminal` false，文本提示"继续工作…最后不带 section 再调一次"。
   - `TestYieldErrorState`：`{"error":"卡在 X"}` → `st.Error` 设好、terminal。
@@ -249,12 +249,12 @@
   - `TestYieldUnknownSectionOnClosedSchema`：封闭 schema 下未知 section → error 列出可用名。
   - `TestYieldParametersDerived`：`Parameters()["data"]` 里没有 `required`，`Description()` 含 schema 关键字段名。
 
-- [ ] **Step 2: 实现**（按 spec §4.2 的流程；注意 `YieldState` 全部方法加锁）
+- [x] **Step 2: 实现**（按 spec §4.2 的流程；注意 `YieldState` 全部方法加锁）
   - `Parameters()`：`{"data": deriveDataSchema(schema), "error": {type:string}, "section": {type:string, enum: <已知分段名，若封闭>}}`；`Required()` 返回 `nil`（三者都可选，语义在 description 与工具内校验）。
   - `Concurrency()` 返回 `ConcurrencyExclusive`（同一消息里的多次 yield 串行，计数器语义才确定）。
   - `Description()`：动态生成，含 `data`/`error`/`section` 三态说明 + schema（>2KB 只留顶层字段名）。
 
-- [ ] **Step 3: 验证** `go test ./internal/subagent/ -run Yield -race`
+- [x] **Step 3: 验证** `go test ./internal/subagent/ -run Yield -race`
 
 ---
 
@@ -266,7 +266,7 @@
 - Produces: `Run`（内部）、`(*Run).View() RunView`、`(*Manager).drive(runCtx, *Run, *runtimeSet) Result`
 - Consumes: `agent.New`/`Run`、`YieldState`、`bus`
 
-- [ ] **Step 1: 写失败测试**（`scriptModel` 扩展：记录每次调用收到的工具名集合；支持"第 N 次调用返回 X"）
+- [x] **Step 1: 写失败测试**（`scriptModel` 扩展：记录每次调用收到的工具名集合；支持"第 N 次调用返回 X"）
   - `TestLadderRemindsThreeTimes`：模型永远只回文本 → 恰好 3 条提醒被记进 sidecar（grep `[提醒`），`Result.Reminders == 3`。
   - `TestForcedTurnOnlyHasYield`：第 3 次提醒那一 turn，模型收到的工具集只有 `yield`。
   - `TestLadderExhaustedNoSchema` / `WithSchema`：无 schema → `completed` + `Yielded=false` + `Warning` 含"未 yield"；有 schema → `failed`。
@@ -277,7 +277,7 @@
   - `TestPanicRecovered`：注入 panic 的假工具 → `failed` 且不炸测试进程。
   - `TestProgressPublished`：订阅 `ChProgress` 能看到 `CurrentTool` 变化与 `Requests` 增长；订阅 `ChLifecycle` 能看到 running→completed→parked。
 
-- [ ] **Step 2: 实现**
+- [x] **Step 2: 实现**
   ```go
   type Run struct {
       mu sync.Mutex
@@ -307,9 +307,9 @@
   - 结算：状态判定（spec §5.3 优先级）→ 写 `<sessionDir>/<Name>.md` → `session_exit` custom 条目（含 status/requests/reminders/budgetStop/schema 状态）→ `ChLifecycle(parked)`。
   - `RunMany` 删除，全部走 `RunBatch`（同步）与 `StartBackground`（Task 12）。
 
-- [ ] **Step 3: 验证** `go test ./internal/subagent/ -race`
+- [x] **Step 3: 验证** `go test ./internal/subagent/ -race`
 
-- [ ] **Step 4: 提交** `feat: P9.2 完成度（yield 三态 + schema 校验重试 + idle 提醒阶梯 + 软预算状态机）`
+- [x] **Step 4: 提交** `feat: P9.2 完成度（yield 三态 + schema 校验重试 + idle 提醒阶梯 + 软预算状态机）`
 
 ---
 
@@ -322,20 +322,20 @@
 **Interfaces:**
 - Produces: `(*ArtifactStore).AddScheme(scheme string, resolve func(rest string) (string, error))`、`(*Manager).Roster() []RunView`、`(*Manager).ResolveAgentURL(name string) (string, error)`、`(*Manager).ResolveHistoryURL(name string) (string, error)`
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
   - `TestAddSchemeDispatch`：注册 `agent` → `Resolve("agent://X")` 走自定义解析；`Resolve("artifact://1")` 仍走原逻辑；未知 scheme → 错误里列出已注册 scheme。
   - `TestReadFileViaAgentScheme`：Run 结束后 `read_file file_path="agent://Reviewer"` 能读到 data JSON。
   - `TestRosterContainsParked`：Run 结束后 `Roster()` 里仍有该行且 `Status == "parked"`，`OutputFile`/`SessionFile` 非空。
   - `TestResolveHistoryFallbackToGlob`：名册里没有（模拟 resume）时按 `<sessionDir>/agent-<Name>-*.jsonl` glob 兜底。
 
-- [ ] **Step 2: 实现**
+- [x] **Step 2: 实现**
   - `ArtifactStore`：`schemes map[string]func(string)(string,error)` + `Resolve` 先按 `<scheme>://` 前缀分派，无 scheme 前缀时按 artifact id（兼容 M1）。
   - `read_file`：`strings.Contains(path, "://")` → 交 store 解析（store 为 nil 时报清晰错误）。
   - `Manager`：`runs map[string]*Run`（key = Name）+ `mu`；`Roster()` 返回按启动时间排序的快照。
   - 产出文件写法：`<sessionDir>/<sanitizeName(Name)>.md`，内容 = 元信息头（agent/status/requests/tokens/duration）+ `## data`（JSON）+ `## sections` + `## last text`。
   - `cmd/agent/main.go`：`store.AddScheme("agent", mgr.ResolveAgentURL)`、`store.AddScheme("history", mgr.ResolveHistoryURL)`。
 
-- [ ] **Step 3: 验证** `go test ./internal/runtime/ ./internal/tool/ ./internal/subagent/`
+- [x] **Step 3: 验证** `go test ./internal/runtime/ ./internal/tool/ ./internal/subagent/`
 
 ---
 
@@ -347,12 +347,12 @@
 - Produces: `tui.NewModel(ag, mgr, cmgr, mem, cwd string, sub *subagent.Manager, b *bus.Bus)`（签名扩展）、`hubTickMsg`、`renderHub(rows []subagent.RunView, sel, width int) string`
 - Consumes: `bus.Subscribe`、`subagent.Manager.Roster/Cancel/Send`
 
-- [ ] **Step 1: 写失败测试**（TUI 主体不好测，只测纯渲染与选择逻辑）
+- [x] **Step 1: 写失败测试**（TUI 主体不好测，只测纯渲染与选择逻辑）
   - `hub_test.go`：`TestRenderHubRows`——给定 3 行（running/parked/failed）渲染出 3 行文本，含 Name、status、`req=`、当前工具；选中行有标记。
   - `TestHubSelectionClamp`：`j`/`k` 越界不 panic，选择被夹在 `[0, len-1]`。
   - `TestParseAgentCommand`：`/agent Reviewer 再核对 X` → `("Reviewer", "再核对 X", true)`；`/agent` 无参数 → `ok == false`。
 
-- [ ] **Step 2: 实现**
+- [x] **Step 2: 实现**
   - `teaModel` 增 `hubOpen bool`、`hubSel int`、`sub *subagent.Manager`、`bus *bus.Bus`。
   - `ctrl+a` 切换面板；面板打开时 `j/k/x/esc` 优先（审批弹窗仍最高优先级）。
   - `View()`：`hubOpen` 时把 chat 区下半部分换成 Hub 面板（表头 = 聚合：running N / parked M / 总 tokens）。
@@ -360,9 +360,9 @@
   - `/agent <Name> <文本>`：调 `sub.Send("Main", name, text)`（Task 14 实现；本任务先接 `Roster` 判断存在性，未实现时提示"待 P9.4"）。
   - `x`：对选中行调 `sub.Cancel([]string{id})`（Task 12 之前先调 Run 的 cancel）。
 
-- [ ] **Step 3: 验证** `go test ./internal/tui/`；手动跑一次 TUI 确认面板开合与不遮挡输入框
+- [x] **Step 3: 验证** `go test ./internal/tui/`；真实模型 headless 冒烟已验证名册/`agent://`/`history://`（`- [ ]` 交互式 TUI 面板开合待人工确认）
 
-- [ ] **Step 4: 提交** `feat: P9.3 可观测（Run 名册 + agent://history:// + TUI Agent Hub）`
+- [x] **Step 4: 提交** `feat: P9.3 可观测（Run 名册 + agent://history:// + TUI Agent Hub）`
 
 ---
 

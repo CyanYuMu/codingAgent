@@ -51,11 +51,20 @@ type Options struct {
 }
 
 // Manager 派发子 agent，并持有 Run 名册。
+// 名册按运行名索引（运行名同时是 hub 地址、agent:// 地址与作业 id，预检保证唯一）；
+// 结束的 Run 留在名册里（parked），这样父 agent 与 TUI 事后还能读它的产出与转录。
 type Manager struct {
 	o   Options
 	sem chan struct{}
 	seq atomic.Int64
+
+	mu    sync.Mutex
+	runs  map[string]*Run
+	order []string // 启动顺序，名册展示用
 }
+
+// maxParkedRuns 名册里保留的已结束 Run 上限：超出后丢最早的（磁盘上的转录与产出不删）。
+const maxParkedRuns = 100
 
 // NewManager 构造 Manager；并发上限默认 4，窗口默认 128k。
 func NewManager(o Options) *Manager {
@@ -68,7 +77,149 @@ func NewManager(o Options) *Manager {
 	if o.DefaultMaxTurns <= 0 {
 		o.DefaultMaxTurns = 50
 	}
-	return &Manager{o: o, sem: make(chan struct{}, o.MaxConcurrency)}
+	return &Manager{o: o, sem: make(chan struct{}, o.MaxConcurrency), runs: map[string]*Run{}}
+}
+
+// register 把 Run 放进名册（同名覆盖：预检已保证同时只有一个活的同名 Run）。
+func (m *Manager) register(r *Run) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.runs[r.name]; !ok {
+		m.order = append(m.order, r.name)
+	}
+	m.runs[r.name] = r
+	m.pruneLocked()
+}
+
+// pruneLocked 名册超限时丢最早的已结束 Run。
+func (m *Manager) pruneLocked() {
+	settled := 0
+	for _, n := range m.order {
+		if r := m.runs[n]; r != nil && r.settled() {
+			settled++
+		}
+	}
+	for i := 0; i < len(m.order) && settled > maxParkedRuns; i++ {
+		n := m.order[i]
+		if r := m.runs[n]; r != nil && r.settled() {
+			delete(m.runs, n)
+			m.order = append(m.order[:i], m.order[i+1:]...)
+			i--
+			settled--
+		}
+	}
+}
+
+// lookup 按运行名取 Run（含已结束的 parked）。
+func (m *Manager) lookup(name string) *Run {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.runs[name]
+}
+
+// Roster 返回名册快照（按启动顺序）。
+func (m *Manager) Roster() []RunView {
+	m.mu.Lock()
+	runs := make([]*Run, 0, len(m.order))
+	for _, n := range m.order {
+		if r := m.runs[n]; r != nil {
+			runs = append(runs, r)
+		}
+	}
+	m.mu.Unlock()
+	out := make([]RunView, 0, len(runs))
+	for _, r := range runs {
+		out = append(out, r.View())
+	}
+	return out
+}
+
+// names 返回名册里的运行名（错误提示用）。
+func (m *Manager) names() []string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([]string, 0, len(m.order))
+	for _, n := range m.order {
+		if _, ok := m.runs[n]; ok {
+			out = append(out, n)
+		}
+	}
+	return out
+}
+
+// Cancel 按运行名终止若干 Run，返回实际终止数（已结束的不计）。
+func (m *Manager) Cancel(names []string) int {
+	n := 0
+	for _, name := range names {
+		if r := m.lookup(name); r != nil && !r.settled() {
+			r.Cancel()
+			n++
+		}
+	}
+	return n
+}
+
+// Send 给一个子 agent 送一条消息：运行中的作为 steering 注入它的下一步。
+// 唤醒已结束（parked）的 Run 走后台作业通道，在 hub 通信落地后支持。
+func (m *Manager) Send(from, to, text string) error {
+	r := m.lookup(to)
+	if r == nil {
+		return fmt.Errorf("没有名为 %q 的子 agent；当前名册：%s", to, strings.Join(m.names(), ", "))
+	}
+	if r.settled() {
+		return fmt.Errorf("%s 已结束（%s），暂不支持唤醒续跑；可以用 read_file agent://%s 读它的产出", to, StatusString(r.statusNow()), to)
+	}
+	if !r.Steer(message.NewUserMessage("[hub from " + from + "] " + text)) {
+		return fmt.Errorf("%s 的消息队列已满，稍后再试", to)
+	}
+	return nil
+}
+
+// RegisterSchemes 把 agent:// 与 history:// 挂到一个产物存储上，
+// 让 read_file 成为读回子 agent 产出与转录的唯一入口。
+func (m *Manager) RegisterSchemes(store *runtime.ArtifactStore) { m.registerSchemes(store) }
+
+func (m *Manager) registerSchemes(store *runtime.ArtifactStore) {
+	if store == nil {
+		return
+	}
+	store.AddScheme("agent", m.ResolveAgentURL)
+	store.AddScheme("history", m.ResolveHistoryURL)
+}
+
+// ResolveAgentURL 解析 agent://<Name> → 该 Run 的完整产出文件。
+func (m *Manager) ResolveAgentURL(name string) (string, error) {
+	if r := m.lookup(name); r != nil {
+		if f := r.View().OutputFile; f != "" {
+			return f, nil
+		}
+	}
+	// 名册里没有（例如 resume 之后）：回落到产物目录里按名字找
+	p := filepath.Join(m.o.SessionDir, sanitizeName(name)+".md")
+	if _, err := os.Stat(p); err == nil {
+		return p, nil
+	}
+	return "", fmt.Errorf("找不到 %q 的产出；当前名册：%s", name, strings.Join(m.names(), ", "))
+}
+
+// ResolveHistoryURL 解析 history://<Name> → 该 Run 的 sidecar 转录。
+func (m *Manager) ResolveHistoryURL(name string) (string, error) {
+	if r := m.lookup(name); r != nil {
+		if f := r.View().SessionFile; f != "" {
+			return f, nil
+		}
+	}
+	matches, _ := filepath.Glob(filepath.Join(m.o.SessionDir, "agent-"+sanitizeName(name)+"-*.jsonl"))
+	if len(matches) == 0 {
+		return "", fmt.Errorf("找不到 %q 的转录；当前名册：%s", name, strings.Join(m.names(), ", "))
+	}
+	newest, newestAt := matches[0], time.Time{}
+	for _, p := range matches {
+		if st, err := os.Stat(p); err == nil && st.ModTime().After(newestAt) {
+			newest, newestAt = p, st.ModTime()
+		}
+	}
+	return newest, nil
 }
 
 // List 返回子 agent 定义（确定性顺序，供 task 工具枚举）。
@@ -80,6 +231,7 @@ func (m *Manager) Env(depth int, self string, spawns []string) Env {
 		Defs: m.o.Defs, Depth: depth, MaxDepth: m.o.MaxDepth, Spawns: spawns, SelfAgent: self,
 		MinTaskChars: m.o.MinTaskChars,
 		SeqNext:      func(agent string) string { return fmt.Sprintf("%s-%d", agent, m.seq.Add(1)) },
+		NameTaken:    func(name string) bool { return m.lookup(name) != nil }, // 名册里的名字（含 parked）不复用
 	}
 }
 
@@ -138,8 +290,10 @@ func (m *Manager) RunBatch(ctx context.Context, b TaskBatch, env Env) ([]Result,
 func (m *Manager) Run(ctx context.Context, batchContext string, r Resolved, depth int) Result {
 	def := m.resolveDef(r.Def)
 	run := newRun(r.Item.Name, def.Name, depth)
+	m.register(run)
 	rs, err := m.setup(def, r, batchContext, depth)
 	if err != nil {
+		run.setStatus(StatusFailed)
 		return Result{ID: run.name, Name: run.name, Agent: def.Name, Status: StatusFailed, Err: err}
 	}
 	defer rs.sess.Close()
@@ -152,6 +306,7 @@ func (m *Manager) setup(def AgentDef, r Resolved, batchContext string, depth int
 	var store *runtime.ArtifactStore
 	if m.o.SessionDir != "" {
 		store = runtime.NewArtifactStore(m.o.SessionDir)
+		m.registerSchemes(store) // 子 agent 之间也能 read_file agent://<Name>
 	}
 	ys := NewYieldState()
 	tools, yieldOnly := m.buildTools(def, depth, store, ys, r.Schema, r.SchemaMode)
