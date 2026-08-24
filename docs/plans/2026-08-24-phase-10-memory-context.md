@@ -166,13 +166,13 @@
 
 **Interfaces:** `(*Manager).InvalidateSystem()`
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
   - `TestSystemPrefixStableAcrossBuilds`：注入一个每次调用都返回不同内容的 `system()` → 连续 10 次 `Build` 前缀完全一致；`InvalidateSystem()` 后才变。
   - `TestCompactInvalidatesSystem`：`Compact` 成功后前缀重新计算。
   - `TestSetSessionInvalidates`：换会话后重新计算。
 
-- [ ] **Step 2: 实现**：`Manager` 缓存 `[]message.Message` 前缀与一个 `dirty` 标记；`Compact`/`RecoverOverflow`/`SetSession` 置脏。
-- [ ] **Step 3: 验证** `go test ./internal/context/`
+- [x] **Step 2: 实现**：`Manager` 缓存 `[]message.Message` 前缀与一个 `dirty` 标记；`Compact`/`RecoverOverflow`/`SetSession` 置脏。
+- [x] **Step 3: 验证** `go test ./internal/context/`
 
 ---
 
@@ -182,7 +182,7 @@
 
 **Interfaces:** `instructions.Load(cwd, home string, limit int) (Block, error)`
 
-- [ ] **Step 1: 写失败测试**（全部用临时目录搭真实文件树）
+- [x] **Step 1: 写失败测试**（全部用临时目录搭真实文件树）
   - `TestLoadHierarchyOrder`：git root 的 `AGENTS.md` 在前、子目录的在后；同级 `AGENTS.md` 优先于 `CLAUDE.md`。
   - `TestImportExpansion`：`@docs/x.md` 展开；相对路径相对导入者目录；`~/x.md` 展开家目录。
   - `TestImportDepthAndCycle`：5 跳后停止；A↔B 互相导入不死循环。
@@ -191,8 +191,8 @@
   - `TestMissingImportKeptLiteral`、`TestBudgetTruncatesFarthest`（超预算时先丢最远的祖先层）。
   - `TestRulesAreSticky`：`RULES.md` 内容出现在渲染文本末尾且 `Sticky=true`。
 
-- [ ] **Step 2: 实现**（按 spec §3；`expand` 是纯函数，输入 `(content, dir, depth, seen)`）
-- [ ] **Step 3: 验证** `go test ./internal/instructions/`
+- [x] **Step 2: 实现**（按 spec §3；`expand` 是纯函数，输入 `(content, dir, depth, seen)`）
+- [x] **Step 3: 验证** `go test ./internal/instructions/`
 
 ---
 
@@ -200,12 +200,12 @@
 
 **Files:** Modify `cmd/agent/main.go`
 
-- [ ] **Step 1: 实现**
+- [x] **Step 1: 实现**
   - system 前缀顺序固定：`[基础指令 + env] [<project-instructions>…] [<memories>] [<project-map>] [<sticky-rules>]`。
   - 召回查询用 `BuildRecallQuery(session.Replay())`，预算裁剪到 `recall_budget`。
   - `Compact` 之后（TUI/headless 收到 `EventCompaction`）不需要额外动作——`Manager` 自己置脏。
-- [ ] **Step 2: 验证** `-p` 跑两轮，打印 system 前缀哈希确认同一会话内一致。
-- [ ] **Step 3: 提交** `feat: P10.2 注入位置与项目指令层（前缀缓存 + AGENTS.md 层级 + @import + RULES 粘性）`
+- [x] **Step 2: 验证** 单测钉住「10 次 Build 前缀不变、system() 只算一次」；真机冒烟确认模型能读到 AGENTS.md、@import 展开的内容与 RULES.md 粘性规则。
+- [x] **Step 3: 提交** `feat: P10.2 注入位置与项目指令层（前缀缓存 + AGENTS.md 层级 + @import + RULES 粘性）`
 
 ---
 

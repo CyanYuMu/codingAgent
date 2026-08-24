@@ -195,7 +195,8 @@ func Load(cwd, home string, limit int) (Block, error)
 
 1. **层级**：`<Home>/AGENTS.md`（用户级，最前）→ git root 到 cwd 的每一级目录，每级取第一个存在的 `AGENTS.md` / `CLAUDE.md`（本项目原生名优先 `AGENTS.md`）→ 祖先在前、近者在后（近者后置 = 更强）。
 2. **@import**：行首或空白后的 `@path` 展开为文件内容；相对路径相对**导入它的文件**所在目录；`~` 展开家目录；≤5 跳；已展开过的文件不再展开（防环）；**围栏代码块与行内代码里的 `@` 不展开**；`git@github.com:…`、`user@example.com` 不当导入；目标不存在则原样保留。
-3. **RULES.md**：`<Home>/RULES.md` 与 `<cwd>/RULES.md` 标 `Sticky`，渲染在整块**最后**，并在每次压缩后重新贴（借 §2.4 的失效机制自然做到）。
+3. **RULES.md**：与普通指令查**同样的目录链**（用户级 → git 根 → … → cwd）并标 `Sticky`，渲染在整块**最后**，每次压缩后随前缀重新贴（借 §2.4 的失效机制自然做到）。
+   （实现时改的：原设计只看 `<cwd>/RULES.md`，那样从子目录启动就把仓库根的规则丢了。）
 4. **预算**：整块 ≤ `limit`（默认 32KB 字符）；超出按"近者优先"截断，并在块尾注明被截断的文件数。
 5. 渲染：每个文件一段 `<project-instructions path="/abs/path">…</project-instructions>`，模型能看到绝对路径。
 

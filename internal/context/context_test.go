@@ -245,3 +245,72 @@ func TestSummarizePromptRequiresSixFields(t *testing.T) {
 		}
 	}
 }
+
+// countingSystem 每次调用返回不同内容：用来验证前缀确实被缓存了。
+func countingSystem(n *int) func(context.Context) []message.Message {
+	return func(context.Context) []message.Message {
+		*n++
+		return []message.Message{message.NewSystemMessage("SYS-" + string(rune('a'+*n-1)))}
+	}
+}
+
+func TestSystemPrefixStableAcrossBuilds(t *testing.T) {
+	s, _ := session.New("s1", &session.MemoryStorage{})
+	calls := 0
+	cm := New(s, nil, 100000, 1000, countingSystem(&calls))
+	_ = cm.Record(ctxMsg(message.RoleUser, "hi"), model.Usage{})
+
+	first, _ := cm.Build(context.Background())
+	for i := 0; i < 9; i++ {
+		got, _ := cm.Build(context.Background())
+		if got[0].Blocks[0].Text != first[0].Blocks[0].Text {
+			t.Fatalf("第 %d 次 Build 的前缀变了：%q → %q（prompt cache 会因此每轮失效）",
+				i+2, first[0].Blocks[0].Text, got[0].Blocks[0].Text)
+		}
+	}
+	if calls != 1 {
+		t.Fatalf("system() 被调用 %d 次，应只算一次", calls)
+	}
+}
+
+func TestInvalidateSystemRefreshes(t *testing.T) {
+	s, _ := session.New("s1", &session.MemoryStorage{})
+	calls := 0
+	cm := New(s, nil, 100000, 1000, countingSystem(&calls))
+	before, _ := cm.Build(context.Background())
+	cm.InvalidateSystem()
+	after, _ := cm.Build(context.Background())
+	if before[0].Blocks[0].Text == after[0].Blocks[0].Text {
+		t.Fatal("失效后应重新计算前缀")
+	}
+}
+
+func TestCompactInvalidatesSystem(t *testing.T) {
+	s, _ := session.New("s1", &session.MemoryStorage{})
+	calls := 0
+	cm := New(s, &fakeSummarizer{out: "SUMMARY"}, 1000, 6, countingSystem(&calls))
+	for _, tx := range []string{"m0", "m1", "m2", "m3"} {
+		_ = cm.Record(ctxMsg(message.RoleUser, tx), model.Usage{})
+	}
+	_, _ = cm.Build(context.Background())
+	if _, err := cm.Compact(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	_, _ = cm.Build(context.Background())
+	if calls != 2 {
+		t.Fatalf("压缩后应刷新前缀（记忆与粘性规则要重贴），system() 调用次数 = %d", calls)
+	}
+}
+
+func TestSetSessionInvalidatesSystem(t *testing.T) {
+	s, _ := session.New("s1", &session.MemoryStorage{})
+	calls := 0
+	cm := New(s, nil, 100000, 1000, countingSystem(&calls))
+	_, _ = cm.Build(context.Background())
+	s2, _ := session.New("s2", &session.MemoryStorage{})
+	cm.SetSession(s2)
+	_, _ = cm.Build(context.Background())
+	if calls != 2 {
+		t.Fatalf("换会话后应重算前缀：%d", calls)
+	}
+}

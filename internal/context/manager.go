@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"strings"
+	"sync"
 
 	"einoclaw-build/internal/message"
 	"einoclaw-build/internal/model"
@@ -53,12 +54,19 @@ func (m *modelSummarizer) Summarize(ctx context.Context, msgs []message.Message)
 // Manager 是循环的真相源：从 session 重建输入、记录消息、超阈值压缩、溢出恢复。
 // 它实现 agent.Context。
 type Manager struct {
+	mu         sync.Mutex // 保护 session 与前缀缓存：TUI 换会话与循环重建输入在不同 goroutine
 	session    *session.Session
 	summarizer Summarizer
 	window     int
 	keepRecent int
 	lastPrompt int                                         // 最近一次 provider 报告的 prompt tokens（估算校准用）
 	system     func(ctx context.Context) []message.Message // 系统提示 + 记忆块等前缀，由装配方注入
+
+	// 前缀缓存：system() 里有记忆召回这类每次都可能变的内容，如果每轮都重算，
+	// 提示词前缀就每轮都变——provider 的 prompt cache 全部失效，长会话里这是最大的隐性成本。
+	// 因此只在「会话首轮 / 压缩后 / 换会话」这三个时刻刷新。
+	sysCache []message.Message
+	sysDirty bool
 }
 
 // New 构造 Manager。system 为 nil 时不注入前缀；summarizer 为 nil 时不压缩（Compact 恒返回 false）。
@@ -69,14 +77,44 @@ func New(s *session.Session, sum Summarizer, window, keepRecent int, system func
 	if keepRecent <= 0 {
 		keepRecent = 16384
 	}
-	return &Manager{session: s, summarizer: sum, window: window, keepRecent: keepRecent, system: system}
+	return &Manager{session: s, summarizer: sum, window: window, keepRecent: keepRecent, system: system, sysDirty: true}
 }
 
 // Session 返回当前会话。
-func (m *Manager) Session() *session.Session { return m.session }
+func (m *Manager) Session() *session.Session {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.session
+}
 
-// SetSession 切换当前会话（多会话 /new /resume 时跟随）。
-func (m *Manager) SetSession(s *session.Session) { m.session = s }
+// SetSession 切换当前会话（多会话 /new /resume 时跟随），并让前缀失效。
+func (m *Manager) SetSession(s *session.Session) {
+	m.mu.Lock()
+	m.session, m.sysDirty = s, true
+	m.mu.Unlock()
+}
+
+// InvalidateSystem 让下一次 Build 重新计算系统前缀（记忆刷新、粘性规则重贴）。
+func (m *Manager) InvalidateSystem() {
+	m.mu.Lock()
+	m.sysDirty = true
+	m.mu.Unlock()
+}
+
+// systemPrefix 取（或重建）系统前缀。重建时**不持锁**：注入的 system() 闭包会回调 Session()。
+func (m *Manager) systemPrefix(ctx context.Context) []message.Message {
+	m.mu.Lock()
+	cached, dirty := m.sysCache, m.sysDirty
+	m.mu.Unlock()
+	if !dirty {
+		return cached
+	}
+	built := m.system(ctx)
+	m.mu.Lock()
+	m.sysCache, m.sysDirty = built, false
+	m.mu.Unlock()
+	return built
+}
 
 // threshold 预算阈值：window − reserve，reserve = max(15%·window, 16384)。
 func (m *Manager) threshold() int {
@@ -89,11 +127,11 @@ func (m *Manager) threshold() int {
 
 // Build 重建模型输入：system 前缀 + 会话回放（含压缩展开与悬空修复）。
 func (m *Manager) Build(ctx context.Context) ([]message.Message, error) {
-	hist, err := m.session.Replay()
+	hist, err := m.Session().Replay()
 	if err != nil {
 		return nil, err
 	}
-	prefix := m.system(ctx)
+	prefix := m.systemPrefix(ctx)
 	out := make([]message.Message, 0, len(prefix)+len(hist))
 	out = append(out, prefix...)
 	return append(out, hist...), nil
@@ -101,7 +139,7 @@ func (m *Manager) Build(ctx context.Context) ([]message.Message, error) {
 
 // Record 记录一条消息到会话（assistant 消息带用量）。
 func (m *Manager) Record(msg message.Message, u model.Usage) error {
-	return m.session.AppendWithUsage(msg, u)
+	return m.Session().AppendWithUsage(msg, u)
 }
 
 // ShouldCompact 判断上一次调用的 prompt 用量是否超阈值；同时记下真值供估算校准。
@@ -160,7 +198,8 @@ func (m *Manager) compact(ctx context.Context, keep int) (bool, error) {
 	if m.summarizer == nil {
 		return false, nil
 	}
-	msgs, err := m.session.Replay()
+	sess := m.Session()
+	msgs, err := sess.Replay()
 	if err != nil {
 		return false, err
 	}
@@ -180,12 +219,16 @@ func (m *Manager) compact(ctx context.Context, keep int) (bool, error) {
 	for _, mm := range msgs {
 		before += estimateTokens(mm)
 	}
-	return true, m.session.Compact(summary, firstKept, before)
+	if err := sess.Compact(summary, firstKept, before); err != nil {
+		return false, err
+	}
+	m.InvalidateSystem() // 压缩后重贴记忆与粘性规则：这是前缀允许变化的少数时刻之一
+	return true, nil
 }
 
 // entryIDOfMessageIndex 把 Replay 下标映射回 session 条目 id（与 Replay 一一对应）。
 func (m *Manager) entryIDOfMessageIndex(idx int) (string, error) {
-	ids, err := m.session.ContextEntryIDs()
+	ids, err := m.Session().ContextEntryIDs()
 	if err != nil {
 		return "", err
 	}

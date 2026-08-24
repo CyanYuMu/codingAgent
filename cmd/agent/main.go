@@ -16,6 +16,7 @@ import (
 	"einoclaw-build/internal/agent"
 	"einoclaw-build/internal/bus"
 	agentctx "einoclaw-build/internal/context"
+	"einoclaw-build/internal/instructions"
 	"einoclaw-build/internal/memory"
 	"einoclaw-build/internal/message"
 	"einoclaw-build/internal/model"
@@ -137,6 +138,24 @@ func discoverAgents(cwd string) []subagent.AgentDef {
 		log.Printf("跳过 agent 定义: %v", w)
 	}
 	return res.Defs
+}
+
+// loadProjectInstructions 加载 L1 项目指令层（AGENTS.md / CLAUDE.md / RULES.md，含 @import）。
+// 读不到就是没有，不该让 agent 起不来。
+func loadProjectInstructions(cwd string) string {
+	home, err := paths.Home()
+	if err != nil {
+		home = ""
+	}
+	b, err := instructions.Load(cwd, home, 0)
+	if err != nil {
+		log.Printf("项目指令层加载失败: %v", err)
+		return ""
+	}
+	for _, f := range b.Files {
+		log.Printf("已加载项目指令: %s", f.Path)
+	}
+	return b.Text
 }
 
 // warnLegacyData 检测仓库内旧的 sessions/ 与 memory.db（P8 之前的落点），提示一次迁移。
@@ -284,12 +303,17 @@ func main() {
 	exec := tool.NewExecutor(mainRegistry, mode, approver)
 	exec.SetArtifactStore(store)
 
-	// system 前缀：指令 + 环境块 + 记忆块。召回查询用最近几个用户 turn 构造；
-	// 召回失败要出声——静默吞掉的话，"记忆功能看起来在、实际永远召回不到"能藏很久。
+	// system 前缀的排布是固定的：[基础指令 + env] [项目指令层] [记忆块]，
+	// 而且整块被 context.Manager 缓存，只在会话首轮/压缩后/换会话时重算——
+	// 前缀每轮变化 = provider 的 prompt cache 每轮失效，这是长会话里最贵的隐性成本。
 	instr := buildInstruction(cfg.DelegationMode) + envBlock(cwd)
+	projectBlock := loadProjectInstructions(cwd)
 	var cmgr *agentctx.Manager
 	system := func(ctx context.Context) []message.Message {
 		msgs := []message.Message{message.NewSystemMessage(instr)}
+		if projectBlock != "" {
+			msgs = append(msgs, message.NewSystemMessage(projectBlock))
+		}
 		if mem == nil {
 			return msgs
 		}
