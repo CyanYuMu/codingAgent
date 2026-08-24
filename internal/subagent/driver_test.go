@@ -228,7 +228,7 @@ func TestCancelRunFromRoster(t *testing.T) {
 	o.Defs[0].Timeout = 5 * time.Second
 	mgr := NewManager(o)
 	run := newRun("Scout", "explorer", 1)
-	rs, err := mgr.setup(mgr.resolveDef(o.Defs[0]), Resolved{Item: TaskItem{Name: "Scout", Agent: "explorer", Task: "x"}}, "背景", 1)
+	rs, err := mgr.setup(mgr.resolveDef(o.Defs[0]), Resolved{Item: TaskItem{Name: "Scout", Agent: "explorer", Task: "x"}}, "背景", 1, run)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -30,7 +30,7 @@ func mergeHubEvents(b *bus.Bus) <-chan bus.Envelope {
 	if b == nil {
 		return out
 	}
-	for _, ch := range []string{subagent.ChLifecycle, subagent.ChProgress, subagent.ChJob} {
+	for _, ch := range []string{subagent.ChLifecycle, subagent.ChProgress, subagent.ChJob, subagent.ChMailbox} {
 		c, _ := b.Subscribe(ch, 128)
 		go func(c <-chan bus.Envelope) {
 			for e := range c {

@@ -148,6 +148,7 @@ func main() {
 	cwdFlag := flag.String("cwd", "", "工作目录（默认当前目录）")
 	yolo := flag.Bool("yolo", false, "强制 approval_mode=yolo")
 	prompt := flag.String("p", "", "headless：执行一个提示词后退出（事件打印到 stdout）")
+	waitJobs := flag.Duration("wait-jobs", 0, "headless：等后台作业结算的上限（默认取 subagent.default_timeout）")
 	flag.Parse()
 
 	cwd := *cwdFlag
@@ -255,6 +256,7 @@ func main() {
 		}
 	}
 	mainRegistry.Register(subagent.NewTaskTool(mgr, 0, "", nil)) // 主 agent：深度 0、可派任意 agent
+	mainRegistry.Register(subagent.NewHubTool(mgr, subagent.MainName))
 	exec := tool.NewExecutor(mainRegistry, mode, approver)
 	exec.SetArtifactStore(store)
 
@@ -277,8 +279,20 @@ func main() {
 	cmgr = agentctx.New(s, summ, cfg.Models[0].ContextWindow, 16384, system)
 	ag := agent.New("codeclaw", m, mainRegistry, exec, cmgr)
 
+	defer func() {
+		if err := mgr.Shutdown(5 * time.Second); err != nil {
+			log.Print(err)
+		}
+	}()
+
 	if *prompt != "" {
-		os.Exit(runHeadless(context.Background(), ag, cmgr, *prompt))
+		wait := *waitJobs
+		if wait == 0 {
+			wait = cfg.Subagent.DefaultTimeout
+		}
+		code := runHeadless(context.Background(), ag, cmgr, mgr, *prompt, wait)
+		_ = mgr.Shutdown(5 * time.Second)
+		os.Exit(code)
 	}
 
 	program := tea.NewProgram(tui.NewModel(ag, sessMgr, cmgr, mem, cwd, mgr, evbus))

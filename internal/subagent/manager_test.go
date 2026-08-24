@@ -289,7 +289,7 @@ func TestToolSetReadOnly(t *testing.T) {
 	m := o.Model.(*scriptModel)
 	runOne(t, NewManager(o), context.Background(), one("explorer", "x"))
 	got := m.toolsAt(0)
-	want := []string{"glob", "grep", "read_file", "yield"}
+	want := []string{"glob", "grep", "hub", "read_file", "yield"} // hub 是协调工具，只读 agent 也留着
 	if strings.Join(got, ",") != strings.Join(want, ",") {
 		t.Fatalf("read-only 工具集 = %v, want %v", got, want)
 	}
@@ -389,23 +389,30 @@ func TestRosterNamesAreNotReused(t *testing.T) {
 	}
 }
 
-func TestSendToRunningAndParked(t *testing.T) {
+func TestDeliverRouting(t *testing.T) {
 	dir := t.TempDir()
 	mgr := NewManager(baseOpts(&scriptModel{}, dir))
-	if err := mgr.Send("Main", "Nope", "在吗"); err == nil || !strings.Contains(err.Error(), "没有名为") {
+	if _, err := mgr.Deliver("Main", "Nope", "在吗", ""); err == nil || !strings.Contains(err.Error(), "没有名为") {
 		t.Fatalf("err = %v", err)
 	}
-	runOne(t, mgr, context.Background(), one("explorer", "x"))
-	name := mgr.names()[0]
-	if err := mgr.Send("Main", name, "补充一点"); err == nil || !strings.Contains(err.Error(), "已结束") {
-		t.Fatalf("给 parked 发消息应说明暂不支持唤醒：%v", err)
+	// 发给 Main：进主信箱，等 TUI/headless 取件
+	if _, err := mgr.Deliver("Scout", MainName, "接口定为 Add(a,b int)", "task-1"); err != nil {
+		t.Fatal(err)
 	}
-	// 运行中的：消息进 steer 队列
+	mails := mgr.TakeMainInbox()
+	if len(mails) != 1 || mails[0].From != "Scout" || mails[0].ReplyTo != "task-1" {
+		t.Fatalf("主信箱 = %+v", mails)
+	}
+	if len(mgr.TakeMainInbox()) != 0 {
+		t.Fatal("取件应是一次性的")
+	}
+	// 发给运行中的：作为 steering 注入
 	run := newRun("Live", "explorer", 1)
 	mgr.register(run)
 	run.setStatus(StatusRunning)
-	if err := mgr.Send("Main", "Live", "改用接口 B"); err != nil {
-		t.Fatal(err)
+	receipt, err := mgr.Deliver("Main", "Live", "改用接口 B", "")
+	if err != nil || !strings.Contains(receipt, "已送达") {
+		t.Fatalf("receipt=%q err=%v", receipt, err)
 	}
 	select {
 	case msg := <-run.steer:

@@ -33,7 +33,47 @@ var (
 	currentCancel context.CancelFunc
 	currentSteer  chan message.Message // 当前 run 的 steering 通道
 	runMu         sync.Mutex           // 保证同一时刻只有一个 run（防双 run 竞态）
+	steerMu       sync.Mutex           // 保护 currentCancel/currentSteer：TUI 主循环与 run goroutine 都会碰
 )
+
+// setCurrentRun 记录当前 run 的取消函数与 steering 通道。
+func setCurrentRun(cancel context.CancelFunc, steer chan message.Message) {
+	steerMu.Lock()
+	defer steerMu.Unlock()
+	currentCancel, currentSteer = cancel, steer
+}
+
+// clearCurrentSteer 在 run 结束时清掉 steering 通道（之后的注入要另起一轮）。
+func clearCurrentSteer() {
+	steerMu.Lock()
+	defer steerMu.Unlock()
+	currentSteer = nil
+}
+
+// cancelCurrent 取消当前 run（若有）。
+func cancelCurrent() {
+	steerMu.Lock()
+	c := currentCancel
+	steerMu.Unlock()
+	if c != nil {
+		c()
+	}
+}
+
+// trySteer 把消息注入当前 run；没有活动 run 或队列满则返回 false，调用方改为另起一轮。
+func trySteer(msg message.Message) bool {
+	steerMu.Lock()
+	defer steerMu.Unlock()
+	if currentSteer == nil {
+		return false
+	}
+	select {
+	case currentSteer <- msg:
+		return true
+	default:
+		return false
+	}
+}
 
 // SetProgram 注入 BubbleTea program，供后台 goroutine 把事件塞回 TUI 主循环。
 func SetProgram(p *tea.Program) { program = p }
@@ -103,7 +143,8 @@ func (m teaModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case hubTickMsg:
-		return m, waitHubEvent(m.hubCh) // 名册在渲染时读，这里只需重新挂等待
+		m = m.deliverPending() // 后台作业结果 / 发给 Main 的消息：注入当前轮或另起一轮
+		return m, waitHubEvent(m.hubCh)
 
 	case tea.MouseWheelMsg:
 		switch msg.Button {
@@ -269,18 +310,13 @@ func (m teaModel) handleKey(msg tea.KeyPressMsg) (teaModel, tea.Cmd) {
 
 	case key.Matches(msg, key.NewBinding(key.WithKeys("ctrl+e"))):
 		// steering：注入当前输入作为修正，不取消当前 run
-		if currentSteer != nil {
-			if t := strings.TrimSpace(m.inputArea.Value()); t != "" {
-				currentSteer <- message.NewUserMessage(t)
-				m.inputArea.Reset()
-			}
+		if t := strings.TrimSpace(m.inputArea.Value()); t != "" && trySteer(message.NewUserMessage(t)) {
+			m.inputArea.Reset()
 		}
 		return m, nil
 
 	case key.Matches(msg, key.NewBinding(key.WithKeys("ctrl+c"))):
-		if currentCancel != nil {
-			currentCancel() // 停当前流
-		}
+		cancelCurrent() // 停当前流
 		return m, tea.Quit
 
 	case key.Matches(msg, key.NewBinding(key.WithKeys("enter"))):
@@ -300,15 +336,8 @@ func (m teaModel) handleKey(msg tea.KeyPressMsg) (teaModel, tea.Cmd) {
 		m.scrollOffset = 0 // 发新消息跳到底部
 
 		// 取消上一轮，清掉可能残留的审批弹窗，起新一轮 agent run
-		if currentCancel != nil {
-			currentCancel()
-		}
 		m.pendingApproval = nil
-		ctx, cancel := context.WithCancel(context.Background())
-		currentCancel = cancel
-		steer := make(chan message.Message, 8)
-		currentSteer = steer
-		go m.runAgent(ctx, text, steer)
+		m.startRun(text)
 		return m, nil
 	}
 	var cmd tea.Cmd
@@ -332,9 +361,7 @@ func (m teaModel) handleSlash(text string) (bool, teaModel) {
 		m.inputArea.Reset()
 		return true, m
 	case text == "/new":
-		if currentCancel != nil {
-			currentCancel()
-		}
+		cancelCurrent()
 		ns, err := m.mgr.New(m.cwd)
 		if err != nil {
 			m.chatLines = append(m.chatLines, renderError(err))
@@ -364,9 +391,7 @@ func (m teaModel) handleSlash(text string) (bool, teaModel) {
 		return true, m
 	case strings.HasPrefix(text, "/resume "):
 		id := strings.TrimSpace(strings.TrimPrefix(text, "/resume "))
-		if currentCancel != nil {
-			currentCancel()
-		}
+		cancelCurrent()
 		ns, err := m.mgr.Switch(id)
 		if err != nil {
 			m.chatLines = append(m.chatLines, renderError(err))
@@ -399,10 +424,11 @@ func (m teaModel) handleSlash(text string) (bool, teaModel) {
 		case m.sub == nil:
 			m.chatLines = append(m.chatLines, dimStyle.Render("本实例未装配子 agent"))
 		default:
-			if err := m.sub.Send("Main", name, body); err != nil {
+			receipt, err := m.sub.Send("Main", name, body)
+			if err != nil {
 				m.chatLines = append(m.chatLines, renderError(err))
 			} else {
-				m.chatLines = append(m.chatLines, dimStyle.Render("→ "+name+"："+body))
+				m.chatLines = append(m.chatLines, dimStyle.Render("→ "+name+"："+body+"（"+receipt+"）"))
 			}
 		}
 		m.inputArea.Reset()
@@ -419,11 +445,48 @@ func (m teaModel) handleSlash(text string) (bool, teaModel) {
 	return false, m
 }
 
+// startRun 取消上一轮并起一轮新的 agent run（用户输入与 auto-continue 共用这条路径）。
+func (m teaModel) startRun(text string) {
+	cancelCurrent()
+	ctx, cancel := context.WithCancel(context.Background())
+	steer := make(chan message.Message, 8)
+	setCurrentRun(cancel, steer)
+	go m.runAgent(ctx, text, steer)
+}
+
+// deliverPending 把已结算的后台作业结果与发给 Main 的消息交给主 agent：
+// 有活动 run 就作为 steering 注入（它下一步就能看到），否则自动起一轮继续。
+func (m teaModel) deliverPending() teaModel {
+	if m.sub == nil {
+		return m
+	}
+	jobs, mails := m.sub.TakeSettled(), m.sub.TakeMainInbox()
+	if len(jobs) == 0 && len(mails) == 0 {
+		return m
+	}
+	m = m.finalizeStreaming()
+	for _, j := range jobs {
+		m.chatLines = append(m.chatLines, dimStyle.Render(fmt.Sprintf("── 后台作业完成：%s [%s] ──",
+			j.JobID, subagent.StatusString(j.Result.Status))))
+	}
+	for _, ml := range mails {
+		m.chatLines = append(m.chatLines, dimStyle.Render("← "+ml.From+"："+ml.Text))
+	}
+	notice := subagent.RenderAsyncResult(jobs, mails)
+	if trySteer(message.NewUserMessage(notice)) {
+		return m
+	}
+	m.chatLines = append(m.chatLines, dimStyle.Render("（主 agent 空闲，自动继续处理上面的结果）"))
+	m.scrollOffset = 0
+	m.startRun(notice)
+	return m
+}
+
 // runAgent 在后台 goroutine 跑 agent：记录用户消息 → 跑循环（循环内记录 assistant/tool）。
 func (m teaModel) runAgent(ctx context.Context, text string, steer chan message.Message) {
 	runMu.Lock() // 等上一个 run 结束（cancel 后它会快速退出），避免新旧两轮并发写 session
 	defer runMu.Unlock()
-	defer func() { currentSteer = nil }()
+	defer clearCurrentSteer()
 
 	_ = m.cmgr.Record(message.NewUserMessage(text), model.Usage{})
 	for ev := range m.agent.Run(ctx, steer) {

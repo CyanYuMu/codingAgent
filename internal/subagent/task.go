@@ -97,16 +97,37 @@ func (taskTool) Concurrency() tool.Concurrency {
 func (t taskTool) Execute(ctx context.Context, args map[string]any, sink *runtime.Sink) error {
 	batch, legacy := parseBatch(args)
 	env := t.mgr.Env(t.depth, t.self, t.spawns)
-	results, err := t.mgr.RunBatch(ctx, batch, env)
-	if err != nil {
-		return err // 预检失败：错误文本告诉模型怎么改，没有任何子 agent 被启动
-	}
 	var sb strings.Builder
 	if legacy != "" {
 		sb.WriteString(legacy + "\n\n")
 	}
-	if batch.Background && !t.mgr.o.AllowBackground {
+
+	if batch.Background && t.mgr.o.AllowBackground {
+		inline, jobs, err := t.mgr.StartBackground(ctx, batch, env)
+		if err != nil {
+			return err
+		}
+		if len(jobs) > 0 {
+			sb.WriteString("已转入后台，作业 id（= 子 agent 名）：\n")
+			for _, j := range jobs {
+				fmt.Fprintf(&sb, "- %s（%s）\n", j.ID, j.Agent)
+			}
+			sb.WriteString("不用轮询：完成后结果会自动送到你的会话。现在去做别的事；" +
+				"需要时用 hub jobs 看状态、hub send 追问、hub cancel 取消。\n")
+		}
+		for _, r := range inline {
+			sb.WriteString("\n" + renderResult(r) + "\n")
+		}
+		sink.Write([]byte(sb.String()))
+		return nil
+	}
+
+	if batch.Background {
 		sb.WriteString("[提示] 本实例未启用后台作业，已同步执行。\n\n")
+	}
+	results, err := t.mgr.RunBatch(ctx, batch, env)
+	if err != nil {
+		return err // 预检失败：错误文本告诉模型怎么改，没有任何子 agent 被启动
 	}
 	for _, r := range results {
 		sb.WriteString(renderResult(r))

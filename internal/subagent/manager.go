@@ -54,13 +54,20 @@ type Options struct {
 // 名册按运行名索引（运行名同时是 hub 地址、agent:// 地址与作业 id，预检保证唯一）；
 // 结束的 Run 留在名册里（parked），这样父 agent 与 TUI 事后还能读它的产出与转录。
 type Manager struct {
-	o   Options
-	sem chan struct{}
-	seq atomic.Int64
+	o    Options
+	gate *gate
+	seq  atomic.Int64
 
-	mu    sync.Mutex
-	runs  map[string]*Run
-	order []string // 启动顺序，名册展示用
+	// 后台作业挂在这个根 ctx 上：父 turn 结束、用户 Esc 都不该带走后台任务，只有进程退出才收。
+	root       context.Context
+	rootCancel context.CancelFunc
+	wg         sync.WaitGroup
+
+	mu      sync.Mutex
+	runs    map[string]*Run
+	order   []string // 启动顺序，名册展示用
+	pending []JobResult
+	boxes   map[string]*mailbox
 }
 
 // maxParkedRuns 名册里保留的已结束 Run 上限：超出后丢最早的（磁盘上的转录与产出不删）。
@@ -77,7 +84,9 @@ func NewManager(o Options) *Manager {
 	if o.DefaultMaxTurns <= 0 {
 		o.DefaultMaxTurns = 50
 	}
-	return &Manager{o: o, sem: make(chan struct{}, o.MaxConcurrency), runs: map[string]*Run{}}
+	root, cancel := context.WithCancel(context.Background())
+	return &Manager{o: o, gate: newGate(o.MaxConcurrency), runs: map[string]*Run{},
+		boxes: map[string]*mailbox{}, root: root, rootCancel: cancel}
 }
 
 // register 把 Run 放进名册（同名覆盖：预检已保证同时只有一个活的同名 Run）。
@@ -159,21 +168,57 @@ func (m *Manager) Cancel(names []string) int {
 	return n
 }
 
-// Send 给一个子 agent 送一条消息：运行中的作为 steering 注入它的下一步。
-// 唤醒已结束（parked）的 Run 走后台作业通道，在 hub 通信落地后支持。
-func (m *Manager) Send(from, to, text string) error {
+// Deliver 投递一条 hub 消息，返回给发送方的送达回执。三种去向：
+//   - Main：进主信箱，由 TUI/headless 取走并注入主会话
+//   - 运行中的子 agent：作为 steering 注入它的下一步
+//   - 已结束的子 agent：唤醒续跑（后台作业），结果按 async-result 回投
+func (m *Manager) Deliver(from, to, text, replyTo string) (string, error) {
+	mail := Mail{From: from, Text: text, ReplyTo: replyTo, At: time.Now()}
+	if to == MainName {
+		m.box(MainName).push(mail)
+		if m.o.Bus != nil {
+			m.o.Bus.Publish(ChMailbox, MailArrived{To: MainName, From: from, Text: text})
+		}
+		return "已送达 Main", nil
+	}
 	r := m.lookup(to)
 	if r == nil {
-		return fmt.Errorf("没有名为 %q 的子 agent；当前名册：%s", to, strings.Join(m.names(), ", "))
+		return "", fmt.Errorf("没有名为 %q 的 peer；当前名册：%s", to, strings.Join(append([]string{MainName}, m.names()...), ", "))
 	}
 	if r.settled() {
-		return fmt.Errorf("%s 已结束（%s），暂不支持唤醒续跑；可以用 read_file agent://%s 读它的产出", to, StatusString(r.statusNow()), to)
+		job, err := m.Revive(to, formatMail(mail))
+		if err != nil {
+			return "", err
+		}
+		return fmt.Sprintf("%s 已结束，已唤醒它续跑（作业 %s）；结果完成后会自动送到你这里", to, job.ID), nil
 	}
-	if !r.Steer(message.NewUserMessage("[hub from " + from + "] " + text)) {
-		return fmt.Errorf("%s 的消息队列已满，稍后再试", to)
+	if !r.Steer(message.NewUserMessage(formatMail(mail))) {
+		return "", fmt.Errorf("%s 的消息队列已满，稍后再试", to)
 	}
-	return nil
+	return "已送达 " + to, nil
 }
+
+// Send 是 Deliver 的简化入口（TUI 的 /agent 用）。
+func (m *Manager) Send(from, to, text string) (string, error) { return m.Deliver(from, to, text, "") }
+
+// putBack 把不该由本次调用消费的作业结果放回待投递队列。
+func (m *Manager) putBack(rs []JobResult) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.pending = append(rs, m.pending...)
+}
+
+// formatMail 把消息渲染成注入目标会话的一句话（可审计：转录里能看出是谁说的）。
+func formatMail(ml Mail) string {
+	s := "[hub from " + ml.From + "]"
+	if ml.ReplyTo != "" {
+		s += "（回复 " + ml.ReplyTo + "）"
+	}
+	return s + " " + ml.Text
+}
+
+// MailArrived 是「有消息送到 Main」的广播（TUI 用它触发取件）。
+type MailArrived struct{ To, From, Text string }
 
 // RegisterSchemes 把 agent:// 与 history:// 挂到一个产物存储上，
 // 让 read_file 成为读回子 agent 产出与转录的唯一入口。
@@ -264,14 +309,14 @@ func (m *Manager) RunBatch(ctx context.Context, b TaskBatch, env Env) ([]Result,
 	results := make([]Result, len(items))
 	var wg sync.WaitGroup
 	for i, it := range items {
-		if err := m.acquire(ctx); err != nil {
+		if err := m.gate.acquire(ctx); err != nil {
 			results[i] = Result{Name: it.Item.Name, Agent: it.Item.Agent, Status: StatusAborted, Err: err}
 			continue
 		}
 		wg.Add(1)
 		go func(i int, it Resolved) {
 			defer wg.Done()
-			defer m.release()
+			defer m.gate.release()
 			defer func() {
 				if r := recover(); r != nil {
 					results[i] = Result{Name: it.Item.Name, Agent: it.Item.Agent, Status: StatusFailed,
@@ -291,7 +336,7 @@ func (m *Manager) Run(ctx context.Context, batchContext string, r Resolved, dept
 	def := m.resolveDef(r.Def)
 	run := newRun(r.Item.Name, def.Name, depth)
 	m.register(run)
-	rs, err := m.setup(def, r, batchContext, depth)
+	rs, err := m.setup(def, r, batchContext, depth, run)
 	if err != nil {
 		run.setStatus(StatusFailed)
 		return Result{ID: run.name, Name: run.name, Agent: def.Name, Status: StatusFailed, Err: err}
@@ -300,20 +345,65 @@ func (m *Manager) Run(ctx context.Context, batchContext string, r Resolved, dept
 	return m.drive(ctx, run, rs)
 }
 
-// setup 装配一个 Run 的运行时：独立产物存储与 bash、工具集（含只含 yield 的备用集）、
-// 继承父审批的执行器、sidecar 会话、上下文管理器与产出累积。
-func (m *Manager) setup(def AgentDef, r Resolved, batchContext string, depth int) (*runtimeSet, error) {
+// setup 装配一个 Run 的运行时：新建 sidecar 会话、写 session_init、记录任务，
+// 并把重建所需的信息挂到 Run 上（唤醒续跑时用）。
+func (m *Manager) setup(def AgentDef, r Resolved, batchContext string, depth int, run *Run) (*runtimeSet, error) {
+	sess, file, err := m.openSidecar(r.Item.Name, def, r, depth)
+	if err != nil {
+		return nil, err
+	}
+	rs := m.buildRuntime(def, r.Item.Name, depth, sess, file, r.Schema, r.SchemaMode)
+	if err := rs.cc.Record(message.NewUserMessage(buildTaskPrompt(batchContext, r.Item)), model.Usage{}); err != nil {
+		sess.Close()
+		return nil, err
+	}
+	if run != nil {
+		run.mu.Lock()
+		run.sessionFile = file
+		run.spawn = spawnSpec{def: def, item: r.Item, batchContext: batchContext,
+			schema: r.Schema, mode: r.SchemaMode, depth: depth, file: file}
+		run.mu.Unlock()
+	}
+	// session_init 里带上工具集，转录本身就能回答「它当时能做什么」
+	names := make([]string, 0, 8)
+	for _, t := range rs.tools.List() {
+		names = append(names, t.Name())
+	}
+	_ = sess.AppendInit(session.SessionInit{
+		Agent: def.Name, SystemPrompt: def.SystemPrompt, Task: r.Item.Task, Tools: names,
+		OutputSchema: r.Schema, Depth: depth,
+	})
+	return rs, nil
+}
+
+// setupResume 打开已有 sidecar 续跑：不写 session_init、不重记任务，历史由回放带回来。
+func (m *Manager) setupResume(spec spawnSpec) (*runtimeSet, error) {
+	st, err := session.NewFileStorage(spec.file)
+	if err != nil {
+		return nil, err
+	}
+	sess, err := session.Open(st)
+	if err != nil {
+		st.Close()
+		return nil, err
+	}
+	return m.buildRuntime(spec.def, spec.item.Name, spec.depth, sess, spec.file, spec.schema, spec.mode), nil
+}
+
+// buildRuntime 组装工具集（含只含 yield 的备用集）、继承父审批的执行器与上下文管理器。
+func (m *Manager) buildRuntime(def AgentDef, name string, depth int, sess *session.Session, file string,
+	schema map[string]any, mode string) *runtimeSet {
 	var store *runtime.ArtifactStore
 	if m.o.SessionDir != "" {
 		store = runtime.NewArtifactStore(m.o.SessionDir)
 		m.registerSchemes(store) // 子 agent 之间也能 read_file agent://<Name>
 	}
 	ys := NewYieldState()
-	tools, yieldOnly := m.buildTools(def, depth, store, ys, r.Schema, r.SchemaMode)
+	tools, yieldOnly := m.buildTools(def, name, depth, store, ys, schema, mode)
 
 	var approver tool.Approver = denyApprover{}
 	if m.o.Escalate && m.o.Approver != nil {
-		approver = labeledApprover{inner: m.o.Approver, label: "[子 agent " + r.Item.Name + "]"}
+		approver = labeledApprover{inner: m.o.Approver, label: "[子 agent " + name + "]"}
 	}
 	exec := tool.NewExecutor(tools, m.o.Mode, approver)
 	yieldExec := tool.NewExecutor(yieldOnly, m.o.Mode, approver)
@@ -321,28 +411,19 @@ func (m *Manager) setup(def AgentDef, r Resolved, batchContext string, depth int
 		exec.SetArtifactStore(store)
 		yieldExec.SetArtifactStore(store)
 	}
-
-	sess, file, err := m.openSidecar(r.Item.Name, def, r, tools, depth)
-	if err != nil {
-		return nil, err
-	}
 	system := func(context.Context) []message.Message {
 		return []message.Message{message.NewSystemMessage(def.SystemPrompt + subagentCompletionNote)}
 	}
-	cc := agentctx.New(sess, m.o.Summarizer, m.o.ContextWindow, 16384, system)
-	if err := cc.Record(message.NewUserMessage(buildTaskPrompt(batchContext, r.Item)), model.Usage{}); err != nil {
-		sess.Close()
-		return nil, err
-	}
 	return &runtimeSet{
 		def: def, tools: tools, yieldOnly: yieldOnly, exec: exec, yieldExec: yieldExec,
-		cc: cc, sess: sess, file: file, ys: ys, schema: r.Schema, mode: r.SchemaMode,
-	}, nil
+		cc:   agentctx.New(sess, m.o.Summarizer, m.o.ContextWindow, 16384, system),
+		sess: sess, file: file, ys: ys, schema: schema, mode: mode,
+	}
 }
 
 // buildTools 构造一个 Run 的工具集，并返回「只含 yield」的备用注册表（强制收尾那一 turn 用）。
 // 规则：默认集（或定义指定的子集）→ 只读 agent 裁到读工具 → 加 yield → 满足 spawn policy 与深度才加 task。
-func (m *Manager) buildTools(def AgentDef, depth int, store *runtime.ArtifactStore, ys *YieldState, schema map[string]any, mode string) (all, yieldOnly *tool.Registry) {
+func (m *Manager) buildTools(def AgentDef, name string, depth int, store *runtime.ArtifactStore, ys *YieldState, schema map[string]any, mode string) (all, yieldOnly *tool.Registry) {
 	base := tool.NewRegistry()
 	if m.o.WorkerTools != nil {
 		base = m.o.WorkerTools(m.o.CWD, store)
@@ -368,6 +449,7 @@ func (m *Manager) buildTools(def AgentDef, depth int, store *runtime.ArtifactSto
 	}
 	y := NewYieldTool(ys, schema, mode)
 	all.Register(y)
+	all.Register(NewHubTool(m, name)) // 协调用：看名册、给同伴发消息、等作业
 
 	maxDepth := m.o.MaxDepth
 	if maxDepth <= 0 {
@@ -405,7 +487,7 @@ const subagentCompletionNote = `
 如果确实无法完成，也要调用 yield，在 error 参数里说明尝试过什么、卡在哪里。`
 
 // openSidecar 为子 agent 建独立会话：有 SessionDir 则落盘为 agent-<name>-<rand>.jsonl，否则内存。
-func (m *Manager) openSidecar(name string, def AgentDef, r Resolved, tools *tool.Registry, depth int) (*session.Session, string, error) {
+func (m *Manager) openSidecar(name string, def AgentDef, r Resolved, depth int) (*session.Session, string, error) {
 	var st session.Storage
 	file := ""
 	if m.o.SessionDir != "" {
@@ -426,14 +508,6 @@ func (m *Manager) openSidecar(name string, def AgentDef, r Resolved, tools *tool
 	if err != nil {
 		return nil, "", err
 	}
-	names := make([]string, 0, 8)
-	for _, t := range tools.List() {
-		names = append(names, t.Name())
-	}
-	_ = sess.AppendInit(session.SessionInit{
-		Agent: def.Name, SystemPrompt: def.SystemPrompt, Task: r.Item.Task, Tools: names,
-		OutputSchema: r.Schema, Depth: depth,
-	})
 	return sess, file, nil
 }
 
@@ -442,17 +516,6 @@ func randSuffix() string {
 	_, _ = rand.Read(b[:])
 	return hex.EncodeToString(b[:])
 }
-
-func (m *Manager) acquire(ctx context.Context) error {
-	select {
-	case m.sem <- struct{}{}:
-		return nil
-	case <-ctx.Done():
-		return ctx.Err()
-	}
-}
-
-func (m *Manager) release() { <-m.sem }
 
 func textOf(m message.Message) string {
 	var sb strings.Builder

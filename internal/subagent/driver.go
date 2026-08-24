@@ -78,6 +78,8 @@ type Run struct {
 	budgetStop  bool
 	noticeSent  bool
 	killed      bool
+	background  bool // 后台作业（结算后按 async-result 投递给父）
+	spawn       spawnSpec
 	startedAt   time.Time
 	settledAt   time.Time
 	sessionFile string
@@ -86,6 +88,17 @@ type Run struct {
 	steer      chan message.Message
 	cancelRun  context.CancelFunc
 	cancelTurn context.CancelFunc
+}
+
+// spawnSpec 记录重建一个 Run 需要的一切：唤醒续跑（revive）时按它重开 sidecar 并重建工具集。
+type spawnSpec struct {
+	def          AgentDef
+	item         TaskItem
+	batchContext string
+	schema       map[string]any
+	mode         string
+	depth        int
+	file         string // sidecar 转录路径；"" = 内存会话（不可 revive）
 }
 
 // runtimeSet 是一个 Run 的运行时装配：工具集（含只含 yield 的备用集）、会话、上下文与产出累积。
@@ -164,6 +177,21 @@ func (r *Run) statusNow() Status {
 
 // settled 表示已结算（不再消耗模型请求，可读产出与转录）。
 func (r *Run) settled() bool { return r.statusNow().Settled() }
+
+// resetForRevive 把一个 parked 的 Run 恢复成可再跑的状态：
+// 预算与提醒按「这一次续跑」重新计（否则上次用满的预算会让新一轮一上来就被强制收尾）。
+func (r *Run) resetForRevive() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.requests, r.toolCalls, r.reminders = 0, 0, 0
+	r.usage, r.contextTokens = model.Usage{}, 0
+	r.budgetStop, r.noticeSent, r.killed = false, false, false
+	r.runErr, r.currentTool = nil, ""
+	r.revives++
+	r.startedAt, r.settledAt = time.Now(), time.Time{}
+	r.status = StatusPending
+	r.background = true // 续跑一律走后台作业通道，结果按 async-result 回投
+}
 
 // drive 驱动一个 Run 走完 turn 阶梯：每 turn 一个可单独取消的 ctx；turn 结束若没 terminal yield
 // 就注入提醒（最后一次只给 yield 工具）；软预算越界先通知、再停机强制收尾、宽限耗尽硬杀。

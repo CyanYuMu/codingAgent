@@ -375,7 +375,7 @@
 **Interfaces:**
 - Produces: `JobInfo`、`JobResult`、`(*Manager).StartBackground(b TaskBatch, env Env) ([]JobInfo, error)`、`(*Manager).Jobs() []JobInfo`、`(*Manager).Cancel(ids []string) int`、`(*Manager).TakeSettled() []JobResult`、`(*Manager).Pending() int`、`(*Manager).Shutdown(grace time.Duration)`、`(*Manager).SetConcurrency(n int)`
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
   - `TestStartBackgroundReturnsImmediately`：慢模型（delay 300ms）+ `StartBackground` → 调用在 50ms 内返回，`Pending() == 1`。
   - `TestSettledDeliveredExactlyOnce`：等作业结束 → `TakeSettled()` 返回 1 条，再调返回 0 条。
   - `TestJobsSnapshotConsumesDelivery`：结束后先调 `Jobs()`（含结果摘要）→ `TakeSettled()` 返回 0 条。
@@ -384,7 +384,7 @@
   - `TestShutdownWaitsForBackground`：`Shutdown(1s)` 后所有 Run 退出（`Pending() == 0`），且 sidecar 里有 `session_exit`。
   - `TestSetConcurrency`：并发闸从 1 调到 3 后三个 Run 能同时 running（用 barrier 假工具断言）。
 
-- [ ] **Step 2: 实现**
+- [x] **Step 2: 实现**
   - `Manager` 增 `root context.Context` + `rootCancel`（`NewManager` 里建）、`wg sync.WaitGroup`、`jobs map[string]*jobEntry`、`settled []JobResult`（未投递集合）。
   - `StartBackground`：预检 → 为每项建 Run → `go m.driveJob(...)`（挂 `m.root`）→ 立刻返回 `JobInfo`。
   - 结算：写 `settled` → `bus.Publish(ChJob, JobSettled{...})`。
@@ -392,7 +392,7 @@
   - `SetConcurrency`：可 resize 闸——用 `chan struct{}` + 目标容量计数的实现（`acquire` 时对比当前容量；缩容只影响后续 acquire，不打断在跑的）。
   - `Shutdown`：`rootCancel()` → `wg.Wait()` 带 `grace` 超时（超时则打印告警返回）。
 
-- [ ] **Step 3: 验证** `go test ./internal/subagent/ -race -run 'Background|Job|Cancel|Shutdown|Concurrency'`
+- [x] **Step 3: 验证** `go test ./internal/subagent/ -race -run 'Background|Job|Cancel|Shutdown|Concurrency'`
 
 ---
 
@@ -403,12 +403,12 @@
 **Interfaces:**
 - Produces: `subagent.RenderAsyncResult(rs []JobResult) string`、`tui` 的 `jobSettledMsg`、`runHeadless` 的 auto-continue 循环
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
   - `TestRenderAsyncResult`：单条/多条渲染都含 `<system-notice>`、job id、Name、status 与结果段。
   - `TestHeadlessAutoContinueBounded`：注入一个假的 "pending → settled" 序列（把 `Pending`/`TakeSettled` 抽成小接口便于替换）→ 最多 3 轮 auto-continue 后退出；每轮打印 `[job settled …]`。
   - `TestDeliverToActiveRunUsesSteer`：活动 run 存在时投递走 steer（断言 steer 通道收到消息），不新起 run。
 
-- [ ] **Step 2: 实现**
+- [x] **Step 2: 实现**
   - `subagent.RenderAsyncResult` 按 spec §7.2 模板。
   - TUI：bus 订阅里遇 `ChJob` → `program.Send(jobSettledMsg{})`；`Update` 处理：`TakeSettled()` → 若为空忽略；否则聊天区落 `── 后台作业完成：… ──`，然后
     - 有活动 run（`currentSteer != nil`）→ 推 `message.NewUserMessage(text)`；
@@ -416,7 +416,7 @@
   - headless：一轮结束后 `for i := 0; i < 3 && mgr.Pending() > 0; i++ { 等待（`--wait-jobs` 上限，轮询 200ms 或订阅 ChJob）→ TakeSettled → 打印 → 再跑一轮 }`。
   - `main.go`：`defer mgr.Shutdown(5*time.Second)`。
 
-- [ ] **Step 3: 验证** `go test ./cmd/agent/ ./internal/tui/`
+- [x] **Step 3: 验证** `go test ./cmd/agent/ ./internal/tui/`
 
 ---
 
@@ -427,7 +427,7 @@
 **Interfaces:**
 - Produces: `subagent.NewHubTool(mgr *Manager, self string) tool.Tool`、`(*Manager).Send(from, to, text, replyTo string) error`、`(*Manager).Inbox(name string) []Mail`、`(*Manager).Wait(ctx, name string, ids []string, d time.Duration) (string, error)`、`(*Manager).Revive(name, text string) (JobInfo, error)`、`(*Manager).TakeMainInbox() []Mail`
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
   - `TestSendToRunningPushesSteer`：running Run 的 sidecar 里出现 `[hub from Main]` 消息且模型下一步能看到（断言 sidecar 内容）。
   - `TestSendToParkedRevives`：parked Run + `Send` → 产生一个新的后台作业（`Pending() == 1`），sidecar 追加新 user 条目，`Revives == 1`。
   - `TestSendToUnknownFails`：返回 error，文本含"no such peer"与可用名单。
@@ -436,14 +436,14 @@
   - `TestHubListExcludesSelf`：`list` 不含自己，含 `Main`。
   - `TestHubToolInSubagentToolset`：子 agent 的工具集包含 `hub`（read tier）。
 
-- [ ] **Step 2: 实现**
+- [x] **Step 2: 实现**
   - `mailbox`：`{mu, msgs []Mail, unread int, wake chan struct{}}`；`push` 非阻塞唤醒（`select default`）。
   - `Manager.Send`：查名册 → running/idle → 推 `Run.steer`（记为 user 消息 `[hub from X] …`）；parked → `Revive`；`Main` → 进主邮箱 + `bus.Publish(ChMailbox)`（TUI 提示）。
   - `Revive`：重开 sidecar（`session.Open`）→ 重建 tools/cc/YieldState → 新 `Run.revives++` → 走 `drive` → 结算按后台作业投递。
   - `hub` 工具：`Tier() = TierRead`，`Concurrency() = Shared`（`wait` 阻塞但不写状态）；`wait` 的 `Timeout` 夹到 `[1, 120]` 秒；description 按 spec §8（明确"只协调、不传长内容、能用工具查的别问 peer"）。
   - 工具集：`buildTools` 里统一加 `hub`（主 agent 的注册表也加）。
 
-- [ ] **Step 3: 验证** `go test ./internal/subagent/ -race`
+- [x] **Step 3: 验证** `go test ./internal/subagent/ -race`
 
 ---
 
@@ -451,12 +451,12 @@
 
 **Files:** Modify `cmd/agent/config.go`、`cmd/agent/config_test.go`、`example.yaml`、`docs/DEVELOPMENT_LOG.md`；Create `.codeclaw/agents/README.md`（示例定义说明）
 
-- [ ] **Step 1: 写失败测试**：`config_test.go` 覆盖新字段的默认值与"只能下调 soft_budget"的合并规则。
-- [ ] **Step 2: 实现**：`subagentConfig` 增 `SoftBudget`、`MaxRecursionDepth`、`MinTaskChars`、`Background`、`AgentsDir`；`applyDefaults` 补默认（200 / 2 / 40 / true / ""）；`example.yaml` 加注释示例；`DEVELOPMENT_LOG.md` 追加 P9 段（含"本阶段踩的坑"）。
-- [ ] **Step 3: 冒烟**（真实模型，`--yolo`）
+- [x] **Step 1: 写失败测试**：`config_test.go` 覆盖新字段的默认值与"只能下调 soft_budget"的合并规则。
+- [x] **Step 2: 实现**：`subagentConfig` 增 `SoftBudget`、`MaxRecursionDepth`、`MinTaskChars`、`Background`（`AgentsDir` 判断价值不大，未做）；`applyDefaults` 补默认（200 / 2 / 40 / true / ""）；`example.yaml` 加注释示例；`DEVELOPMENT_LOG.md` 追加 P9 段（含"本阶段踩的坑"）。
+- [x] **Step 3: 冒烟**（真实模型 deepseek-v4-flash，`--yolo -p`，已通过）
   - `codeclaw --yolo -p "并行派两个 explorer 分别梳理 internal/agent 与 internal/subagent，然后综合"` → 观察 job id 立即返回、Hub 有两行、async-result 回投、最终综合。
   - TUI 里 `ctrl+a` 看面板；`/agent <Name> 追问…` 唤醒 parked。
-- [ ] **Step 4: 提交** `feat: P9.4 异步与通信（后台作业 + async-result 投递 + hub 邮箱 + parked revive）`
+- [x] **Step 4: 提交** `feat: P9.4 异步与通信（后台作业 + async-result 投递 + hub 邮箱 + parked revive）`
 
 ---
 

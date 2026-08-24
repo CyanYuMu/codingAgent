@@ -61,6 +61,8 @@ P0 地基 → P1 Agent Loop → P2 Session → P3 Context → P4 工具运行时
 | P6-L2 | 派发运行时 | tasks[] 批量 + yield + 状态机 | ✅ |
 | P7 | Trace + Eval | JSONL 审计 + 夹具评测 | ✅ |
 | 扩展 | 多会话/滚动/steering | /new /resume /forget + 鼠标 + Ctrl+E | ✅ |
+| P8（M1） | 地基修正 | 项目作用域数据目录 + Session v2 + 压缩正确性 + 子 agent 运行时修正 + headless `-p` | ✅ |
+| P9（M2） | 委派运行时 | frontmatter agent + TaskBatch 预检 + yield 三态 + 提醒/预算 + Agent Hub + 后台作业 + hub 邮箱 | ✅ |
 
 ---
 
@@ -236,6 +238,58 @@ P0 地基 → P1 Agent Loop → P2 Session → P3 Context → P4 工具运行时
 | **聊天列表虚拟滚动** | `scrollOffset` + 只渲染可见窗口 `[start,end)` + PgUp/PgDn + 鼠标滚轮（`MouseModeCellMotion`） |
 | **steering 补充输入** | `RunSteering`（steer 通道非阻塞注入）+ Ctrl+E；注入后下一步模型调用生效 |
 | **/forget** | `memory.Clear()`（清长期记忆，与 `/new` 清对话分离） |
+
+---
+
+## 3.9 P9（M2）委派运行时
+
+> spec `docs/specs/phase-9-delegation-runtime.md`，plan `docs/plans/2026-08-24-phase-9-delegation-runtime.md`。
+> 目标：把派发从「一次同步函数调用」变成**有契约、可观察、可干预、寿命受约束**的执行单元。
+
+### P9.1 契约与发现
+
+| 机制 | 做法 |
+|---|---|
+| EventBus | `internal/bus`：Publish 非阻塞（订阅者缓冲满即丢）、Subscribe 返回通道 + 幂等注销。总线只服务观测，真相源仍是 JSONL |
+| agent 定义发现 | markdown frontmatter：项目 `.codeclaw/agents/*.md` → 用户 `~/.codeclaw/agents/*.md` → 内置（`go:embed`），同名 first-wins；坏文件只告警。单个字段格式错（如 `timeout: 十分钟`）只降级该字段，不废掉整个定义 |
+| 派发契约 | `TaskBatch{context, tasks[], background}`；纯函数 `Preflight` 在起子进程**之前**拒绝：空 context / 一句话派发（<40 字符）/ 未知 agent / 深度超限 / spawn policy / 同名递归；运行名去重（parked 的名字也不复用） |
+| 工具集裁剪 | `read_only` 裁到 read/glob/grep；`spawns` 非空且深度未满才给 `task`；另备一个「只含 yield」的注册表给强制收尾用 |
+
+### P9.2 完成度协议
+
+| 机制 | 做法 |
+|---|---|
+| 按调用判定终止 | `tool.Terminal` 改成 `IsTerminal(args, err)`，结果带 `Result.Terminal`——增量 yield 与「工具内退回重试」都不会误终止 run |
+| yield 三态 | `data`=终止提交 / `data+section`=增量分段（不终止，收尾时按 schema 装配）/ `error`=主动放弃。线格式是扁平三参数，**不用顶层 anyOf**（strict provider 会拒掉整个工具定义） |
+| schema | `data` 的线格式由 outputSchema **递归去 required** 派生（增量分段才提交得进来），真正校验在工具内：不符则带路径与剩余次数退回重试 ≤3 次，permissive 放行并告警、strict 判 `schema_violation` |
+| turn 阶梯 | 每 turn 一个可单独取消的 ctx；turn 结束没 terminal yield → 注入提醒（≤3 次，最后一次把工具集换成只剩 yield）。阶梯耗尽：有 schema 判 failed，无 schema 判 completed 并标注 |
+| 软预算 | 越界注入收尾通知 → 1.5× 停当前 turn 强制收尾 → 宽限 5 次请求仍不 yield 则 `killed`。定义里的预算只能比全局上限更小（`-1` 显式关闭） |
+
+### P9.3 可观测
+
+| 机制 | 做法 |
+|---|---|
+| 会话内 URL | `ArtifactStore` 成为路由表：`AddScheme` 注册 `agent://` / `history://`，`read_file` 见到任意 `<scheme>://` 都交给它——读回大内容对模型只有一个入口 |
+| Run 名册 | 运行名 = hub 地址 = `agent://` 地址 = 作业 id；结束的 Run 留作 `parked`（可事后读产出与转录、可被唤醒）；名册外按产物目录回落解析（resume 后仍能读） |
+| Agent Hub | TUI `ctrl+a`：表头聚合运行中/已结束/累计 tokens，行显示当前工具与用量；`j/k` 选择、`x` 终止、`esc` 关闭；`/agents` 打印名册、`/agent <名> <文本>` 发消息 |
+
+### P9.4 异步与通信
+
+| 机制 | 做法 |
+|---|---|
+| 后台作业 | `task{background:true}` 立刻返回作业 id；后台 Run 挂 **Manager 根 ctx**（父 turn 结束、用户 Esc 都不该带走它），`Shutdown` 统一收 |
+| 恰好一次投递 | 结算进「待投递」队列；`TakeSettled` / `hub jobs` / `hub wait` 共用这一个队列——谁先看到谁消费，不会重复送 |
+| async-result | 有活动 run → 走 steering 注入；空闲 → 自动起一轮继续（headless 最多 3 轮，防 CI 死循环） |
+| hub 邮箱 | `list/send/inbox/wait/jobs/cancel`。send 对运行中的注入 steering、对已结束的**唤醒续跑**、对 Main 进主信箱；wait 只在完全没事可做时用 |
+| parked → revive | 重开同一个 sidecar 续跑（转录里两轮都在），预算与提醒按这一次重新计，结果按后台作业回投 |
+| 可 resize 并发闸 | 令牌通道 + 「债」计数：缩容不打断在跑的 Run，归还的令牌直接扣掉 |
+
+### 实测（deepseek-v4-flash）
+
+- 派两个 background 子 agent → `task` 立刻返回作业 id，主 agent 回「已派发」后 turn 就结束；两个作业结算后自动续跑并综合结果。
+- `hub send` 追问已完成的 A → 唤醒续跑，A 先用 `hub send` 回了一句结论、再 yield 最终产出；同一个 sidecar 里有两条 `session_exit`。
+- 子 agent 的工具集实测是 `glob/grep/hub/read_file/yield`（只读 agent 拿不到 bash/write_file）。
+- 续跑那轮触发了 1 次 idle 提醒后才 yield —— 阶梯在真实模型上确实在兜底。
 
 ---
 

@@ -1,6 +1,6 @@
 # Phase 9 详细设计：委派运行时（M2 · Delegation Runtime）
 
-> 状态：**待评审** · 日期：2026-08-24 · 所属方案：[2026-08-24-evolution-plan.md](2026-08-24-evolution-plan.md) §9 M2（A3 A5 A6 A8 A9）
+> 状态：**已实施**（P9.1–P9.4 全部完成并提交，含真实模型冒烟） · 日期：2026-08-24 · 所属方案：[2026-08-24-evolution-plan.md](2026-08-24-evolution-plan.md) §9 M2（A3 A5 A6 A8 A9）
 > 前置：M1（P8 地基修正）已完成并提交（`phase-8-foundation-fixes` 分支，`aeceba2`/`075e966`/`90717f9`）
 > 目标：把"派发"从**一次同步函数调用**升级为**一组有契约、可观察、可干预、寿命受约束的执行单元**——
 > 完成度由协议保证（yield 三态 + schema 校验重试 + idle 提醒 + 软预算），可观察性由 EventBus 保证，
