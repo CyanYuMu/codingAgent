@@ -170,6 +170,19 @@ func ProjectConfigPath(cwd string) string {
 	return filepath.Join(cwd, ".codeclaw", "config.yaml")
 }
 
+// GlobalMemoryPath = <Home>/memory/global.db ：跨项目的用户偏好类记忆。
+func GlobalMemoryPath() (string, error) {
+	home, err := Home()
+	if err != nil {
+		return "", err
+	}
+	dir := filepath.Join(home, "memory")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, "global.db"), nil
+}
+
 // UserAgentsDir = <Home>/agents ：用户级子 agent 定义（*.md，frontmatter）。目录可以不存在。
 func UserAgentsDir() (string, error) {
 	home, err := Home()

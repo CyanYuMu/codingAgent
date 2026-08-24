@@ -89,9 +89,13 @@ func renderMemories(mems []memory.Memory) string {
 	var sb strings.Builder
 	sb.WriteString("<memories>\n")
 	for _, m := range mems {
-		fmt.Fprintf(&sb, "- [%s] %s（置信 %.1f）\n", m.MemoryType, m.Content, m.Veracity)
+		fmt.Fprintf(&sb, "- [%s · %s] %s", m.Kind, m.Scope, m.Content)
+		if m.Why != "" {
+			fmt.Fprintf(&sb, "（因为：%s）", m.Why)
+		}
+		fmt.Fprintf(&sb, " (id=%d)\n", m.ID)
 	}
-	sb.WriteString("</memories>\n（以上是背景上下文，当前用户消息和工具结果优先。）")
+	sb.WriteString("</memories>\n（以上是背景上下文，当前用户消息和工具结果优先；发现某条与现实不符就用 forget 让它失效。）")
 	return sb.String()
 }
 
@@ -180,14 +184,33 @@ func main() {
 	}
 	warnLegacyData(cwd, projectDir)
 
-	mem, err := memory.Open(filepath.Join(projectDir, "memory.db"))
+	projectID, err := paths.ProjectID(cwd)
 	if err != nil {
-		log.Printf("记忆库不可用，禁用记忆: %v", err)
+		projectID = cwd
+	}
+	mem, err := memory.Open(filepath.Join(projectDir, "memory.db"), memory.ScopeProject, projectID)
+	if err != nil {
+		log.Printf("项目记忆库不可用，禁用项目记忆: %v", err)
 		mem = nil
 	}
 	if mem != nil {
+		mem.SetMaxPerScope(cfg.Memory.MaxPerScope)
 		defer mem.Close()
 	}
+	// 全局库：跨项目的用户偏好类事实（"用户偏好中文回复"）不该只活在一个项目里
+	var globalMem *memory.Store
+	if cfg.Memory.GlobalEnabled() {
+		if gp, err := paths.GlobalMemoryPath(); err != nil {
+			log.Printf("全局记忆库路径不可用: %v", err)
+		} else if g, err := memory.Open(gp, memory.ScopeGlobal, ""); err != nil {
+			log.Printf("全局记忆库不可用: %v", err)
+		} else {
+			globalMem = g
+			globalMem.SetMaxPerScope(cfg.Memory.MaxPerScope)
+			defer globalMem.Close()
+		}
+	}
+	recaller := memory.Union(mem, globalMem)
 
 	sessMgr, err := session.NewManager(projectDir)
 	if err != nil {
@@ -211,7 +234,8 @@ func main() {
 			reg.Register(t)
 		}
 		if mem != nil {
-			reg.Register(tool.NewRememberTool(mem))
+			reg.Register(tool.NewRememberTool(mem, globalMem))
+			reg.Register(tool.NewForgetTool(mem, globalMem))
 		}
 		for _, srv := range cfg.MCPServers {
 			if err := tool.ConnectMCP(context.Background(), reg, srv); err != nil {
@@ -260,19 +284,27 @@ func main() {
 	exec := tool.NewExecutor(mainRegistry, mode, approver)
 	exec.SetArtifactStore(store)
 
-	// system 前缀：指令 + 环境块 + 记忆块（按当前会话最后一条用户消息召回）
+	// system 前缀：指令 + 环境块 + 记忆块。召回查询用最近几个用户 turn 构造；
+	// 召回失败要出声——静默吞掉的话，"记忆功能看起来在、实际永远召回不到"能藏很久。
 	instr := buildInstruction(cfg.DelegationMode) + envBlock(cwd)
 	var cmgr *agentctx.Manager
 	system := func(ctx context.Context) []message.Message {
 		msgs := []message.Message{message.NewSystemMessage(instr)}
-		if mem != nil {
-			if hist, err := cmgr.Session().Replay(); err == nil {
-				if q := lastUserText(hist); q != "" {
-					if mems, err := mem.Recall(q, 5); err == nil && len(mems) > 0 {
-						msgs = append(msgs, message.NewSystemMessage(renderMemories(mems)))
-					}
-				}
-			}
+		if mem == nil {
+			return msgs
+		}
+		hist, err := cmgr.Session().Replay()
+		if err != nil {
+			log.Printf("回放会话失败，跳过记忆召回: %v", err)
+			return msgs
+		}
+		mems, err := recaller.Recall(memory.BuildRecallQuery(hist), cfg.Memory.RecallTopK)
+		if err != nil {
+			log.Printf("记忆召回失败: %v", err)
+			return msgs
+		}
+		if len(mems) > 0 {
+			msgs = append(msgs, message.NewSystemMessage(renderMemories(mems)))
 		}
 		return msgs
 	}

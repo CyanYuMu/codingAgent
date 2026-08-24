@@ -48,6 +48,24 @@ type subagentConfig struct {
 // BackgroundEnabled 返回是否允许后台作业（未配置时默认允许）。
 func (s subagentConfig) BackgroundEnabled() bool { return s.Background == nil || *s.Background }
 
+// memoryConfig 记忆与召回配置。
+type memoryConfig struct {
+	Global      *bool `yaml:"global"`        // 是否启用 <Home>/memory/global.db；默认启用
+	RecallTopK  int   `yaml:"recall_top_k"`  // 每轮注入几条
+	MaxPerScope int   `yaml:"max_per_scope"` // 每个作用域的条数上限
+	ProjectMap  *bool `yaml:"project_map"`   // 会话首轮注入项目地图（P10.4）
+	ReadNotes   *bool `yaml:"read_notes"`    // read_file 命中未变更文件时用笔记顶替内容（默认关）
+}
+
+// GlobalEnabled 未配置时默认启用全局记忆库。
+func (m memoryConfig) GlobalEnabled() bool { return m.Global == nil || *m.Global }
+
+// ProjectMapEnabled 未配置时默认注入项目地图。
+func (m memoryConfig) ProjectMapEnabled() bool { return m.ProjectMap == nil || *m.ProjectMap }
+
+// ReadNotesEnabled 默认关：拿摘要冒充文件内容会让模型基于旧信息改代码。
+func (m memoryConfig) ReadNotesEnabled() bool { return m.ReadNotes != nil && *m.ReadNotes }
+
 // config 顶层配置。
 type config struct {
 	Models         []modelConfig    `yaml:"models"`
@@ -55,6 +73,7 @@ type config struct {
 	MCPServers     []tool.MCPConfig `yaml:"mcp_servers"`     // 外部 MCP server（stdio）
 	DelegationMode string           `yaml:"delegation_mode"` // conservative/preferred/always，默认 preferred
 	Subagent       subagentConfig   `yaml:"subagent"`
+	Memory         memoryConfig     `yaml:"memory"`
 }
 
 // configPaths 返回三层配置路径（用户 → 项目 → 仓库内 legacy），后者覆盖前者。
@@ -131,6 +150,21 @@ func mergeConfig(dst *config, src config) {
 	if src.Subagent.Background != nil {
 		dst.Subagent.Background = src.Subagent.Background
 	}
+	if src.Memory.Global != nil {
+		dst.Memory.Global = src.Memory.Global
+	}
+	if src.Memory.RecallTopK != 0 {
+		dst.Memory.RecallTopK = src.Memory.RecallTopK
+	}
+	if src.Memory.MaxPerScope != 0 {
+		dst.Memory.MaxPerScope = src.Memory.MaxPerScope
+	}
+	if src.Memory.ProjectMap != nil {
+		dst.Memory.ProjectMap = src.Memory.ProjectMap
+	}
+	if src.Memory.ReadNotes != nil {
+		dst.Memory.ReadNotes = src.Memory.ReadNotes
+	}
 }
 
 // applyDefaults 补默认值：approval_mode=write、delegation_mode=preferred、窗口 128k、子 agent 并发 4 / 超时 10m / 50 轮。
@@ -161,6 +195,12 @@ func applyDefaults(cfg *config) {
 	}
 	if cfg.Subagent.MinTaskChars == 0 {
 		cfg.Subagent.MinTaskChars = 40
+	}
+	if cfg.Memory.RecallTopK == 0 {
+		cfg.Memory.RecallTopK = 5
+	}
+	if cfg.Memory.MaxPerScope == 0 {
+		cfg.Memory.MaxPerScope = 500
 	}
 }
 

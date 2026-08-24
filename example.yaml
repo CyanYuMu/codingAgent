@@ -32,6 +32,14 @@ subagent:
 #   <项目>/.codeclaw/agents/*.md  →  ~/.codeclaw/agents/*.md  →  内置（explorer/reviewer/planner/worker）
 # 同名 first-wins；写坏一个文件只告警跳过。字段见 docs/specs/phase-9-delegation-runtime.md §2.2
 
+# 长期记忆
+memory:
+  global: true          # 除项目库外再开 <Home>/memory/global.db，放"用户偏好"这类跨项目事实
+  recall_top_k: 5       # 每轮注入几条记忆
+  max_per_scope: 500    # 每个作用域的条数上限（超限按 重要性×新鲜度×可信度 淘汰最低的）
+  # project_map: true   # 会话首轮注入项目地图（P10.4）
+  # read_notes: false   # read_file 命中未变更文件时用笔记顶替内容；默认关（摘要冒充内容会让模型基于旧信息改代码）
+
 models:
   # 示例：DeepSeek
   - model_name: deepseek-chat
