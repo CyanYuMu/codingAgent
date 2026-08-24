@@ -14,6 +14,7 @@ import (
 	tea "charm.land/bubbletea/v2"
 
 	"einoclaw-build/internal/agent"
+	"einoclaw-build/internal/bus"
 	agentctx "einoclaw-build/internal/context"
 	"einoclaw-build/internal/memory"
 	"einoclaw-build/internal/message"
@@ -121,18 +122,17 @@ func parseMode(s string) permission.Mode {
 	}
 }
 
-// builtinDefs 内置子 agent 定义；超时与轮次上限来自配置。
-func builtinDefs(cfg config) []subagent.SubagentSpec {
-	mk := func(name, desc, when, prompt string) subagent.SubagentSpec {
-		return subagent.SubagentSpec{Name: name, Description: desc, WhenToUse: when, SystemPrompt: prompt,
-			Timeout: cfg.Subagent.DefaultTimeout, MaxTurns: cfg.Subagent.DefaultMaxTurns}
+// discoverAgents 发现子 agent 定义：项目 → 用户 → 内置（同名 first-wins）；坏文件只告警。
+func discoverAgents(cwd string) []subagent.AgentDef {
+	userDir, err := paths.UserAgentsDir()
+	if err != nil {
+		log.Printf("用户 agent 目录不可用: %v", err)
 	}
-	return []subagent.SubagentSpec{
-		mk("reviewer", "代码审查", "非平凡实现/改动后验收、代码审查", "你是代码审查专家：核对改动是否满足任务的验收标准，找出正确性问题，用 yield 提交 {findings:[{file,line,severity,summary}], verdict}。"),
-		mk("explorer", "探索项目", "探索未知代码库、定位相关代码", "你是项目探索专家：用 glob/grep/read_file 梳理项目结构、定位相关代码，用 yield 提交 {files:[{path,role}], entrypoints:[], notes}。不要修改文件。"),
-		mk("planner", "任务规划", "把复杂任务拆解成步骤", "你是任务规划专家：把复杂任务拆解成彼此独立、可并行的步骤，每步给出 Target/Change/Acceptance，用 yield 提交 {steps:[{name,target,change,acceptance}]}。"),
-		mk("worker", "实现与验证", "具体的编码实现、跑测试", "你是实现者：按任务说明修改代码并做最小验证，用 yield 提交 {changed_files:[], verification, notes}。"),
+	res := subagent.Discover(paths.ProjectAgentsDir(cwd), userDir, subagent.Bundled())
+	for _, w := range res.Warns {
+		log.Printf("跳过 agent 定义: %v", w)
 	}
+	return res.Defs
 }
 
 // warnLegacyData 检测仓库内旧的 sessions/ 与 memory.db（P8 之前的落点），提示一次迁移。
@@ -227,11 +227,15 @@ func main() {
 	}
 
 	summ := agentctx.NewModelSummarizer(m)
+	evbus := bus.New()
 	mgr := subagent.NewManager(subagent.Options{
 		Model: m, WorkerTools: workerTools, Memory: mem, Mode: mode, Approver: approver,
 		Escalate: cfg.Subagent.ApprovalEscalation, SessionDir: artifactDir, CWD: cwd,
-		MaxConcurrency: cfg.Subagent.MaxConcurrency, Defs: builtinDefs(cfg), Summarizer: summ,
-		ContextWindow: cfg.Models[0].ContextWindow,
+		MaxConcurrency: cfg.Subagent.MaxConcurrency, Defs: discoverAgents(cwd), Summarizer: summ,
+		ContextWindow: cfg.Models[0].ContextWindow, Bus: evbus,
+		DefaultTimeout: cfg.Subagent.DefaultTimeout, DefaultMaxTurns: cfg.Subagent.DefaultMaxTurns,
+		SoftBudget: cfg.Subagent.SoftBudget, MaxDepth: cfg.Subagent.MaxRecursionDepth,
+		MinTaskChars: cfg.Subagent.MinTaskChars, AllowBackground: cfg.Subagent.BackgroundEnabled(),
 	})
 
 	// 主 agent 工具集（按委派模式）：always = 只读工具 + task + remember；其它 = 全套 + task
@@ -248,7 +252,7 @@ func main() {
 			mainRegistry.Register(t)
 		}
 	}
-	mainRegistry.Register(subagent.NewTaskTool(mgr))
+	mainRegistry.Register(subagent.NewTaskTool(mgr, 0, "", nil)) // 主 agent：深度 0、可派任意 agent
 	exec := tool.NewExecutor(mainRegistry, mode, approver)
 	exec.SetArtifactStore(store)
 

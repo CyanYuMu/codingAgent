@@ -169,3 +169,17 @@ func UserConfigPath() (string, error) {
 func ProjectConfigPath(cwd string) string {
 	return filepath.Join(cwd, ".codeclaw", "config.yaml")
 }
+
+// UserAgentsDir = <Home>/agents ：用户级子 agent 定义（*.md，frontmatter）。目录可以不存在。
+func UserAgentsDir() (string, error) {
+	home, err := Home()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(home, "agents"), nil
+}
+
+// ProjectAgentsDir = <cwd>/.codeclaw/agents ：项目级子 agent 定义（优先级高于用户级）。
+func ProjectAgentsDir(cwd string) string {
+	return filepath.Join(cwd, ".codeclaw", "agents")
+}

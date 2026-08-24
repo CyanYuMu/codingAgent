@@ -39,7 +39,14 @@ type subagentConfig struct {
 	ApprovalEscalation bool          `yaml:"approval_escalation"` // headless 子 agent 的 Prompt 决策升级到父弹窗
 	DefaultTimeout     time.Duration `yaml:"default_timeout"`
 	DefaultMaxTurns    int           `yaml:"default_max_turns"`
+	SoftBudget         int           `yaml:"soft_budget"`          // 累计模型请求软预算上限；0 = 关闭护栏
+	MaxRecursionDepth  int           `yaml:"max_recursion_depth"`  // 委派递归深度上限
+	MinTaskChars       int           `yaml:"min_task_chars"`       // 任务描述最短长度（拒绝一句话派发）
+	Background         *bool         `yaml:"background"`           // 是否允许 task background:true；默认 true
 }
+
+// BackgroundEnabled 返回是否允许后台作业（未配置时默认允许）。
+func (s subagentConfig) BackgroundEnabled() bool { return s.Background == nil || *s.Background }
 
 // config 顶层配置。
 type config struct {
@@ -112,6 +119,18 @@ func mergeConfig(dst *config, src config) {
 	if src.Subagent.DefaultMaxTurns != 0 {
 		dst.Subagent.DefaultMaxTurns = src.Subagent.DefaultMaxTurns
 	}
+	if src.Subagent.SoftBudget != 0 {
+		dst.Subagent.SoftBudget = src.Subagent.SoftBudget
+	}
+	if src.Subagent.MaxRecursionDepth != 0 {
+		dst.Subagent.MaxRecursionDepth = src.Subagent.MaxRecursionDepth
+	}
+	if src.Subagent.MinTaskChars != 0 {
+		dst.Subagent.MinTaskChars = src.Subagent.MinTaskChars
+	}
+	if src.Subagent.Background != nil {
+		dst.Subagent.Background = src.Subagent.Background
+	}
 }
 
 // applyDefaults 补默认值：approval_mode=write、delegation_mode=preferred、窗口 128k、子 agent 并发 4 / 超时 10m / 50 轮。
@@ -133,6 +152,15 @@ func applyDefaults(cfg *config) {
 	}
 	if cfg.Subagent.DefaultMaxTurns == 0 {
 		cfg.Subagent.DefaultMaxTurns = 50
+	}
+	if cfg.Subagent.SoftBudget == 0 {
+		cfg.Subagent.SoftBudget = 200
+	}
+	if cfg.Subagent.MaxRecursionDepth == 0 {
+		cfg.Subagent.MaxRecursionDepth = 2
+	}
+	if cfg.Subagent.MinTaskChars == 0 {
+		cfg.Subagent.MinTaskChars = 40
 	}
 }
 

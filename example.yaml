@@ -22,7 +22,15 @@ subagent:
   max_concurrency: 4          # 并行子 agent 上限
   approval_escalation: false  # true：子 agent 需要审批时升级到主界面弹窗（带 [子 agent X] 标签）；false：直接拒绝并说明
   default_timeout: 10m        # 单个子 agent wall-clock 超时
-  default_max_turns: 50       # 单个子 agent 工具循环上限
+  default_max_turns: 50       # 单个子 agent 单轮工具循环上限
+  soft_budget: 200            # 累计模型请求软预算：越界注入收尾通知，1.5× 强制 yield，宽限后硬杀；0 = 关闭护栏
+  max_recursion_depth: 2      # 委派递归深度上限（子 agent 再派子 agent）
+  min_task_chars: 40          # 任务描述最短长度（拒绝一句话派发）
+  background: true            # 允许 task 的 background:true（长任务转后台，完成后结果自动送回会话）
+
+# 子 agent 定义（markdown frontmatter）优先级：
+#   <项目>/.codeclaw/agents/*.md  →  ~/.codeclaw/agents/*.md  →  内置（explorer/reviewer/planner/worker）
+# 同名 first-wins；写坏一个文件只告警跳过。字段见 docs/specs/phase-9-delegation-runtime.md §2.2
 
 models:
   # 示例：DeepSeek

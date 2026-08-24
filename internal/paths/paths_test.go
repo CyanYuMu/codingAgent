@@ -88,3 +88,15 @@ func TestProjectIDStableAndScoped(t *testing.T) {
 		t.Fatal("different projects must differ")
 	}
 }
+
+func TestAgentsDirs(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("CODECLAW_HOME", home)
+	got, err := UserAgentsDir()
+	if err != nil || got != filepath.Join(home, "agents") {
+		t.Fatalf("UserAgentsDir = %q err %v", got, err)
+	}
+	if got := ProjectAgentsDir("/x/y"); got != filepath.Join("/x/y", ".codeclaw", "agents") {
+		t.Fatalf("ProjectAgentsDir = %q", got)
+	}
+}

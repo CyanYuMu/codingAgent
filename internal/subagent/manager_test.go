@@ -5,7 +5,9 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -44,21 +46,51 @@ func (f *fakeStream) Usage() model.Usage {
 func (f *fakeStream) Close() {}
 
 // scriptModel 每步返回一个预置事件；脚本耗尽后返回纯文本 "idle"（无工具调用 → 循环结束）。
+// 同时记录每次调用收到的工具名，供"强制收尾那一 turn 只有 yield"这类断言使用。
 type scriptModel struct {
+	mu    sync.Mutex
 	steps []model.ModelEvent
 	delay time.Duration
+	tools [][]string // 每次调用收到的工具名（排序后）
+	calls int
 }
 
-func (m *scriptModel) Stream(ctx context.Context, _ []message.Message, _ []model.ToolSpec) (model.ModelStream, error) {
+func (m *scriptModel) Stream(ctx context.Context, _ []message.Message, tools []model.ToolSpec) (model.ModelStream, error) {
 	if ctx.Err() != nil {
 		return nil, ctx.Err()
 	}
-	if len(m.steps) == 0 {
-		return &fakeStream{events: []model.ModelEvent{{Text: "idle"}}, delay: m.delay, ctx: ctx}, nil
+	m.mu.Lock()
+	names := make([]string, 0, len(tools))
+	for _, t := range tools {
+		names = append(names, t.Name)
 	}
-	s := m.steps[0]
-	m.steps = m.steps[1:]
-	return &fakeStream{events: []model.ModelEvent{s}, delay: m.delay, ctx: ctx}, nil
+	sort.Strings(names)
+	m.tools = append(m.tools, names)
+	m.calls++
+	var ev model.ModelEvent
+	if len(m.steps) == 0 {
+		ev = model.ModelEvent{Text: "idle"}
+	} else {
+		ev, m.steps = m.steps[0], m.steps[1:]
+	}
+	delay := m.delay
+	m.mu.Unlock()
+	return &fakeStream{events: []model.ModelEvent{ev}, delay: delay, ctx: ctx}, nil
+}
+
+func (m *scriptModel) remaining() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return len(m.steps)
+}
+
+func (m *scriptModel) toolsAt(i int) []string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if i < 0 || i >= len(m.tools) {
+		return nil
+	}
+	return m.tools[i]
 }
 
 func call(id, name, args string) model.ModelEvent {
@@ -76,9 +108,28 @@ func workerTools(cwd string, store *runtime.ArtifactStore) *tool.Registry {
 func baseOpts(m model.Model, dir string) Options {
 	return Options{
 		Model: m, WorkerTools: workerTools, Mode: permission.ModeYolo, SessionDir: dir, CWD: dir, MaxConcurrency: 2,
-		Defs:          []SubagentSpec{{Name: "explorer", SystemPrompt: "x", MaxTurns: 10}},
+		Defs:          []AgentDef{{Name: "explorer", Description: "探索", SystemPrompt: "x", MaxTurns: 10}},
 		ContextWindow: 100000,
+		MinTaskChars:  1, // 测试里用短任务描述；预检长度另有专门测试
 	}
+}
+
+// one 构造单任务批次。
+func one(agent, task string) TaskBatch {
+	return TaskBatch{Context: "测试批次背景", Tasks: []TaskItem{{Agent: agent, Task: task}}}
+}
+
+// runOne 跑一个单任务批次并返回唯一结果。
+func runOne(t *testing.T, mgr *Manager, ctx context.Context, b TaskBatch) Result {
+	t.Helper()
+	rs, err := mgr.RunBatch(ctx, b, mgr.Env(0, "", nil))
+	if err != nil {
+		t.Fatalf("RunBatch: %v", err)
+	}
+	if len(rs) != 1 {
+		t.Fatalf("want 1 result, got %d", len(rs))
+	}
+	return rs[0]
 }
 
 func TestYieldTerminatesAndExtractsData(t *testing.T) {
@@ -88,12 +139,13 @@ func TestYieldTerminatesAndExtractsData(t *testing.T) {
 	}}
 	dir := t.TempDir()
 	mgr := NewManager(baseOpts(m, dir))
-	r := mgr.Run(context.Background(), Task{Subagent: "explorer", Prompt: "look"})
-	if r.Status != StatusCompleted || !r.Yielded || r.Data["files"] == nil || r.Requests != 1 {
+	r := runOne(t, mgr, context.Background(), one("explorer", "look"))
+	data, _ := r.Data.(map[string]any)
+	if r.Status != StatusCompleted || !r.Yielded || data["files"] == nil || r.Requests != 1 {
 		t.Fatalf("result = %+v", r)
 	}
-	if len(m.steps) != 1 {
-		t.Fatalf("model should not be called after yield; remaining steps = %d", len(m.steps))
+	if m.remaining() != 1 {
+		t.Fatalf("model should not be called after yield; remaining steps = %d", m.remaining())
 	}
 	if r.SessionFile == "" || !strings.HasPrefix(filepath.Base(r.SessionFile), "agent-explorer") {
 		t.Fatalf("session file = %q", r.SessionFile)
@@ -111,7 +163,7 @@ func TestTimeoutIsReported(t *testing.T) {
 	m := &scriptModel{delay: 300 * time.Millisecond, steps: []model.ModelEvent{{Text: "slow"}}}
 	o := baseOpts(m, t.TempDir())
 	o.Defs[0].Timeout = 100 * time.Millisecond
-	r := NewManager(o).Run(context.Background(), Task{Subagent: "explorer", Prompt: "slow"})
+	r := runOne(t, NewManager(o), context.Background(), one("explorer", "slow"))
 	if r.Status != StatusTimeout {
 		t.Fatalf("status = %s, want timeout (err=%v)", StatusString(r.Status), r.Err)
 	}
@@ -121,7 +173,7 @@ func TestParentCancelIsAborted(t *testing.T) {
 	m := &scriptModel{delay: 300 * time.Millisecond, steps: []model.ModelEvent{{Text: "slow"}}}
 	ctx, cancel := context.WithCancel(context.Background())
 	go func() { time.Sleep(50 * time.Millisecond); cancel() }()
-	r := NewManager(baseOpts(m, t.TempDir())).Run(ctx, Task{Subagent: "explorer", Prompt: "x"})
+	r := runOne(t, NewManager(baseOpts(m, t.TempDir())), ctx, one("explorer", "x"))
 	if r.Status != StatusAborted {
 		t.Fatalf("status = %s, want aborted", StatusString(r.Status))
 	}
@@ -131,7 +183,7 @@ func TestHeadlessDeniesPromptByDefault(t *testing.T) {
 	m := &scriptModel{steps: []model.ModelEvent{call("c1", "bash", `{"command":"echo hi"}`), {Text: "end"}}}
 	o := baseOpts(m, t.TempDir())
 	o.Mode = permission.ModeAlwaysAsk
-	r := NewManager(o).Run(context.Background(), Task{Subagent: "explorer", Prompt: "x"})
+	r := runOne(t, NewManager(o), context.Background(), one("explorer", "x"))
 	b, _ := os.ReadFile(r.SessionFile)
 	if !strings.Contains(string(b), "headless subagent cannot prompt") {
 		t.Fatalf("bash should be denied, transcript: %s", b)
@@ -154,13 +206,15 @@ func TestEscalationLabelsCall(t *testing.T) {
 	o.Mode = permission.ModeAlwaysAsk
 	ap := &recordingApprover{}
 	o.Approver, o.Escalate = ap, true
-	r := NewManager(o).Run(context.Background(), Task{Name: "Scout", Subagent: "explorer", Prompt: "x"})
+	b := one("explorer", "x")
+	b.Tasks[0].Name = "Scout"
+	r := runOne(t, NewManager(o), context.Background(), b)
 	if len(ap.got) != 1 || !strings.Contains(ap.got[0].Name, "[子 agent Scout]") {
 		t.Fatalf("approver got %+v", ap.got)
 	}
-	b, _ := os.ReadFile(r.SessionFile)
-	if !strings.Contains(string(b), "hi") {
-		t.Fatalf("escalated approval should let bash run: %s", b)
+	tr, _ := os.ReadFile(r.SessionFile)
+	if !strings.Contains(string(tr), "hi") {
+		t.Fatalf("escalated approval should let bash run: %s", tr)
 	}
 }
 
@@ -168,7 +222,7 @@ func TestSchemaRequiredButNoData(t *testing.T) {
 	m := &scriptModel{steps: []model.ModelEvent{{Text: "just text"}}}
 	o := baseOpts(m, t.TempDir())
 	o.Defs[0].OutputSchema = map[string]any{"type": "object"}
-	r := NewManager(o).Run(context.Background(), Task{Subagent: "explorer", Prompt: "x"})
+	r := runOne(t, NewManager(o), context.Background(), one("explorer", "x"))
 	if r.Status != StatusFailed || r.Err == nil || r.Text != "just text" {
 		t.Fatalf("result = %+v", r)
 	}
@@ -187,8 +241,8 @@ func TestIndependentBashPerRun(t *testing.T) {
 			{Text: "end"},
 		}}
 	}
-	ra := NewManager(baseOpts(mk("a"), dir)).Run(context.Background(), Task{Subagent: "explorer", Prompt: "x"})
-	rb := NewManager(baseOpts(mk("b"), dir)).Run(context.Background(), Task{Subagent: "explorer", Prompt: "x"})
+	ra := runOne(t, NewManager(baseOpts(mk("a"), dir)), context.Background(), one("explorer", "x"))
+	rb := runOne(t, NewManager(baseOpts(mk("b"), dir)), context.Background(), one("explorer", "x"))
 	ba, _ := os.ReadFile(ra.SessionFile)
 	bb, _ := os.ReadFile(rb.SessionFile)
 	if !strings.Contains(string(ba), filepath.Join(dir, "a")) || !strings.Contains(string(bb), filepath.Join(dir, "b")) {
@@ -196,26 +250,105 @@ func TestIndependentBashPerRun(t *testing.T) {
 	}
 }
 
-func TestRunManyOrderAndUnknown(t *testing.T) {
+func TestRunBatchOrderAndDefaultNames(t *testing.T) {
 	mgr := NewManager(baseOpts(&scriptModel{}, t.TempDir()))
-	rs := mgr.RunMany(context.Background(), []Task{{Subagent: "nope", Prompt: "x"}, {Subagent: "explorer", Prompt: "y"}})
-	if len(rs) != 2 || rs[0].Status != StatusFailed || rs[1].Status != StatusCompleted || rs[1].Yielded {
+	rs, err := mgr.RunBatch(context.Background(), TaskBatch{
+		Context: "背景",
+		Tasks:   []TaskItem{{Agent: "explorer", Task: "第一件事"}, {Agent: "explorer", Task: "第二件事"}},
+	}, mgr.Env(0, "", nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rs) != 2 || rs[0].Status != StatusCompleted || rs[1].Status != StatusCompleted || rs[0].Yielded {
 		t.Fatalf("results = %+v", rs)
 	}
-	if rs[1].Name != "explorer-2" {
-		t.Fatalf("default name = %q", rs[1].Name)
+	if rs[0].Name != "explorer-1" || rs[1].Name != "explorer-2" {
+		t.Fatalf("names = %q %q", rs[0].Name, rs[1].Name)
 	}
-	out := renderResult(rs[1])
-	if !strings.Contains(out, "[未显式 yield") || !strings.Contains(out, "transcript:") {
+	out := renderResult(rs[0])
+	if !strings.Contains(out, "[未显式 yield") || !strings.Contains(out, "转录: history://") {
 		t.Fatalf("render = %s", out)
+	}
+}
+
+func TestRunBatchUnknownAgentRejectedBeforeSpawning(t *testing.T) {
+	dir := t.TempDir()
+	mgr := NewManager(baseOpts(&scriptModel{}, dir))
+	_, err := mgr.RunBatch(context.Background(), one("nope", "做点什么"), mgr.Env(0, "", nil))
+	if err == nil || !strings.Contains(err.Error(), "未知 agent") {
+		t.Fatalf("err = %v", err)
+	}
+	des, _ := os.ReadDir(dir)
+	if len(des) != 0 {
+		t.Fatalf("预检失败不该产生 sidecar：%v", des)
 	}
 }
 
 func TestMemorySidecarWhenNoSessionDir(t *testing.T) {
 	o := baseOpts(&scriptModel{}, t.TempDir())
 	o.SessionDir = ""
-	r := NewManager(o).Run(context.Background(), Task{Subagent: "explorer", Prompt: "x"})
+	r := runOne(t, NewManager(o), context.Background(), one("explorer", "x"))
 	if r.Status != StatusCompleted || r.SessionFile != "" {
 		t.Fatalf("result = %+v", r)
+	}
+}
+
+func TestToolSetReadOnly(t *testing.T) {
+	o := baseOpts(&scriptModel{}, t.TempDir())
+	o.Defs[0].ReadOnly = true
+	m := o.Model.(*scriptModel)
+	runOne(t, NewManager(o), context.Background(), one("explorer", "x"))
+	got := m.toolsAt(0)
+	want := []string{"glob", "grep", "read_file", "yield"}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("read-only 工具集 = %v, want %v", got, want)
+	}
+}
+
+func TestToolSetSpawnsAndDepth(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		spawns   []string
+		maxDepth int
+		wantTask bool
+	}{
+		{"有 spawns 且深度未满", []string{"worker"}, 2, true},
+		{"无 spawns", nil, 2, false},
+		{"深度已满", []string{"worker"}, 1, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			o := baseOpts(&scriptModel{}, t.TempDir())
+			o.Defs[0].Spawns = tc.spawns
+			o.MaxDepth = tc.maxDepth
+			o.Defs = append(o.Defs, AgentDef{Name: "worker", Description: "干活", SystemPrompt: "w"})
+			m := o.Model.(*scriptModel)
+			runOne(t, NewManager(o), context.Background(), one("explorer", "x"))
+			hasTask := false
+			for _, n := range m.toolsAt(0) {
+				if n == "task" {
+					hasTask = true
+				}
+			}
+			if hasTask != tc.wantTask {
+				t.Fatalf("task in toolset = %v, want %v（工具集 %v）", hasTask, tc.wantTask, m.toolsAt(0))
+			}
+		})
+	}
+}
+
+func TestResolveDefAppliesDefaultsAndBudgetCeiling(t *testing.T) {
+	mgr := NewManager(Options{DefaultMaxTurns: 40, DefaultTimeout: time.Minute, SoftBudget: 200})
+	got := mgr.resolveDef(AgentDef{Name: "a"})
+	if got.MaxTurns != 40 || got.Timeout != time.Minute || got.SoftBudget != 200 {
+		t.Fatalf("defaults = %+v", got)
+	}
+	if got := mgr.resolveDef(AgentDef{Name: "a", SoftBudget: 500}); got.SoftBudget != 200 {
+		t.Fatalf("定义不该放大全局预算上限，got %d", got.SoftBudget)
+	}
+	if got := mgr.resolveDef(AgentDef{Name: "a", SoftBudget: 50}); got.SoftBudget != 50 {
+		t.Fatalf("定义可以更小，got %d", got.SoftBudget)
+	}
+	if got := mgr.resolveDef(AgentDef{Name: "a", SoftBudget: -1}); got.SoftBudget != 0 {
+		t.Fatalf("-1 应表示关闭护栏，got %d", got.SoftBudget)
 	}
 }
