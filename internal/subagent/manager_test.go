@@ -218,16 +218,6 @@ func TestEscalationLabelsCall(t *testing.T) {
 	}
 }
 
-func TestSchemaRequiredButNoData(t *testing.T) {
-	m := &scriptModel{steps: []model.ModelEvent{{Text: "just text"}}}
-	o := baseOpts(m, t.TempDir())
-	o.Defs[0].OutputSchema = map[string]any{"type": "object"}
-	r := runOne(t, NewManager(o), context.Background(), one("explorer", "x"))
-	if r.Status != StatusFailed || r.Err == nil || r.Text != "just text" {
-		t.Fatalf("result = %+v", r)
-	}
-}
-
 func TestIndependentBashPerRun(t *testing.T) {
 	// 两个子 agent 各自 cd 到不同目录，再 pwd；互不影响
 	dir := t.TempDir()

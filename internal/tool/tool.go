@@ -19,8 +19,12 @@ type Tool interface {
 	Execute(ctx context.Context, args map[string]any, sink *runtime.Sink) error
 }
 
-// Terminal 可选接口：工具执行成功后终止本次 run（如子 agent 的 yield）。
-type Terminal interface{ IsTerminal() bool }
+// Terminal 可选接口：本次调用是否终止 run。按调用判定而不是按工具判定，
+// 因为同一个工具的不同调用语义不同（yield 的增量提交只是记一段，终止提交才结束 run）。
+// args 是本次调用的参数，err 是 Execute 的返回（工具内退回重试时 err != nil，不该终止）。
+type Terminal interface {
+	IsTerminal(args map[string]any, err error) bool
+}
 
 // RequiredParams 可选接口：声明必填参数名（进入工具定义的 required）。
 type RequiredParams interface{ Required() []string }

@@ -8,7 +8,6 @@ import (
 
 	"einoclaw-build/internal/message"
 	"einoclaw-build/internal/model"
-	"einoclaw-build/internal/tool"
 )
 
 // Run 执行一次 run：以 cc 为真相源循环「重建输入 → 模型 → 记录 → 工具 → 记录」，流式吐出 AgentEvent。
@@ -104,13 +103,8 @@ func (a *Agent) loop(ctx context.Context, steer <-chan message.Message, emit fun
 				emit(AgentEvent{Type: EventError, Err: err})
 				return
 			}
-			if r.IsError {
-				continue
-			}
-			if t, ok := a.tools.Get(tc.Name); ok {
-				if term, ok := t.(tool.Terminal); ok && term.IsTerminal() {
-					terminated = tc.Name
-				}
+			if r.Terminal {
+				terminated = tc.Name // 终止由本次调用决定（见 tool.Terminal）；仍先记录完所有结果，保持配对
 			}
 		}
 		if terminated != "" {

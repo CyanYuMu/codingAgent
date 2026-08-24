@@ -81,7 +81,7 @@ func (echoTool) Parameters() map[string]any {
 }
 func (echoTool) Tier() permission.Tier         { return permission.TierRead }
 func (echoTool) Concurrency() tool.Concurrency { return tool.ConcurrencyShared }
-func (e echoTool) IsTerminal() bool            { return e.terminal }
+func (e echoTool) IsTerminal(_ map[string]any, err error) bool { return e.terminal && err == nil }
 func (echoTool) Execute(_ context.Context, args map[string]any, sink *runtime.Sink) error {
 	v, _ := args["v"].(string)
 	sink.Write([]byte("echo:" + v))

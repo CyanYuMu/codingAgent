@@ -4,8 +4,6 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
-	"encoding/json"
-	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -14,7 +12,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"einoclaw-build/internal/agent"
 	"einoclaw-build/internal/bus"
 	agentctx "einoclaw-build/internal/context"
 	"einoclaw-build/internal/memory"
@@ -140,99 +137,57 @@ func (m *Manager) RunBatch(ctx context.Context, b TaskBatch, env Env) ([]Result,
 // Context Isolation：子 agent 只看到 system + batch context + task，不看父历史；父只拿结构化产出/最后文本 + 指针。
 func (m *Manager) Run(ctx context.Context, batchContext string, r Resolved, depth int) Result {
 	def := m.resolveDef(r.Def)
-	name := r.Item.Name
-	start := time.Now()
+	run := newRun(r.Item.Name, def.Name, depth)
+	rs, err := m.setup(def, r, batchContext, depth)
+	if err != nil {
+		return Result{ID: run.name, Name: run.name, Agent: def.Name, Status: StatusFailed, Err: err}
+	}
+	defer rs.sess.Close()
+	return m.drive(ctx, run, rs)
+}
 
-	// 运行时：独立产物存储 / 工具集（独立 bash） / 审批
+// setup 装配一个 Run 的运行时：独立产物存储与 bash、工具集（含只含 yield 的备用集）、
+// 继承父审批的执行器、sidecar 会话、上下文管理器与产出累积。
+func (m *Manager) setup(def AgentDef, r Resolved, batchContext string, depth int) (*runtimeSet, error) {
 	var store *runtime.ArtifactStore
 	if m.o.SessionDir != "" {
 		store = runtime.NewArtifactStore(m.o.SessionDir)
 	}
-	tools, _ := m.buildTools(def, depth, store)
+	ys := NewYieldState()
+	tools, yieldOnly := m.buildTools(def, depth, store, ys, r.Schema, r.SchemaMode)
+
 	var approver tool.Approver = denyApprover{}
 	if m.o.Escalate && m.o.Approver != nil {
-		approver = labeledApprover{inner: m.o.Approver, label: "[子 agent " + name + "]"}
+		approver = labeledApprover{inner: m.o.Approver, label: "[子 agent " + r.Item.Name + "]"}
 	}
 	exec := tool.NewExecutor(tools, m.o.Mode, approver)
+	yieldExec := tool.NewExecutor(yieldOnly, m.o.Mode, approver)
 	if store != nil {
 		exec.SetArtifactStore(store)
+		yieldExec.SetArtifactStore(store)
 	}
 
-	// sidecar 会话
-	sess, file, err := m.openSidecar(name, def, r, tools, depth)
+	sess, file, err := m.openSidecar(r.Item.Name, def, r, tools, depth)
 	if err != nil {
-		return Result{Name: name, Agent: def.Name, Status: StatusFailed, Err: err}
+		return nil, err
 	}
-	defer sess.Close()
-
 	system := func(context.Context) []message.Message {
 		return []message.Message{message.NewSystemMessage(def.SystemPrompt + subagentCompletionNote)}
 	}
 	cc := agentctx.New(sess, m.o.Summarizer, m.o.ContextWindow, 16384, system)
-	_ = cc.Record(message.NewUserMessage(buildTaskPrompt(batchContext, r.Item)), model.Usage{})
-
-	sub := agent.New(def.Name, m.o.Model, tools, exec, cc)
-	sub.SetMaxIterations(def.MaxTurns)
-
-	runCtx := ctx
-	cancel := context.CancelFunc(func() {})
-	if def.Timeout > 0 {
-		runCtx, cancel = context.WithTimeout(ctx, def.Timeout)
+	if err := cc.Record(message.NewUserMessage(buildTaskPrompt(batchContext, r.Item)), model.Usage{}); err != nil {
+		sess.Close()
+		return nil, err
 	}
-	defer cancel()
-
-	res := Result{ID: name, Name: name, Agent: def.Name, SessionFile: file}
-	var runErr error
-	for ev := range sub.Run(runCtx, nil) {
-		switch ev.Type {
-		case agent.EventMessageEnd:
-			res.Requests++
-			res.Usage = res.Usage.Add(ev.Ended.Usage)
-			if txt := textOf(ev.Ended.Message); txt != "" {
-				res.Text = txt
-			}
-		case agent.EventToolStart:
-			res.ToolCalls++
-			if ev.ToolStart.Name == "yield" {
-				var args map[string]any
-				if json.Unmarshal([]byte(ev.ToolStart.Args), &args) == nil {
-					if d, ok := args["data"]; ok {
-						res.Data = d
-					}
-				}
-			}
-		case agent.EventTerminated:
-			if ev.Terminated.ToolName == "yield" {
-				res.Yielded = true
-			}
-		case agent.EventError:
-			runErr = ev.Err
-		}
-	}
-	res.DurationMs = time.Since(start).Milliseconds()
-
-	switch {
-	case ctx.Err() != nil:
-		res.Status, res.Err = StatusAborted, ctx.Err()
-	case runCtx.Err() != nil:
-		res.Status, res.Err = StatusTimeout, fmt.Errorf("子 agent 超时（%s）", def.Timeout)
-	case runErr != nil:
-		res.Status, res.Err = StatusFailed, runErr
-	case r.Schema != nil && res.Data == nil:
-		res.Status, res.Err = StatusFailed, errors.New("子 agent 未通过 yield 产出符合 schema 的结构化数据")
-	default:
-		res.Status = StatusCompleted
-	}
-	_ = sess.AppendCustom("session_exit", map[string]any{
-		"status": StatusString(res.Status), "requests": res.Requests, "toolCalls": res.ToolCalls,
-		"yielded": res.Yielded, "durationMs": res.DurationMs,
-	})
-	return res
+	return &runtimeSet{
+		def: def, tools: tools, yieldOnly: yieldOnly, exec: exec, yieldExec: yieldExec,
+		cc: cc, sess: sess, file: file, ys: ys, schema: r.Schema, mode: r.SchemaMode,
+	}, nil
 }
 
 // buildTools 构造一个 Run 的工具集，并返回「只含 yield」的备用注册表（强制收尾那一 turn 用）。
 // 规则：默认集（或定义指定的子集）→ 只读 agent 裁到读工具 → 加 yield → 满足 spawn policy 与深度才加 task。
-func (m *Manager) buildTools(def AgentDef, depth int, store *runtime.ArtifactStore) (all, yieldOnly *tool.Registry) {
+func (m *Manager) buildTools(def AgentDef, depth int, store *runtime.ArtifactStore, ys *YieldState, schema map[string]any, mode string) (all, yieldOnly *tool.Registry) {
 	base := tool.NewRegistry()
 	if m.o.WorkerTools != nil {
 		base = m.o.WorkerTools(m.o.CWD, store)
@@ -256,7 +211,7 @@ func (m *Manager) buildTools(def AgentDef, depth int, store *runtime.ArtifactSto
 		}
 		all.Register(t)
 	}
-	y := NewYieldTool()
+	y := NewYieldTool(ys, schema, mode)
 	all.Register(y)
 
 	maxDepth := m.o.MaxDepth

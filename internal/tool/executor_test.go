@@ -2,6 +2,7 @@ package tool
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -156,5 +157,49 @@ func waitStarted(t *testing.T, r *Registry, name string) {
 	case <-ch:
 	case <-time.After(2 * time.Second):
 		t.Fatalf("工具 %s 未启动（可能串行卡住）", name)
+	}
+}
+
+// stopTool 按调用参数决定是否终止（模拟 yield 的三态：增量提交不终止、出错不终止）。
+type stopTool struct{}
+
+func (stopTool) Name() string               { return "stop" }
+func (stopTool) Description() string        { return "" }
+func (stopTool) Parameters() map[string]any { return map[string]any{} }
+func (stopTool) Tier() permission.Tier      { return permission.TierRead }
+func (stopTool) Concurrency() Concurrency   { return ConcurrencyShared }
+func (stopTool) IsTerminal(args map[string]any, err error) bool {
+	if err != nil {
+		return false
+	}
+	stop, _ := args["stop"].(bool)
+	return stop
+}
+func (stopTool) Execute(_ context.Context, args map[string]any, sink *runtime.Sink) error {
+	sink.Write([]byte("ok"))
+	if bad, _ := args["bad"].(bool); bad {
+		return errors.New("retry me")
+	}
+	return nil
+}
+
+func TestResultTerminalIsPerCall(t *testing.T) {
+	reg := NewRegistry()
+	reg.Register(stopTool{})
+	e := NewExecutor(reg, permission.ModeYolo, nil)
+	for _, tc := range []struct {
+		args     string
+		terminal bool
+		isErr    bool
+	}{
+		{`{"stop":true}`, true, false},
+		{`{"stop":false}`, false, false},
+		{`{}`, false, false},
+		{`{"stop":true,"bad":true}`, false, true}, // 工具内退回重试：不终止
+	} {
+		res := e.Execute(context.Background(), message.ToolCall{ID: "c", Name: "stop", Args: tc.args})
+		if res.Terminal != tc.terminal || res.IsError != tc.isErr {
+			t.Fatalf("args %s → terminal=%v isErr=%v, want %v/%v", tc.args, res.Terminal, res.IsError, tc.terminal, tc.isErr)
+		}
 	}
 }

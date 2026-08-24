@@ -27,8 +27,9 @@ type DenyReasoner interface{ DenyReason() string }
 
 // Result 是一次工具执行给模型的结果。
 type Result struct {
-	Content string
-	IsError bool
+	Content  string
+	IsError  bool
+	Terminal bool // 本次调用要求终止 run（yield 的终止提交）
 }
 
 // Executor 执行工具调用：查表 → 审批 → 执行 → 塑形结果。
@@ -85,10 +86,14 @@ func (e *Executor) Execute(ctx context.Context, call message.ToolCall) Result {
 	defer sink.Close()
 	err := t.Execute(ctx, args, sink)
 	res := sink.Result()
-	if err != nil {
-		return Result{Content: res + "\n[tool error: " + err.Error() + "]", IsError: true}
+	terminal := false
+	if term, ok := t.(Terminal); ok {
+		terminal = term.IsTerminal(args, err)
 	}
-	return Result{Content: res}
+	if err != nil {
+		return Result{Content: res + "\n[tool error: " + err.Error() + "]", IsError: true, Terminal: terminal}
+	}
+	return Result{Content: res, Terminal: terminal}
 }
 
 // ExecuteAll 并行执行多个工具调用：Shared 用 goroutine 并行（Semaphore 限并发），Exclusive 串行，结果按调用序返回。
