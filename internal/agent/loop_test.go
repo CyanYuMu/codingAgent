@@ -79,8 +79,8 @@ func (echoTool) Description() string { return "" }
 func (echoTool) Parameters() map[string]any {
 	return map[string]any{"v": map[string]any{"type": "string"}}
 }
-func (echoTool) Tier() permission.Tier         { return permission.TierRead }
-func (echoTool) Concurrency() tool.Concurrency { return tool.ConcurrencyShared }
+func (echoTool) Tier() permission.Tier                         { return permission.TierRead }
+func (echoTool) Concurrency() tool.Concurrency                 { return tool.ConcurrencyShared }
 func (e echoTool) IsTerminal(_ map[string]any, err error) bool { return e.terminal && err == nil }
 func (echoTool) Execute(_ context.Context, args map[string]any, sink *runtime.Sink) error {
 	v, _ := args["v"].(string)

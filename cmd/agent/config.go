@@ -39,10 +39,10 @@ type subagentConfig struct {
 	ApprovalEscalation bool          `yaml:"approval_escalation"` // headless 子 agent 的 Prompt 决策升级到父弹窗
 	DefaultTimeout     time.Duration `yaml:"default_timeout"`
 	DefaultMaxTurns    int           `yaml:"default_max_turns"`
-	SoftBudget         int           `yaml:"soft_budget"`          // 累计模型请求软预算上限；0 = 关闭护栏
-	MaxRecursionDepth  int           `yaml:"max_recursion_depth"`  // 委派递归深度上限
-	MinTaskChars       int           `yaml:"min_task_chars"`       // 任务描述最短长度（拒绝一句话派发）
-	Background         *bool         `yaml:"background"`           // 是否允许 task background:true；默认 true
+	SoftBudget         int           `yaml:"soft_budget"`         // 累计模型请求软预算上限；0 = 关闭护栏
+	MaxRecursionDepth  int           `yaml:"max_recursion_depth"` // 委派递归深度上限
+	MinTaskChars       int           `yaml:"min_task_chars"`      // 任务描述最短长度（拒绝一句话派发）
+	Background         *bool         `yaml:"background"`          // 是否允许 task background:true；默认 true
 }
 
 // BackgroundEnabled 返回是否允许后台作业（未配置时默认允许）。
