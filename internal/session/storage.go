@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"encoding/json"
 	"os"
-	"strings"
 	"sync"
 )
 
@@ -20,21 +19,26 @@ type FileStorage struct {
 	path string
 	f    *os.File
 	w    *bufio.Writer
+	mu   sync.Mutex
 }
 
 func NewFileStorage(path string) (*FileStorage, error) {
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
 	if err != nil {
 		return nil, err
 	}
 	return &FileStorage{path: path, f: f, w: bufio.NewWriter(f)}, nil
 }
 
+func (fs *FileStorage) Path() string { return fs.path }
+
 func (fs *FileStorage) Append(e Entry) error {
 	b, err := json.Marshal(e)
 	if err != nil {
 		return err
 	}
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
 	if _, err := fs.w.Write(b); err != nil {
 		return err
 	}
@@ -44,27 +48,36 @@ func (fs *FileStorage) Append(e Entry) error {
 	return fs.w.Flush()
 }
 
+// Entries 逐行读回（跳过残行），单行上限 16MB。
 func (fs *FileStorage) Entries() ([]Entry, error) {
-	data, err := os.ReadFile(fs.path)
+	f, err := os.Open(fs.path)
 	if err != nil {
 		return nil, err
 	}
+	defer f.Close()
+	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 1<<20), 16<<20)
 	var entries []Entry
-	for _, line := range strings.Split(string(data), "\n") {
-		line = strings.TrimSpace(line)
-		if line == "" {
+	for sc.Scan() {
+		line := sc.Bytes()
+		if len(line) == 0 {
 			continue
 		}
 		var e Entry
-		if json.Unmarshal([]byte(line), &e) != nil {
+		if json.Unmarshal(line, &e) != nil {
 			continue // 跳过残行（崩溃截断）
 		}
 		entries = append(entries, e)
 	}
-	return entries, nil
+	return entries, sc.Err()
 }
 
-func (fs *FileStorage) Close() error { return fs.f.Close() }
+func (fs *FileStorage) Close() error {
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+	_ = fs.w.Flush()
+	return fs.f.Close()
+}
 
 // MemoryStorage 内存实现，供单测用。
 type MemoryStorage struct {

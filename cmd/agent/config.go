@@ -3,11 +3,13 @@ package main
 import (
 	"errors"
 	"fmt"
-	"log"
 	"os"
+	"time"
 
 	"gopkg.in/yaml.v3"
 
+	"einoclaw-build/internal/paths"
+	"einoclaw-build/internal/permission"
 	"einoclaw-build/internal/tool"
 )
 
@@ -32,40 +34,232 @@ type modelConfig struct {
 	ContextWindow  int           `yaml:"context_window"` // 上下文窗口大小，0 用默认
 }
 
-// config 顶层配置。
-type config struct {
-	Models         []modelConfig  `yaml:"models"`
-	ApprovalMode   string         `yaml:"approval_mode"`   // always-ask/write/yolo，默认 yolo
-	MCPServers     []tool.MCPConfig `yaml:"mcp_servers"`     // 外部 MCP server（stdio）
-	DelegationMode string         `yaml:"delegation_mode"` // conservative/preferred/always，默认 preferred
+// subagentConfig 子 agent 运行时配置。
+type subagentConfig struct {
+	MaxConcurrency     int           `yaml:"max_concurrency"`
+	ApprovalEscalation bool          `yaml:"approval_escalation"` // headless 子 agent 的 Prompt 决策升级到父弹窗
+	DefaultTimeout     time.Duration `yaml:"default_timeout"`
+	DefaultMaxTurns    int           `yaml:"default_max_turns"`
+	SoftBudget         int           `yaml:"soft_budget"`         // 累计模型请求软预算上限；0 = 关闭护栏
+	MaxRecursionDepth  int           `yaml:"max_recursion_depth"` // 委派递归深度上限
+	MinTaskChars       int           `yaml:"min_task_chars"`      // 任务描述最短长度（拒绝一句话派发）
+	Background         *bool         `yaml:"background"`          // 是否允许 task background:true；默认 true
 }
 
-// loadConfig 读取项目目录下的 ./config.yaml；不存在或未填 APIKey 则提示并退出。
-func loadConfig() config {
-	data, err := os.ReadFile("config.yaml")
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			fmt.Println("未找到配置文件: ./config.yaml\n请参考项目目录下的 example.yaml 创建并填入模型配置后重试。")
-			os.Exit(0)
-		}
-		log.Fatal(err)
+// BackgroundEnabled 返回是否允许后台作业（未配置时默认允许）。
+func (s subagentConfig) BackgroundEnabled() bool { return s.Background == nil || *s.Background }
+
+// memoryConfig 记忆与召回配置。
+type memoryConfig struct {
+	Global      *bool `yaml:"global"`        // 是否启用 <Home>/memory/global.db；默认启用
+	RecallTopK  int   `yaml:"recall_top_k"`  // 每轮注入几条
+	MaxPerScope int   `yaml:"max_per_scope"` // 每个作用域的条数上限
+	ProjectMap  *bool `yaml:"project_map"`   // 会话首轮注入项目地图（P10.4）
+	ReadNotes   *bool `yaml:"read_notes"`    // read_file 命中未变更文件时用笔记顶替内容（默认关）
+}
+
+// GlobalEnabled 未配置时默认启用全局记忆库。
+func (m memoryConfig) GlobalEnabled() bool { return m.Global == nil || *m.Global }
+
+// ProjectMapEnabled 未配置时默认注入项目地图。
+func (m memoryConfig) ProjectMapEnabled() bool { return m.ProjectMap == nil || *m.ProjectMap }
+
+// ReadNotesEnabled 默认关：拿摘要冒充文件内容会让模型基于旧信息改代码。
+func (m memoryConfig) ReadNotesEnabled() bool { return m.ReadNotes != nil && *m.ReadNotes }
+
+// permissionConfig 审批规则段：tool(args*) 通配语法，见 specs/phase-11-governance-eval.md §2。
+type permissionConfig struct {
+	Allow []string `yaml:"allow"`
+	Ask   []string `yaml:"ask"`
+	Deny  []string `yaml:"deny"`
+}
+
+// bashConfig bash 运行时段。
+type bashConfig struct {
+	Timeout time.Duration `yaml:"timeout"` // 单条命令超时；默认 120s，上限 600s
+}
+
+// config 顶层配置。
+type config struct {
+	Models         []modelConfig    `yaml:"models"`
+	ApprovalMode   string           `yaml:"approval_mode"`   // always-ask/write/yolo，默认 write
+	MCPServers     []tool.MCPConfig `yaml:"mcp_servers"`     // 外部 MCP server（stdio）
+	DelegationMode string           `yaml:"delegation_mode"` // conservative/preferred/always，默认 preferred
+	Subagent       subagentConfig   `yaml:"subagent"`
+	Memory         memoryConfig     `yaml:"memory"`
+	Permissions    permissionConfig `yaml:"permissions"`
+	Bash           bashConfig       `yaml:"bash"`
+}
+
+// configPaths 返回三层配置路径（用户 → 项目 → 仓库内 legacy），后者覆盖前者。
+func configPaths(cwd string) []string {
+	var out []string
+	if p, err := paths.UserConfigPath(); err == nil {
+		out = append(out, p)
 	}
+	out = append(out, paths.ProjectConfigPath(cwd), "config.yaml")
+	return out
+}
+
+// loadConfigFrom 按顺序读取存在的文件并合并（后者覆盖前者的非零值），最后补默认值。
+func loadConfigFrom(files []string) (config, error) {
 	var cfg config
-	if err := yaml.Unmarshal(data, &cfg); err != nil {
-		log.Fatal(err)
+	found := false
+	for _, p := range files {
+		data, err := os.ReadFile(p)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				continue
+			}
+			return cfg, err
+		}
+		var layer config
+		if err := yaml.Unmarshal(data, &layer); err != nil {
+			return cfg, fmt.Errorf("%s: %w", p, err)
+		}
+		mergeConfig(&cfg, layer)
+		found = true
 	}
-	if len(cfg.Models) == 0 || cfg.Models[0].APIKey == "" {
-		fmt.Println("请在配置文件中填入模型相关配置后重试。")
-		os.Exit(0)
+	if !found || len(cfg.Models) == 0 || cfg.Models[0].APIKey == "" {
+		return cfg, errors.New("未找到模型配置：请在 ~/.codeclaw/config.yaml 或 <项目>/.codeclaw/config.yaml 填入 models（参考 example.yaml）")
 	}
+	applyDefaults(&cfg)
+	return cfg, nil
+}
+
+// mergeConfig 把 src 的非零字段覆盖进 dst；MCP servers 累加。
+func mergeConfig(dst *config, src config) {
+	if len(src.Models) > 0 {
+		dst.Models = src.Models
+	}
+	if src.ApprovalMode != "" {
+		dst.ApprovalMode = src.ApprovalMode
+	}
+	if len(src.MCPServers) > 0 {
+		dst.MCPServers = append(dst.MCPServers, src.MCPServers...)
+	}
+	if src.DelegationMode != "" {
+		dst.DelegationMode = src.DelegationMode
+	}
+	if src.Subagent.MaxConcurrency != 0 {
+		dst.Subagent.MaxConcurrency = src.Subagent.MaxConcurrency
+	}
+	if src.Subagent.ApprovalEscalation {
+		dst.Subagent.ApprovalEscalation = true
+	}
+	if src.Subagent.DefaultTimeout != 0 {
+		dst.Subagent.DefaultTimeout = src.Subagent.DefaultTimeout
+	}
+	if src.Subagent.DefaultMaxTurns != 0 {
+		dst.Subagent.DefaultMaxTurns = src.Subagent.DefaultMaxTurns
+	}
+	if src.Subagent.SoftBudget != 0 {
+		dst.Subagent.SoftBudget = src.Subagent.SoftBudget
+	}
+	if src.Subagent.MaxRecursionDepth != 0 {
+		dst.Subagent.MaxRecursionDepth = src.Subagent.MaxRecursionDepth
+	}
+	if src.Subagent.MinTaskChars != 0 {
+		dst.Subagent.MinTaskChars = src.Subagent.MinTaskChars
+	}
+	if src.Subagent.Background != nil {
+		dst.Subagent.Background = src.Subagent.Background
+	}
+	if src.Memory.Global != nil {
+		dst.Memory.Global = src.Memory.Global
+	}
+	if src.Memory.RecallTopK != 0 {
+		dst.Memory.RecallTopK = src.Memory.RecallTopK
+	}
+	if src.Memory.MaxPerScope != 0 {
+		dst.Memory.MaxPerScope = src.Memory.MaxPerScope
+	}
+	if src.Memory.ProjectMap != nil {
+		dst.Memory.ProjectMap = src.Memory.ProjectMap
+	}
+	if src.Memory.ReadNotes != nil {
+		dst.Memory.ReadNotes = src.Memory.ReadNotes
+	}
+	// 权限规则是列表级合并（后层追加）——用户 deny 不会被项目 allow 顶掉
+	dst.Permissions.Allow = append(dst.Permissions.Allow, src.Permissions.Allow...)
+	dst.Permissions.Ask = append(dst.Permissions.Ask, src.Permissions.Ask...)
+	dst.Permissions.Deny = append(dst.Permissions.Deny, src.Permissions.Deny...)
+	if src.Bash.Timeout != 0 {
+		dst.Bash.Timeout = src.Bash.Timeout
+	}
+}
+
+// applyDefaults 补默认值：approval_mode=write、delegation_mode=preferred、窗口 128k、子 agent 并发 4 / 超时 10m / 50 轮。
+func applyDefaults(cfg *config) {
 	if cfg.Models[0].ContextWindow == 0 {
 		cfg.Models[0].ContextWindow = 128000
 	}
 	if cfg.ApprovalMode == "" {
-		cfg.ApprovalMode = "yolo"
+		cfg.ApprovalMode = "write"
 	}
 	if cfg.DelegationMode == "" {
 		cfg.DelegationMode = "preferred"
+	}
+	if cfg.Subagent.MaxConcurrency == 0 {
+		cfg.Subagent.MaxConcurrency = 4
+	}
+	if cfg.Subagent.DefaultTimeout == 0 {
+		cfg.Subagent.DefaultTimeout = 10 * time.Minute
+	}
+	if cfg.Subagent.DefaultMaxTurns == 0 {
+		cfg.Subagent.DefaultMaxTurns = 50
+	}
+	if cfg.Subagent.SoftBudget == 0 {
+		cfg.Subagent.SoftBudget = 200
+	}
+	if cfg.Subagent.MaxRecursionDepth == 0 {
+		cfg.Subagent.MaxRecursionDepth = 2
+	}
+	if cfg.Subagent.MinTaskChars == 0 {
+		cfg.Subagent.MinTaskChars = 40
+	}
+	if cfg.Memory.RecallTopK == 0 {
+		cfg.Memory.RecallTopK = 5
+	}
+	if cfg.Memory.MaxPerScope == 0 {
+		cfg.Memory.MaxPerScope = 500
+	}
+	if cfg.Bash.Timeout == 0 {
+		cfg.Bash.Timeout = 120 * time.Second
+	}
+	if cfg.Bash.Timeout > 600*time.Second {
+		cfg.Bash.Timeout = 600 * time.Second
+	}
+}
+
+// parseRules 把配置原文解析成规则集；坏条目不致命（告警跳过）。
+func (c config) parseRules() (permission.Rules, []error) {
+	var out permission.Rules
+	var errs []error
+	parse := func(raws []string) []permission.Rule {
+		var rules []permission.Rule
+		for _, raw := range raws {
+			r, err := permission.ParseRule(raw)
+			if err != nil {
+				errs = append(errs, fmt.Errorf("permissions: %w", err))
+				continue
+			}
+			rules = append(rules, r)
+		}
+		return rules
+	}
+	out.Allow = parse(c.Permissions.Allow)
+	out.Ask = parse(c.Permissions.Ask)
+	out.Deny = parse(c.Permissions.Deny)
+	return out, errs
+}
+
+// loadConfig 读取三层配置；失败则打印原因退出。
+func loadConfig(cwd string) config {
+	cfg, err := loadConfigFrom(configPaths(cwd))
+	if err != nil {
+		fmt.Println(err)
+		os.Exit(1)
 	}
 	return cfg
 }

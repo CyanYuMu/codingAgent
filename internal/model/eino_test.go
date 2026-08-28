@@ -44,10 +44,10 @@ func TestToAgenticMessagesSystemUser(t *testing.T) {
 
 func TestFromSchemaUsage(t *testing.T) {
 	u := fromSchemaUsage(&schema.TokenUsage{
-		PromptTokens:          10,
-		CompletionTokens:      5,
-		TotalTokens:           15,
-		PromptTokenDetails:    schema.PromptTokenDetails{CachedTokens: 3},
+		PromptTokens:            10,
+		CompletionTokens:        5,
+		TotalTokens:             15,
+		PromptTokenDetails:      schema.PromptTokenDetails{CachedTokens: 3},
 		CompletionTokensDetails: schema.CompletionTokensDetails{ReasoningTokens: 2},
 	})
 	if u.PromptTokens != 10 || u.CompletionTokens != 5 || u.TotalTokens != 15 ||
@@ -90,13 +90,17 @@ func TestToAgenticMessagesAssistantAndTool(t *testing.T) {
 	if out[0].Role != schema.AgenticRoleTypeAssistant {
 		t.Fatalf("out[0].Role = %v, want assistant", out[0].Role)
 	}
-	if !hasBlock(out[0], func(b *schema.ContentBlock) bool { return b.FunctionToolCall != nil && b.FunctionToolCall.Name == "bash" }) {
+	if !hasBlock(out[0], func(b *schema.ContentBlock) bool {
+		return b.FunctionToolCall != nil && b.FunctionToolCall.Name == "bash"
+	}) {
 		t.Fatal("assistant 应含 bash 工具调用块")
 	}
 	if out[1].Role != schema.AgenticRoleTypeUser {
 		t.Fatalf("out[1].Role = %v, want user", out[1].Role)
 	}
-	if !hasBlock(out[1], func(b *schema.ContentBlock) bool { return b.FunctionToolResult != nil && b.FunctionToolResult.Name == "bash" }) {
+	if !hasBlock(out[1], func(b *schema.ContentBlock) bool {
+		return b.FunctionToolResult != nil && b.FunctionToolResult.Name == "bash"
+	}) {
 		t.Fatal("tool 消息应含 bash 工具结果块")
 	}
 }

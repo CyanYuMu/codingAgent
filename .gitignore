@@ -16,3 +16,6 @@ sessions/
 
 # 记忆库（运行时产物）
 memory.db
+
+# 本地 Go 构建缓存（沙箱下工作区内构建用）
+/.gocache/

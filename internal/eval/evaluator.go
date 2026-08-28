@@ -8,11 +8,13 @@ import (
 	"strings"
 
 	"einoclaw-build/internal/agent"
+	agentctx "einoclaw-build/internal/context"
 	"einoclaw-build/internal/memory"
 	"einoclaw-build/internal/message"
 	"einoclaw-build/internal/model"
 	"einoclaw-build/internal/permission"
 	"einoclaw-build/internal/runtime"
+	"einoclaw-build/internal/session"
 	"einoclaw-build/internal/tool"
 )
 
@@ -58,17 +60,43 @@ func Run(ctx context.Context, fx Fixture, m model.Model, mem memory.Recaller) Re
 		}
 	}
 
-	bash := runtime.NewBash(".")
+	bash := runtime.NewBash(workdir)
+	store := runtime.NewArtifactStore(filepath.Join(workdir, ".artifacts"))
 	registry := tool.NewRegistry()
-	for _, t := range tool.Builtins(bash) {
+	for _, t := range tool.Builtins(bash, store) {
 		registry.Register(t)
 	}
-	ag := agent.New(fx.Name, evalInstruction, m, registry, permission.ModeYolo, nil, mem)
+	exec := tool.NewExecutor(registry, permission.ModeYolo, nil)
+	exec.SetArtifactStore(store)
+	sess, err := session.New(fx.Name, &session.MemoryStorage{})
+	if err != nil {
+		return Result{Name: fx.Name, Pass: false, Detail: err.Error()}
+	}
+	system := func(ctx context.Context) []message.Message {
+		msgs := []message.Message{message.NewSystemMessage(evalInstruction)}
+		if mem != nil {
+			if mems, err := mem.Recall(fx.Prompt, 5); err == nil && len(mems) > 0 {
+				var sb strings.Builder
+				sb.WriteString("<memories>\n")
+				for _, mm := range mems {
+					sb.WriteString("- " + mm.Content + "\n")
+				}
+				sb.WriteString("</memories>")
+				msgs = append(msgs, message.NewSystemMessage(sb.String()))
+			}
+		}
+		return msgs
+	}
+	cc := agentctx.New(sess, nil, 128000, 16384, system)
+	_ = cc.Record(message.NewUserMessage(fx.Prompt), model.Usage{})
+	ag := agent.New(fx.Name, m, registry, exec, cc)
 
 	var text string
-	for ev := range ag.Run(ctx, []message.Message{message.NewUserMessage(fx.Prompt)}) {
+	for ev := range ag.Run(ctx, nil) {
 		if ev.Type == agent.EventMessageEnd {
-			text = textOf(ev.Ended.Message)
+			if t := textOf(ev.Ended.Message); t != "" {
+				text = t
+			}
 		}
 	}
 

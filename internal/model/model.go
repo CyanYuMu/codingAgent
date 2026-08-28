@@ -12,7 +12,8 @@ import (
 type ToolSpec struct {
 	Name        string
 	Description string
-	Parameters  map[string]any // JSON Schema 的 properties 部分
+	Parameters  map[string]any // JSON Schema properties（可含嵌套 items/properties/enum/description）
+	Required    []string       // 必填参数名
 }
 
 // Usage 一次模型调用的 token 用量（provider 真值，P3 记账基石）。
@@ -22,6 +23,16 @@ type Usage struct {
 	TotalTokens      int
 	ReasoningTokens  int // 思考/推理 token
 	CachedTokens     int // 提示词缓存命中
+}
+
+// Add 返回两次用量之和。
+func (u Usage) Add(o Usage) Usage {
+	u.PromptTokens += o.PromptTokens
+	u.CompletionTokens += o.CompletionTokens
+	u.TotalTokens += o.TotalTokens
+	u.ReasoningTokens += o.ReasoningTokens
+	u.CachedTokens += o.CachedTokens
+	return u
 }
 
 // ToolCallDelta 流式下工具调用的一个增量片段。
@@ -41,7 +52,14 @@ type ModelEvent struct {
 	ToolCalls []ToolCallDelta
 }
 
-// Stream 是一次流式调用的事件流。Recv 直到 io.EOF。
+// ModelStream 是一次流式调用的事件流：Recv 直到 io.EOF。*Stream 实现它；测试可注入 fake。
+type ModelStream interface {
+	Recv() (ModelEvent, error)
+	Usage() Usage
+	Close()
+}
+
+// Stream 是 eino reader 之上的 ModelStream 实现。
 type Stream struct {
 	reader *schema.StreamReader[*schema.AgenticMessage]
 	usage  Usage
@@ -52,7 +70,7 @@ func (s *Stream) Usage() Usage { return s.usage }
 
 // Model 是模型客户端抽象 —— 唯一的 eino 依赖点。
 type Model interface {
-	Stream(ctx context.Context, msgs []message.Message, tools []ToolSpec) (*Stream, error)
+	Stream(ctx context.Context, msgs []message.Message, tools []ToolSpec) (ModelStream, error)
 }
 
 // Config 描述要构建的模型。

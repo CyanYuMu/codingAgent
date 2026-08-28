@@ -45,7 +45,7 @@ func main() {
 		log.Fatal(err)
 	}
 
-	mem, _ := memory.Open("/tmp/einoclaw-eval-memory.db")
+	mem, _ := memory.Open("/tmp/einoclaw-eval-memory.db", memory.ScopeProject, "eval")
 	if mem != nil {
 		defer mem.Close()
 	}

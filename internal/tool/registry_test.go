@@ -42,3 +42,22 @@ func TestRegistrySpecs(t *testing.T) {
 		t.Fatalf("specs = %+v", specs)
 	}
 }
+
+// convFakeTool 一个带会话级状态的可数工具。
+type convFakeTool struct {
+	fakeTool
+	resets *int
+}
+
+func (c convFakeTool) ResetConv() { *c.resets++ }
+
+func TestRegistryResetConv(t *testing.T) {
+	n := 0
+	r := NewRegistry()
+	r.Register(convFakeTool{fakeTool: fakeTool{name: "stateful"}, resets: &n})
+	r.Register(fakeTool{name: "plain"})
+	r.ResetConv()
+	if n != 1 {
+		t.Fatalf("ResetConv 应恰好触达带状态的工具，got %d", n)
+	}
+}
