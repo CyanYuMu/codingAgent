@@ -63,6 +63,7 @@ P0 地基 → P1 Agent Loop → P2 Session → P3 Context → P4 工具运行时
 | 扩展 | 多会话/滚动/steering | /new /resume /forget + 鼠标 + Ctrl+E | ✅ |
 | P8（M1） | 地基修正 | 项目作用域数据目录 + Session v2 + 压缩正确性 + 子 agent 运行时修正 + headless `-p` | ✅ |
 | P9（M2） | 委派运行时 | frontmatter agent + TaskBatch 预检 + yield 三态 + 提醒/预算 + Agent Hub + 后台作业 + hub 邮箱 | ✅ |
+| P10（M3） | 记忆与上下文 | FTS 清洗 + 记忆 v2 + 双库召回 + 前缀缓存 + L1 项目层 + 剪枝阶梯 + 项目知识 + read 去重 | ✅ |
 
 ---
 
@@ -293,6 +294,57 @@ P0 地基 → P1 Agent Loop → P2 Session → P3 Context → P4 工具运行时
 
 ---
 
+## 3.10 P10（M3）记忆与上下文
+
+> spec `docs/specs/phase-10-memory-context.md`，plan `docs/plans/2026-08-24-phase-10-memory-context.md`。
+> 目标：修掉「记忆召回静默失败」这个 crit、让提示词前缀在会话内稳定（prompt cache 不再每轮失效）、给上下文收缩加一级零成本手段（剪枝）、把项目知识沉淀成跨会话可复用的项目地图。
+
+### P10.1 记忆正确性
+
+| 机制 | 做法 |
+|---|---|
+| FTS 清洗 | 问句永不直传 `MATCH`：分词 → 丢弃 <3 字符词 → CJK 3 字滑窗 → 双引号包裹（内部 `"` 转义 `""`）→ OR 连接 ≤24 项；无可洗词走 importance×recency 兜底召回（不再静默失败） |
+| Schema v2 + 迁移 | `memories`（scope/project_id/kind/key/why/veracity/importance/访问计数/superseded_by）+ FTS5 trigram；旧 `working_memory` 一次性幂等搬运、旧表保留 |
+| 写入 | 有 key → upsert（保留 created_at/access_count）；无 key → trigram Jaccard ≥0.85 判近重复更新而非新增；密钥模式整条拒写；>2000 字符截断；每 scope 上限淘汰最低分 |
+| 召回打分 | `0.45·fts + 0.2·importance + 0.15·recency + 0.1·log1p(access) + 0.1·scopeBoost` × veracity；召回后批量回写访问计数 |
+| 双库 | 项目库 + 全局库经 `Union` 合并、按 content 去重、项目库 scopeBoost 靠前；`remember` 支持 scope、新增 `forget`（失效不删行） |
+
+### P10.2 注入位置与项目指令层
+
+| 机制 | 做法 |
+|---|---|
+| 前缀缓存 | `context.Manager` 缓存 system 前缀：只在会话首轮、压缩后、切会话时重算——连续 10 轮前缀字节一致，prompt cache 存活 |
+| L1 项目层 | `internal/instructions`：用户级 AGENTS.md → git 根到 cwd 逐级（同级 AGENTS.md 优先于 CLAUDE.md，祖先先近者后）；`@import` 展开（相对导入者目录、`~` 展开、≤5 跳、防环、代码块与 git@/邮箱豁免、缺失原样保留）；`RULES.md` 同链收集、粘性渲染在块尾 |
+| 注入顺序 | `[基础指令] [项目指令] [<memories>] [<project-map>] [<sticky-rules>]`；召回查询用最近 3 个用户 turn（`BuildRecallQuery`） |
+
+### P10.3 上下文治理
+
+| 机制 | 做法 |
+|---|---|
+| 剪枝纯函数 | `PlanPrune`/`ApplyPrune`：保护最近 40k token、单条 <50 token 不剪、至少省 20k 才动手；占位 `[输出已省略：约 N tokens]` 保留 `artifact://` 指针、永不拆 tool 配对、幂等（占位不再是候选） |
+| 落盘与回放 | 剪枝边界落 `prune` 自定义条目（`{beforeEntryID, savings}`）；`Replay()` 回放期应用占位——JSONL 审计完整、前缀单调不 churn |
+| 压缩阶梯 | `Compact` 先剪后摘：剪得够就返回 `prune`（零模型调用），剪无可剪才调摘要器；溢出恢复同阶梯 |
+| `<files>` 树 | 摘要附文件活动树（Read/Write/RW、目录分组、上限 20）；压缩后追加 `<recent-files>` + auto-continue 用户消息 |
+
+### P10.4 项目知识
+
+| 机制 | 做法 |
+|---|---|
+| file_notes | `file_notes` 表（path/summary/symbols/mtime/size/hit_count）；explorer 子 agent 结构化产出（`files:[{path, role}]`）在结算时确定性 upsert，无需额外模型调用 |
+| 项目地图 | 会话首轮注入 `<project-map>`（按目录分组、hit_count 排序、预算 1.5k token）；mtime/size 变了标「(可能已过时)」 |
+| read 会话内去重 | `read_file` 记录 `path → {mtime+size 指纹, 已读行区间并集}`：未变更且区间已覆盖 → 返回「文件未变更（上次读过第 a–b 行），内容仍在上文中」；会话内 URL 不去重；`Registry.ResetConv()` 在 `/new` `/resume` `/clear` 时清空（`reset_boundary` 封存后旧上下文不再成立） |
+
+### 实测与验收
+
+- FTS：含 `?`/引号/括号的问句可召回；「构建命令」类问句在另一个项目里只召回 global 条（分库隔离）。
+- 前缀：单测钉住「10 次 Build 前缀一致、system() 只算一次」。
+- 剪枝：`TestMidTurnCompactionLadderSmoke`（真 session + 真 Manager + 脚本化模型）——阶梯 `[mid-turn:prune, mid-turn:summary]` 各一次、落盘 prune/compaction 条目、回放收缩且 tool 配对完整。
+- read 去重：`TestReadFileDedupSmoke`（真循环 + 真 Builtins + 脚本化模型）——同一文件第二次 `read_file` 结果含「未变更」而非全文，且循环正常收尾；工具包 `-race` 全绿。
+
+**学到**：记忆召回这类「静默失败」只有把错误显式上报 + 用纯函数把查询清洗与打分拆开，才能用单测钉住；「先剪后摘」把压缩拆成零模型调用的阶梯，能在不牺牲正确性的前提下大幅降低长会话成本；会话级状态（read 记录）的生命周期必须显式挂在会话边界（/new /resume /clear）上，否则「内容仍在上文中」会变成谎话。
+
+---
+
 ## 4. 过程中发现并修复的 bug（17 个）
 
 ### 工具循环相关的 3 个（P4 埋坑，实测踩出）
@@ -331,16 +383,19 @@ einoclaw-build/
 │   ├── message/      # 共享消息类型（零依赖）
 │   ├── model/        # 【唯一 import eino 的包】模型客户端
 │   ├── agent/        # 事件驱动循环 + AgentEvent + 累积器
-│   ├── session/      # JSONL 会话 + Manager（多会话）
-│   ├── context/      # 预算 + 六字段压缩
-│   ├── memory/       # SQLite + FTS5 多信号召回
+│   ├── session/      # JSONL 会话 v2（树/分支/回放）+ Manager（多会话）
+│   ├── context/      # 预算 + 六字段压缩 + 剪枝阶梯 + system 前缀缓存
+│   ├── memory/       # SQLite v2 + FTS5 清洗召回 + file_notes
+│   ├── instructions/ # L1 项目指令层（层级 + @import + RULES 粘性）
 │   ├── tool/         # Tool 接口 + Registry + 执行器 + MCP
-│   ├── runtime/      # OutputSink + bash 子进程 + env 硬化
+│   ├── runtime/      # OutputSink + ArtifactStore + bash 子进程 + env 硬化
 │   ├── permission/   # 审批纯策略
-│   ├── subagent/     # 子 agent 派发 + yield + 状态机
+│   ├── subagent/     # 子 agent 派发 + yield + 状态机 + hub 邮箱 + 名册
+│   ├── bus/          # EventBus（观测通道，真相源仍是 JSONL）
+│   ├── paths/        # 数据根目录 + 项目桶 + 配置分层
 │   ├── trace/        # JSONL 聚合统计
 │   ├── eval/         # 夹具 + 字节 verify
-│   └── tui/          # BubbleTea TUI + 渲染 + 审批弹窗
+│   └── tui/          # BubbleTea TUI + 渲染 + 审批弹窗 + Agent Hub
 ├── docs/
 │   ├── specs/        # 各阶段设计文档 + 总 spec + multi-agent spec
 │   └── plans/        # 各阶段实现计划
@@ -353,10 +408,11 @@ einoclaw-build/
 
 ## 6. 待办 / Stretch（未做，按需后置）
 
-- **P6-L3 通信+隔离**：mailbox bus、worktree 隔离、session 持久化（多轮子 agent）、审计 hook。
-- **P3 stretch**：响应式溢出恢复 + retry 双通道、多级摘要方法、snapcompact 成像。
-- **P5 stretch**：episodic 巩固（sleep）、向量嵌入检索、Weibull 衰减、多声部 recall、auto-retain。
-- **P6 stretch**：markdown frontmatter 声明、完整 spawn policy、run monitor（软预算）、MCP http/sse。
+- **M4 治理与闭环（下一阶段，演进方案 §E/§F）**：审批规则引擎（allow/ask/deny）+ `Approval(args)` + bash 危险命令分类器 + 进程组/超时 + env 脱敏；`edit` 工具（read-before-edit + mtime 检查）；shell hooks；trace 派生索引 + `codeclaw stats/trace`；eval v2（并行 + pass@k + 不 os.Chdir）；fake model 回归套件扩展。可选 worktree 隔离。
+- **P6-L3 通信+隔离**：worktree 隔离、审计 hook（mailbox bus 已在 P9 落地）。
+- **P3 stretch**：多级摘要方法、snapcompact 成像（溢出恢复 + retry 双通道已在 P8 落地）。
+- **P5 stretch**：episodic 巩固（sleep）、向量嵌入检索、Weibull 衰减、auto-retain（FTS 清洗/去重/失效已在 P10 落地）。
+- **P6 stretch**：MCP http/sse（frontmatter 声明、spawn policy、软预算已在 P9 落地）。
 - **hardening**：TUI 退出时序、Session.Close 加锁、error 包装 `%w`/哨兵错误、goroutine 入口 recover。
 - **收尾**：状态栏、banner、斜杠命令框架、token 用量显示。
 

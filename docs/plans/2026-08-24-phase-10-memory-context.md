@@ -289,14 +289,14 @@
 
 **Files:** Modify `internal/tool/tools.go`；Test `internal/tool/`
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
   - `TestReadFileDedupesUnchanged`：连读两次同一文件 → 第二次返回"未变更（上次读过第 a–b 行）"。
   - `TestReadFileRereadsAfterChange`：改动文件后再读 → 返回真实内容。
   - `TestReadFileDifferentRangeStillReads`：请求未读过的区间 → 正常读。
 
-- [ ] **Step 2: 实现**（`readFileTool` 持一个带锁的 `map[string]readRecord`，随工具实例生命周期 = 会话/Run 级）
-- [ ] **Step 3: 验证** `go test ./internal/tool/ -race`
-- [ ] **Step 4: 提交** `feat: P10.4 项目知识（file_notes + 项目地图 + read 会话内去重）`
+- [x] **Step 2: 实现**（`readFileTool` 持一个带锁的 `map[string]readRecord`，随工具实例生命周期 = 会话/Run 级）
+- [x] **Step 3: 验证** `go test ./internal/tool/ -race`
+- [x] **Step 4: 提交** `feat: P10.4 项目知识（file_notes + 项目地图 + read 会话内去重）`
 
 ---
 
