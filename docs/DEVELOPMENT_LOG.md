@@ -64,6 +64,7 @@ P0 地基 → P1 Agent Loop → P2 Session → P3 Context → P4 工具运行时
 | P8（M1） | 地基修正 | 项目作用域数据目录 + Session v2 + 压缩正确性 + 子 agent 运行时修正 + headless `-p` | ✅ |
 | P9（M2） | 委派运行时 | frontmatter agent + TaskBatch 预检 + yield 三态 + 提醒/预算 + Agent Hub + 后台作业 + hub 邮箱 | ✅ |
 | P10（M3） | 记忆与上下文 | FTS 清洗 + 记忆 v2 + 双库召回 + 前缀缓存 + L1 项目层 + 剪枝阶梯 + 项目知识 + read 去重 | ✅ |
+| P11（M4） | 治理与闭环 | 审批规则引擎 + bash 分类/超时/进程组 + edit + hooks + trace/stats + eval v2 | 🚧 P11.1 完成 |
 
 ---
 
@@ -342,6 +343,36 @@ P0 地基 → P1 Agent Loop → P2 Session → P3 Context → P4 工具运行时
 - read 去重：`TestReadFileDedupSmoke`（真循环 + 真 Builtins + 脚本化模型）——同一文件第二次 `read_file` 结果含「未变更」而非全文，且循环正常收尾；工具包 `-race` 全绿。
 
 **学到**：记忆召回这类「静默失败」只有把错误显式上报 + 用纯函数把查询清洗与打分拆开，才能用单测钉住；「先剪后摘」把压缩拆成零模型调用的阶梯，能在不牺牲正确性的前提下大幅降低长会话成本；会话级状态（read 记录）的生命周期必须显式挂在会话边界（/new /resume /clear）上，否则「内容仍在上文中」会变成谎话。
+
+---
+
+## 3.11 P11（M4）治理与闭环 · P11.1 审批与 bash 安全
+
+> spec `docs/specs/phase-11-governance-eval.md`，plan `docs/plans/2026-08-28-phase-11-governance-eval.md`。
+> 目标：审批从「tier×mode 两档」升级成**规则可写的决策引擎**；bash 从「全量环境 + 无超时 + 只杀直接子进程」升级成
+> **分类 + 超时 + 进程组回收 + env 脱敏**。P11.2（edit）/P11.3（hooks）/P11.4（trace/stats）/P11.5（eval v2）后续跟进。
+
+### 已落地机制
+
+| 机制 | 做法 |
+|---|---|
+| 规则引擎 | `permission.{Rule,ParseRule,Match,ResolveRules}` 纯函数：`tool(args*)` 通配语法；五步决策（工具 deny → 用户 deny → yolo 忽略裸 Override → 非 yolo Override 强制询问 → 工具显式 policy → 用户规则 → tier×mode）。**回归不变量**：空规则 + 无自检时与旧 `Resolve(tier, mode)` 逐字节等价 |
+| Decisioner 接口 | 工具可选实现 `Decision(args) ToolDecision`：bash 按命令内容分类（只读→read tier、危险→Override 强制 prompt、其余→exec）；Executor 按 `ResolveRules` 走 allow/deny/prompt 三路，决策原因进结果文本 |
+| 「本会话允许」 | TUI 弹窗三态（y 允许 / a 本会话允许 / n 拒绝）；`Executor.AllowSession` 只跳过 tier×mode 与 ask 规则产生的 prompt——危险 Override 与 deny 规则不受豁免 |
+| bash 分类器 | `runtime.Classify` 纯函数：按 `\|`/`&&`/`;` 切段，逐段保守判定；只读白名单（含 git status/log/diff、go build/test/vet、gofmt -l 等子命令特判）；危险模式（rm -rf、sudo、mkfs、dd of=/、curl\|sh、git reset --hard/clean -fdx/push --force、fork bomb、chmod -R /、kill -9 -1、重定向写 /etc|/dev|/usr 等）；未知命令回落 exec（询问而非放行） |
+| 超时与进程组 | `WithTimeout`（默认 120s，可配 ≤600s）+ `Setpgid` + 取消时 SIGTERM 进程组、5s 后 SIGKILL 补刀；超时返回明确错误；管道与后台孙进程一起回收 |
+| env 脱敏 | `SanitizeEnv`：继承全部环境但剔除密钥类（`*API_KEY*`/`*TOKEN*`/`*SECRET*`/`*PASSWORD*`/`*CREDENTIAL*` 等，大小写不敏感） |
+| 配置 | `permissions.{allow,ask,deny}`（三层配置**列表追加**，用户 deny 不被项目顶掉）+ `bash.timeout`；坏规则条目只告警跳过；子 agent 继承父的规则 |
+
+### 实测
+
+- 决策表：deny 在 yolo 下也拒、Override 在 yolo 被忽略而在 write 强制询问、allow 压过 tier×mode、空规则等价旧行为——`internal/permission` 13 个用例钉住。
+- 分类样例集：40+ 命令（只读/危险/不判定三组 + 分段组合 + `> /dev/null` 豁免 + `--force-with-lease` 不误伤）。
+- 进程组：`sleep 100` 300ms 超时 → 进程组无残留（kill -0 确认 ESRCH）。
+- 全链路冒烟（脚本化模型）：`git status` 免审批执行、`rm -rf` 被拒且原因可见、deny 规则在 yolo 下拦截。
+- 真实模型 headless：`git status --short` 免审批执行（第二次调用 cached=2304，前缀缓存命中）；`rm -rf /tmp/x` 被分类器拦下，模型正确报告未执行。
+
+**学到**：审批的正确抽象是「工具自检 + 用户规则 + 模式」三层合议的纯函数，而不是工具上钉死一个危险等级——`echo` 只读但 `echo x > /etc/passwd` 危险，只有按调用判定才拦得住；安全默认的保守方向要明确：「漏判危险是事故，误判只读只是多一次审批」，所以不认识的命令一律回落询问。
 
 ---
 
