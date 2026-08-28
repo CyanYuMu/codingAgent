@@ -223,6 +223,10 @@ func (m *Manager) compact(ctx context.Context, keep int) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	// <files> 树附在摘要后一起落盘：被压缩段里确定性的文件活动事实（摘要的「文件/产物」字段只是转述）
+	if tree := FileOpsTree(msgs[:cut], filesTreeLimit); tree != "" {
+		summary += "\n\n" + tree
+	}
 	firstKept, err := m.entryIDOfMessageIndex(cut)
 	if err != nil {
 		return "", err
@@ -233,6 +237,14 @@ func (m *Manager) compact(ctx context.Context, keep int) (string, error) {
 	}
 	if err := sess.Compact(summary, firstKept, before); err != nil {
 		return "", err
+	}
+	// 压缩后恢复：旧上下文里的文件内容已进摘要，提醒继续任务并给出最近文件清单
+	// （Claude Code 行为：压缩后模型第一步常常是重读文件，这里把路标先给足）。
+	if rf := recentFilesText(msgs, recentFilesMax); rf != "" {
+		if err := sess.Append(message.NewUserMessage(
+			"[上下文已压缩] 继续当前任务。最近涉及的文件：\n" + rf + "\n（需要内容就用 read_file 重新读）")); err != nil {
+			return "", err
+		}
 	}
 	m.InvalidateSystem() // 压缩后重贴记忆与粘性规则：这是前缀允许变化的少数时刻之一
 	return compactSummary, nil

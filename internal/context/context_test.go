@@ -196,8 +196,8 @@ func TestSmallWindowStillCompacts(t *testing.T) {
 		t.Fatalf("small window must compact: method=%q err=%v", method, err)
 	}
 	msgs, _ := cm.Build(context.Background())
-	if len(msgs) >= 12 || msgs[0].Blocks[0].Text != "S" {
-		t.Fatalf("build = %d msgs", len(msgs))
+	if len(msgs) >= 12 || !strings.HasPrefix(msgs[0].Blocks[0].Text, "S") {
+		t.Fatalf("build = %d msgs: %q", len(msgs), msgs[0].Blocks[0].Text)
 	}
 	// 保留段仍以 user 开头（tool 对完整）
 	if msgs[1].Role != message.RoleUser {

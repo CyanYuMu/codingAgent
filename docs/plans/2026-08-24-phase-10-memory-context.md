@@ -253,13 +253,15 @@
 
 **Files:** Modify `internal/context/{compaction,manager}.go`；Test `internal/context/`
 
-- [ ] **Step 1: 写失败测试**
-  - `TestFileOpsTree`：read/write/edit 混合 → `(Read)`/`(Write)`/`(RW)` 标记正确、上限 20、超出有省略行。
+- [x] **Step 1: 写失败测试**
+  - `TestFileOpsTree`：read/write 混合 → `(Read)`/`(Write)`/`(RW)` 标记正确、目录分组、上限 20、超出有省略行、会话内 URL 不进树。
   - `TestSummaryIncludesFilesTag`：摘要文本里有 `<files>`。
   - `TestPostCompactionRecentFiles`：压缩后会话里多出一条含 `<recent-files>` 的用户消息。
 
-- [ ] **Step 2: 实现** · [ ] **Step 3: 验证** · [ ] **Step 4: 冒烟**（小窗口 + 多次大工具输出，观察 `[compaction: prune]` 先于 `[compaction: threshold]`）
-- [ ] **Step 5: 提交** `feat: P10.3 上下文治理（剪枝阶梯 + <files> + 压缩后恢复）`
+- [x] **Step 2: 实现**：`internal/context/files.go`（文件活动收集 + 树渲染纯函数）；摘要附 `<files>` 树落盘；压缩后追加 `<recent-files>` 恢复消息。
+- [x] **Step 3: 验证** `go test ./internal/context/`
+- [x] **Step 4: 冒烟**：`TestMidTurnCompactionLadderSmoke`（agent 包全链路：真 session + 真 Manager + 真 循环 + 脚本化模型）——压缩阶梯 `[mid-turn:prune, mid-turn:summary]` 各一次、用量回落后不再压缩、落盘 prune/compaction 条目、回放收缩且 tool 配对完整。无真实 API 不可用，按演进方案 F.3 用脚本化模型验证 harness 行为。
+- [x] **Step 5: 提交** `feat: P10.3 上下文治理（剪枝阶梯 + <files> + 压缩后恢复）`
 
 ---
 
