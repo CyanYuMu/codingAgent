@@ -273,12 +273,15 @@
 
 **Interfaces:** `Store.UpsertNote(path, summary, symbols string) error`、`Store.ProjectMap(budget int) string`
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
   - `TestUpsertNoteAndMap`：写 3 条笔记 → `ProjectMap` 按目录分组、预算内截断。
-  - `TestProjectMapMarksStale`：文件 mtime 变了 → 该行带"(可能已过时)"。
-  - `TestExplorerOutputUpsertsNotes`：驱动器结算时把 `files:[{path, role}]` 写进笔记（用假 Store 断言）。
+  - `TestProjectMapMarksStale`：文件 mtime/size 变了 → 该行带"(可能已过时)"；重新沉淀后恢复。
+  - `TestExplorerOutputUpsertsNotes`：驱动器结算时把 `files:[{path, role}]` 写进笔记（假 Store 断言）；`TestNonExplorerOutputDoesNotUpsert`（无 files 字段不沉淀）。
+  - `TestExplorerNotesFlowToProjectMap`：端到端——explorer 运行 → 真实 Store 沉淀 → 项目地图可见（验收「第二个会话有项目地图」的数据通路）。
+  - 附加：`TestUpsertNoteOverwritesAndKeepsSymbols`（summary 覆盖、symbols 非空不丢）、`TestProjectMapEmpty`、`TestProjectMapBudgetTruncates`。
 
-- [ ] **Step 2: 实现** · [ ] **Step 3: 验证**
+- [x] **Step 2: 实现**：`memory/notes.go`（file_notes 表 + `UpsertNote`/`NoteHit`/`ProjectMap` + 分组渲染纯函数）；`subagent.Options.Notes`（NoteSink 接口）在 settle 时确定性 upsert；`main.go` 注入 `<project-map>`（预算 1.5k，跟随前缀缓存）。
+- [x] **Step 3: 验证** `go test ./internal/memory/ ./internal/subagent/`
 
 ---
 

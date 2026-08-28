@@ -85,6 +85,10 @@ func envBlock(cwd string) string {
 	return sb.String()
 }
 
+// projectMapBudget 项目地图的注入预算（估算 token）：给模型一张「哪个文件管什么」的地图，
+// 新会话不用从零 explore。
+const projectMapBudget = 1500
+
 // renderMemories 把召回的记忆渲染成 <memories> 背景块。
 func renderMemories(mems []memory.Memory) string {
 	var sb strings.Builder
@@ -230,6 +234,11 @@ func main() {
 		}
 	}
 	recaller := memory.Union(mem, globalMem)
+	// 项目笔记沉淀：explorer 类子 agent 结算时确定性 upsert（summary = role）
+	var notes subagent.NoteSink
+	if mem != nil {
+		notes = mem
+	}
 
 	sessMgr, err := session.NewManager(projectDir)
 	if err != nil {
@@ -280,6 +289,7 @@ func main() {
 		DefaultTimeout: cfg.Subagent.DefaultTimeout, DefaultMaxTurns: cfg.Subagent.DefaultMaxTurns,
 		SoftBudget: cfg.Subagent.SoftBudget, MaxDepth: cfg.Subagent.MaxRecursionDepth,
 		MinTaskChars: cfg.Subagent.MinTaskChars, AllowBackground: cfg.Subagent.BackgroundEnabled(),
+		Notes: notes,
 	})
 
 	mgr.RegisterSchemes(store) // read_file 可读 agent://<子agent名> 与 history://<子agent名>
@@ -329,6 +339,12 @@ func main() {
 		}
 		if len(mems) > 0 {
 			msgs = append(msgs, message.NewSystemMessage(renderMemories(mems)))
+		}
+		// 项目地图：file_notes 的跨会话项目知识。跟随前缀缓存，只在首轮/压缩后/换会话时刷新。
+		if cfg.Memory.ProjectMapEnabled() && mem != nil {
+			if pm := mem.ProjectMap(projectMapBudget); pm != "" {
+				msgs = append(msgs, message.NewSystemMessage(pm))
+			}
 		}
 		return msgs
 	}

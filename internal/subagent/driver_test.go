@@ -3,12 +3,14 @@ package subagent
 import (
 	"context"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"einoclaw-build/internal/bus"
+	"einoclaw-build/internal/memory"
 	"einoclaw-build/internal/message"
 	"einoclaw-build/internal/model"
 )
@@ -237,5 +239,80 @@ func TestCancelRunFromRoster(t *testing.T) {
 	r := mgr.drive(context.Background(), run, rs)
 	if r.Status != StatusKilled {
 		t.Fatalf("人工取消应标 killed：%+v", r)
+	}
+}
+
+// fakeNoteSink 记录 upsert 调用（TestExplorerOutputUpsertsNotes 用）。
+type fakeNoteSink struct {
+	mu  sync.Mutex
+	got []struct{ path, summary string }
+}
+
+func (f *fakeNoteSink) UpsertNote(path, summary, symbols string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.got = append(f.got, struct{ path, summary string }{path, summary})
+	return nil
+}
+
+func TestExplorerOutputUpsertsNotes(t *testing.T) {
+	m := &scriptModel{steps: []model.ModelEvent{
+		call("cy", "yield", `{"data":{"files":[{"path":"a/x.go","role":"上下文治理"},{"path":"b/y.go","role":"装配层"}],"entrypoints":["main"],"notes":"入口在 main"}}`),
+	}}
+	sink := &fakeNoteSink{}
+	o := baseOpts(m, t.TempDir())
+	o.Notes = sink
+	r := runOne(t, NewManager(o), context.Background(), one("explorer", "探索项目"))
+	if r.Status != StatusCompleted || !r.Yielded {
+		t.Fatalf("result = %+v", r)
+	}
+	sink.mu.Lock()
+	defer sink.mu.Unlock()
+	if len(sink.got) != 2 {
+		t.Fatalf("应沉淀 2 条笔记，got %+v", sink.got)
+	}
+	if sink.got[0].path != "a/x.go" || sink.got[0].summary != "上下文治理" {
+		t.Fatalf("笔记 1 = %+v", sink.got[0])
+	}
+	if sink.got[1].path != "b/y.go" || sink.got[1].summary != "装配层" {
+		t.Fatalf("笔记 2 = %+v", sink.got[1])
+	}
+}
+
+func TestNonExplorerOutputDoesNotUpsert(t *testing.T) {
+	m := &scriptModel{steps: []model.ModelEvent{
+		call("cy", "yield", `{"data":{"answer":"42"}}`),
+	}}
+	sink := &fakeNoteSink{}
+	o := baseOpts(m, t.TempDir())
+	o.Notes = sink
+	_ = runOne(t, NewManager(o), context.Background(), one("explorer", "回答问题"))
+	if len(sink.got) != 0 {
+		t.Fatalf("没有 files 字段不应沉淀，got %+v", sink.got)
+	}
+}
+
+// TestExplorerNotesFlowToProjectMap 端到端：explorer 结算 → 真实 memory.Store 沉淀 → 项目地图可见。
+// 这就是验收项「第二个会话有项目地图」的数据通路。
+func TestExplorerNotesFlowToProjectMap(t *testing.T) {
+	dir := t.TempDir()
+	store, err := memory.Open(filepath.Join(dir, "memory.db"), memory.ScopeProject, "proj-t")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	m := &scriptModel{steps: []model.ModelEvent{
+		call("cy", "yield", `{"data":{"files":[{"path":"internal/context/manager.go","role":"上下文治理入口"}],"notes":"ok"}}`),
+	}}
+	o := baseOpts(m, dir)
+	o.Notes = store
+	r := runOne(t, NewManager(o), context.Background(), one("explorer", "探索"))
+	if r.Status != StatusCompleted {
+		t.Fatalf("result = %+v", r)
+	}
+	pm := store.ProjectMap(1500)
+	if !strings.Contains(pm, "internal/context/manager.go") || !strings.Contains(pm, "上下文治理入口") {
+		t.Fatalf("项目地图应含沉淀的笔记:\n%s", pm)
 	}
 }

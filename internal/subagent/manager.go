@@ -25,6 +25,12 @@ import (
 
 // Options 装配 Manager 所需的一切：子 agent 借用父的模型与记忆，但每个 Run 有独立的 bash/cwd、产物存储、
 // sidecar 会话与审批器，权限继承父 mode。
+// NoteSink 是项目笔记沉淀接口（生产实现是 memory.Store）。explorer 类子 agent 的
+// 结构化产出在结算时确定性 upsert 成项目知识，不调模型。
+type NoteSink interface {
+	UpsertNote(path, summary, symbols string) error
+}
+
 type Options struct {
 	Model          model.Model
 	WorkerTools    func(cwd string, store *runtime.ArtifactStore) *tool.Registry // 每个 Run 调用一次，返回独立工具集
@@ -39,6 +45,7 @@ type Options struct {
 	Summarizer     agentctx.Summarizer
 	ContextWindow  int
 	Bus            *bus.Bus // 事件总线（可 nil：不发布）
+	Notes          NoteSink // 项目笔记沉淀（explorer 产出 → file_notes；nil = 不沉淀）
 
 	// 定义里没写时的兜底
 	DefaultTimeout  time.Duration

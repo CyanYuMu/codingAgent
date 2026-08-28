@@ -361,6 +361,9 @@ func (m *Manager) settle(parent, runCtx context.Context, r *Run, rs *runtimeSet)
 		res.Warning = fmt.Sprintf("提醒 %d 次后仍未 yield，以下是最后一段输出（可能不是完整结论）", res.Reminders)
 	}
 
+	if m.o.Notes != nil {
+		m.upsertNotes(res)
+	}
 	if f, err := m.writeOutput(r.name, res); err == nil {
 		res.OutputFile = f
 	}
@@ -378,6 +381,30 @@ func (m *Manager) settle(parent, runCtx context.Context, r *Run, rs *runtimeSet)
 	r.mu.Unlock()
 	m.publishLifecycle(r)
 	return res
+}
+
+// upsertNotes 把 explorer 类子 agent 的结构化产出（files:[{path, role}]）沉淀成项目笔记：
+// summary = role，确定性 upsert。笔记是背景知识，失败不阻塞结算（下次探索会再沉淀）。
+func (m *Manager) upsertNotes(res Result) {
+	data, _ := res.Data.(map[string]any)
+	files, ok := data["files"].([]any)
+	if !ok {
+		return
+	}
+	for _, f := range files {
+		fm, ok := f.(map[string]any)
+		if !ok {
+			continue
+		}
+		path, _ := fm["path"].(string)
+		role, _ := fm["role"].(string)
+		if path == "" {
+			continue
+		}
+		if err := m.o.Notes.UpsertNote(path, role, ""); err != nil {
+			return
+		}
+	}
 }
 
 // writeOutput 把完整产出写进会话产物目录，父只拿摘要 + agent://<Name> 指针。

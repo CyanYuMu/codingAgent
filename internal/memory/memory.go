@@ -121,6 +121,9 @@ func (s *Store) init() error {
 	if _, err := s.db.Exec(schemaV2); err != nil {
 		return err
 	}
+	if _, err := s.db.Exec(fileNotesSchema); err != nil {
+		return err
+	}
 	return s.migrateLegacy()
 }
 
