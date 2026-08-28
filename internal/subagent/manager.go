@@ -35,10 +35,11 @@ type Options struct {
 	Model          model.Model
 	WorkerTools    func(cwd string, store *runtime.ArtifactStore) *tool.Registry // 每个 Run 调用一次，返回独立工具集
 	Memory         memory.Recaller
-	Mode           permission.Mode // 继承父的审批模式（不是 yolo）
-	Approver       tool.Approver   // 父的审批器；Escalate 时使用
-	Escalate       bool            // true = headless 子 agent 的 Prompt 决策升级到父审批（弹窗带子 agent 标签）
-	SessionDir     string          // 父会话产物目录；"" = 不落盘（MemoryStorage）
+	Mode           permission.Mode  // 继承父的审批模式（不是 yolo）
+	Rules          permission.Rules // 继承父的审批规则（deny 在任何模式都生效）
+	Approver       tool.Approver    // 父的审批器；Escalate 时使用
+	Escalate       bool             // true = headless 子 agent 的 Prompt 决策升级到父审批（弹窗带子 agent 标签）
+	SessionDir     string           // 父会话产物目录；"" = 不落盘（MemoryStorage）
 	CWD            string
 	MaxConcurrency int
 	Defs           []AgentDef
@@ -414,6 +415,8 @@ func (m *Manager) buildRuntime(def AgentDef, name string, depth int, sess *sessi
 	}
 	exec := tool.NewExecutor(tools, m.o.Mode, approver)
 	yieldExec := tool.NewExecutor(yieldOnly, m.o.Mode, approver)
+	exec.SetRules(m.o.Rules)      // 子 agent 继承父的审批规则（deny 在任何模式都生效）
+	yieldExec.SetRules(m.o.Rules) // yield 不受规则影响（Read tier），但保持一致以防未来改动
 	if store != nil {
 		exec.SetArtifactStore(store)
 		yieldExec.SetArtifactStore(store)

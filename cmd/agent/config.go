@@ -9,6 +9,7 @@ import (
 	"gopkg.in/yaml.v3"
 
 	"einoclaw-build/internal/paths"
+	"einoclaw-build/internal/permission"
 	"einoclaw-build/internal/tool"
 )
 
@@ -66,6 +67,18 @@ func (m memoryConfig) ProjectMapEnabled() bool { return m.ProjectMap == nil || *
 // ReadNotesEnabled 默认关：拿摘要冒充文件内容会让模型基于旧信息改代码。
 func (m memoryConfig) ReadNotesEnabled() bool { return m.ReadNotes != nil && *m.ReadNotes }
 
+// permissionConfig 审批规则段：tool(args*) 通配语法，见 specs/phase-11-governance-eval.md §2。
+type permissionConfig struct {
+	Allow []string `yaml:"allow"`
+	Ask   []string `yaml:"ask"`
+	Deny  []string `yaml:"deny"`
+}
+
+// bashConfig bash 运行时段。
+type bashConfig struct {
+	Timeout time.Duration `yaml:"timeout"` // 单条命令超时；默认 120s，上限 600s
+}
+
 // config 顶层配置。
 type config struct {
 	Models         []modelConfig    `yaml:"models"`
@@ -74,6 +87,8 @@ type config struct {
 	DelegationMode string           `yaml:"delegation_mode"` // conservative/preferred/always，默认 preferred
 	Subagent       subagentConfig   `yaml:"subagent"`
 	Memory         memoryConfig     `yaml:"memory"`
+	Permissions    permissionConfig `yaml:"permissions"`
+	Bash           bashConfig       `yaml:"bash"`
 }
 
 // configPaths 返回三层配置路径（用户 → 项目 → 仓库内 legacy），后者覆盖前者。
@@ -165,6 +180,13 @@ func mergeConfig(dst *config, src config) {
 	if src.Memory.ReadNotes != nil {
 		dst.Memory.ReadNotes = src.Memory.ReadNotes
 	}
+	// 权限规则是列表级合并（后层追加）——用户 deny 不会被项目 allow 顶掉
+	dst.Permissions.Allow = append(dst.Permissions.Allow, src.Permissions.Allow...)
+	dst.Permissions.Ask = append(dst.Permissions.Ask, src.Permissions.Ask...)
+	dst.Permissions.Deny = append(dst.Permissions.Deny, src.Permissions.Deny...)
+	if src.Bash.Timeout != 0 {
+		dst.Bash.Timeout = src.Bash.Timeout
+	}
 }
 
 // applyDefaults 补默认值：approval_mode=write、delegation_mode=preferred、窗口 128k、子 agent 并发 4 / 超时 10m / 50 轮。
@@ -202,6 +224,34 @@ func applyDefaults(cfg *config) {
 	if cfg.Memory.MaxPerScope == 0 {
 		cfg.Memory.MaxPerScope = 500
 	}
+	if cfg.Bash.Timeout == 0 {
+		cfg.Bash.Timeout = 120 * time.Second
+	}
+	if cfg.Bash.Timeout > 600*time.Second {
+		cfg.Bash.Timeout = 600 * time.Second
+	}
+}
+
+// parseRules 把配置原文解析成规则集；坏条目不致命（告警跳过）。
+func (c config) parseRules() (permission.Rules, []error) {
+	var out permission.Rules
+	var errs []error
+	parse := func(raws []string) []permission.Rule {
+		var rules []permission.Rule
+		for _, raw := range raws {
+			r, err := permission.ParseRule(raw)
+			if err != nil {
+				errs = append(errs, fmt.Errorf("permissions: %w", err))
+				continue
+			}
+			rules = append(rules, r)
+		}
+		return rules
+	}
+	out.Allow = parse(c.Permissions.Allow)
+	out.Ask = parse(c.Permissions.Ask)
+	out.Deny = parse(c.Permissions.Deny)
+	return out, errs
 }
 
 // loadConfig 读取三层配置；失败则打印原因退出。

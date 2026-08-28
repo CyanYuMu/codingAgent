@@ -26,6 +26,12 @@ type Terminal interface {
 	IsTerminal(args map[string]any, err error) bool
 }
 
+// Decisioner 可选接口：工具按本次调用参数自检审批判定（替代固定 Tier 的扩展形态）。
+// 未实现时按 Tier() 构造 ToolDecision。返回的 Tier 为空则回落到 Tier()。
+type Decisioner interface {
+	Decision(args map[string]any) permission.ToolDecision
+}
+
 // RequiredParams 可选接口：声明必填参数名（进入工具定义的 required）。
 type RequiredParams interface{ Required() []string }
 

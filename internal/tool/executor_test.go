@@ -203,3 +203,102 @@ func TestResultTerminalIsPerCall(t *testing.T) {
 		}
 	}
 }
+
+// decisionTool 带 Decision 自检的工具：按参数返回 ToolDecision。
+type decisionTool struct {
+	fakeTool
+	decision permission.ToolDecision
+}
+
+func (d decisionTool) Decision(args map[string]any) permission.ToolDecision { return d.decision }
+
+func TestExecutorAppliesRules(t *testing.T) {
+	// allow 规则：write 模式下 exec 工具免审批
+	r := NewRegistry()
+	r.Register(fakeTool{name: "bash", tier: permission.TierExec})
+	e := NewExecutor(r, permission.ModeWrite, nil)
+	e.SetRules(permission.Rules{Allow: []permission.Rule{testRule(t, "bash(go test*)")}})
+	if out := e.Execute(context.Background(), message.ToolCall{Name: "bash", Args: `{"command":"go test ./..."}`}); out.IsError || out.Content != "ok" {
+		t.Fatalf("allow 规则应放行，got %+v", out)
+	}
+	// 未命中规则 → 仍询问
+	if out := e.Execute(context.Background(), message.ToolCall{Name: "bash", Args: `{"command":"rm x"}`}); !out.IsError || !strings.Contains(out.Content, "denied") {
+		t.Fatalf("未命中规则应 denied，got %+v", out)
+	}
+
+	// deny 规则：yolo 下也拒，approver 不被调用
+	r2 := NewRegistry()
+	r2.Register(fakeTool{name: "read", tier: permission.TierRead})
+	a := &fakeApprover{decision: true}
+	e2 := NewExecutor(r2, permission.ModeYolo, a)
+	e2.SetRules(permission.Rules{Deny: []permission.Rule{testRule(t, "read(./.env*)")}})
+	out := e2.Execute(context.Background(), message.ToolCall{Name: "read", Args: `{"file_path":"./.env"}`})
+	if !out.IsError || !strings.Contains(out.Content, "denied by rule: read(./.env*)") || a.called {
+		t.Fatalf("deny 规则应拒且不弹审批，got %+v called=%v", out, a.called)
+	}
+}
+
+func TestExecutorUsesDecisioner(t *testing.T) {
+	r := NewRegistry()
+	r.Register(decisionTool{fakeTool: fakeTool{name: "bash", tier: permission.TierExec},
+		decision: permission.ToolDecision{Tier: permission.TierExec, Override: true, Reason: "rm 递归/强制删除"}})
+	e := NewExecutor(r, permission.ModeWrite, nil)
+	out := e.Execute(context.Background(), message.ToolCall{Name: "bash", Args: `{"command":"rm -rf /"}`})
+	if !out.IsError || !strings.Contains(out.Content, "rm 递归/强制删除") {
+		t.Fatalf("Override 应强制询问并带原因，got %+v", out)
+	}
+	// 工具显式 deny 永远生效
+	r2 := NewRegistry()
+	r2.Register(decisionTool{fakeTool: fakeTool{name: "x", tier: permission.TierRead},
+		decision: permission.ToolDecision{Tier: permission.TierRead, Policy: permission.PolicyDeny, Reason: "只读源"}})
+	e2 := NewExecutor(r2, permission.ModeYolo, nil)
+	if out := e2.Execute(context.Background(), message.ToolCall{Name: "x", Args: "{}"}); !out.IsError || !strings.Contains(out.Content, "只读源") {
+		t.Fatalf("工具 deny 应永远生效，got %+v", out)
+	}
+}
+
+func TestExecutorOverrideForcesPrompt(t *testing.T) {
+	r := NewRegistry()
+	r.Register(decisionTool{fakeTool: fakeTool{name: "bash", tier: permission.TierExec},
+		decision: permission.ToolDecision{Tier: permission.TierExec, Override: true, Reason: "危险"}})
+	a := &fakeApprover{decision: true}
+	e := NewExecutor(r, permission.ModeWrite, a)
+	if out := e.Execute(context.Background(), message.ToolCall{Name: "bash", Args: "{}"}); !a.called || out.Content != "ok" {
+		t.Fatalf("Override + 批准应执行，got called=%v out=%+v", a.called, out)
+	}
+	// 拒绝路径
+	a2 := &fakeApprover{decision: false}
+	e2 := NewExecutor(r, permission.ModeWrite, a2)
+	if out := e2.Execute(context.Background(), message.ToolCall{Name: "bash", Args: "{}"}); !out.IsError || !strings.Contains(out.Content, "危险") {
+		t.Fatalf("Override + 拒绝应 denied 带原因，got %+v", out)
+	}
+}
+
+func TestExecutorAllowSessionSkipsApproval(t *testing.T) {
+	r := NewRegistry()
+	r.Register(fakeTool{name: "bash", tier: permission.TierExec})
+	a := &fakeApprover{decision: false} // 拒绝型 approver：若被问必然 denied
+	e := NewExecutor(r, permission.ModeWrite, a)
+	e.AllowSession("bash")
+	if out := e.Execute(context.Background(), message.ToolCall{Name: "bash", Args: "{}"}); out.IsError || out.Content != "ok" {
+		t.Fatalf("本会话允许后应免审批执行，got %+v", out)
+	}
+	// 危险 Override 不被本会话允许跳过
+	r2 := NewRegistry()
+	r2.Register(decisionTool{fakeTool: fakeTool{name: "bash", tier: permission.TierExec},
+		decision: permission.ToolDecision{Tier: permission.TierExec, Override: true, Reason: "危险"}})
+	e2 := NewExecutor(r2, permission.ModeWrite, a)
+	e2.AllowSession("bash")
+	if out := e2.Execute(context.Background(), message.ToolCall{Name: "bash", Args: "{}"}); !out.IsError {
+		t.Fatalf("Override 不受本会话允许豁免，got %+v", out)
+	}
+}
+
+func testRule(t *testing.T, raw string) permission.Rule {
+	t.Helper()
+	r, err := permission.ParseRule(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return r
+}

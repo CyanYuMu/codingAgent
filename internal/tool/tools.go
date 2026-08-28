@@ -243,6 +243,20 @@ func (bashTool) Required() []string       { return []string{"command"} }
 func (bashTool) Tier() permission.Tier    { return permission.TierExec }
 func (bashTool) Concurrency() Concurrency { return ConcurrencyExclusive }
 
+// Decision 按命令内容分类：只读 → read（write 模式免审批）；危险 → Override 强制询问（yolo 也拦）；
+// 其余回落 exec tier。分类是纯函数，误判只读只多一次审批、漏判危险才是事故，故保守。
+func (bashTool) Decision(args map[string]any) permission.ToolDecision {
+	command, _ := args["command"].(string)
+	ro, dang, reason := runtime.Classify(command)
+	switch {
+	case dang:
+		return permission.ToolDecision{Tier: permission.TierExec, Override: true, Reason: reason}
+	case ro:
+		return permission.ToolDecision{Tier: permission.TierRead, Reason: "只读命令"}
+	}
+	return permission.ToolDecision{Tier: permission.TierExec}
+}
+
 func (b bashTool) Execute(ctx context.Context, args map[string]any, sink *runtime.Sink) error {
 	command, _ := args["command"].(string)
 	if command == "" {

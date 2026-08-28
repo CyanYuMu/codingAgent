@@ -17,6 +17,21 @@ approval_mode: write
 #   always       —— 必须委派（主 agent 只有只读工具 + task/remember，写与执行必须派子 agent）
 delegation_mode: preferred
 
+# 审批规则（P11）：tool(args*) 通配语法，* 匹配任意序列，不带括号 = 该工具全部参数。
+# deny 在任何模式（含 yolo）都生效；allow 压过 tier×mode；ask 升级为询问。
+# 三层配置的规则按「列表追加」合并（用户 deny 不会被项目 allow 顶掉）。
+# 另有 bash 内置分类器：只读命令（git status/go test）免审批；危险命令（rm -rf/curl|sh/sudo）
+# 强制弹窗（yolo 下也拦）。
+permissions:
+  allow: ["bash(git status*)", "bash(go test*)", "bash(go build*)", "read(**)"]
+  # ask:   ["bash(git push*)"]
+  # deny:  ["read(./.env*)", "bash(rm -rf *)"]
+
+# bash 运行时（P11）
+bash:
+  timeout: 120s   # 单条命令 wall-clock 上限（最大 600s）；超时 SIGTERM 进程组、5s 后 SIGKILL
+                  # 环境变量自动剔除密钥类（*API_KEY*/*TOKEN*/*SECRET*/*PASSWORD*/*CREDENTIAL*）
+
 # 子 agent 运行时
 subagent:
   max_concurrency: 4          # 并行子 agent 上限

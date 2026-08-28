@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	"einoclaw-build/internal/permission"
 	"einoclaw-build/internal/runtime"
 )
 
@@ -189,5 +190,18 @@ func TestInsertRange(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestBashToolDecision(t *testing.T) {
+	bt := bashTool{bash: runtime.NewBash(t.TempDir())}
+	if td := bt.Decision(map[string]any{"command": "git status"}); td.Tier != permission.TierRead || td.Override {
+		t.Fatalf("只读命令应判 read 无覆盖：%+v", td)
+	}
+	if td := bt.Decision(map[string]any{"command": "rm -rf /tmp/x"}); !td.Override || td.Reason == "" || !strings.Contains(td.Reason, "rm") {
+		t.Fatalf("危险命令应 Override 带原因：%+v", td)
+	}
+	if td := bt.Decision(map[string]any{"command": "node server.js"}); td.Tier != permission.TierExec || td.Override {
+		t.Fatalf("未知命令应回落 exec：%+v", td)
 	}
 }

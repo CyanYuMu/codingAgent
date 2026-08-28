@@ -2,6 +2,7 @@ package runtime
 
 import (
 	"os"
+	"regexp"
 	"strings"
 )
 
@@ -28,6 +29,23 @@ func nonInteractiveEnv() []string {
 	out := make([]string, 0, len(envMap))
 	for k, v := range envMap {
 		out = append(out, k+"="+v)
+	}
+	return out
+}
+
+// secretEnvRe 密钥类环境变量（大小写不敏感）：bash 子进程拿不到 API key/token。
+var secretEnvRe = regexp.MustCompile(`(?i)(api[_-]?key|token|secret|password|passwd|credential|private[_-]?key|access[_-]?key)`)
+
+// SanitizeEnv 过滤密钥类环境变量（保留其余全部）。
+// 白名单会误伤真实工作流（GOPROXY/GIT_CONFIG_*/NPM_CONFIG_*），只剔密钥类与 Claude Code 行为一致。
+func SanitizeEnv(base []string) []string {
+	out := make([]string, 0, len(base))
+	for _, e := range base {
+		k, _, _ := strings.Cut(e, "=")
+		if secretEnvRe.MatchString(k) {
+			continue
+		}
+		out = append(out, e)
 	}
 	return out
 }

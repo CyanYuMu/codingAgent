@@ -180,7 +180,8 @@ func TestParentCancelIsAborted(t *testing.T) {
 }
 
 func TestHeadlessDeniesPromptByDefault(t *testing.T) {
-	m := &scriptModel{steps: []model.ModelEvent{call("c1", "bash", `{"command":"echo hi"}`), {Text: "end"}}}
+	// sleep 不在只读白名单 → exec tier → AlwaysAsk + 无升级 → 拒绝并说明（echo 是只读的，不再触发审批）
+	m := &scriptModel{steps: []model.ModelEvent{call("c1", "bash", `{"command":"sleep 0.1"}`), {Text: "end"}}}
 	o := baseOpts(m, t.TempDir())
 	o.Mode = permission.ModeAlwaysAsk
 	r := runOne(t, NewManager(o), context.Background(), one("explorer", "x"))
@@ -201,7 +202,8 @@ func (r *recordingApprover) Approve(_ context.Context, c message.ToolCall) (bool
 }
 
 func TestEscalationLabelsCall(t *testing.T) {
-	m := &scriptModel{steps: []model.ModelEvent{call("c1", "bash", `{"command":"echo hi"}`), {Text: "end"}}}
+	// sleep 不在只读白名单 → exec tier → AlwaysAsk 下必须弹审批并升级到父（echo 是只读的，不再触发审批）
+	m := &scriptModel{steps: []model.ModelEvent{call("c1", "bash", `{"command":"sleep 0.1 && echo hi"}`), {Text: "end"}}}
 	o := baseOpts(m, t.TempDir())
 	o.Mode = permission.ModeAlwaysAsk
 	ap := &recordingApprover{}

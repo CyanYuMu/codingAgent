@@ -34,19 +34,39 @@ type Result struct {
 
 // Executor 执行工具调用：查表 → 审批 → 执行 → 塑形结果。
 type Executor struct {
-	registry *Registry
-	mode     permission.Mode
-	approver Approver      // nil = 无 HITL（Prompt 降级拒绝）
-	sem      chan struct{} // 并发上限（Shared 工具并行数）
-	store    *runtime.ArtifactStore
+	registry     *Registry
+	mode         permission.Mode
+	rules        permission.Rules // 用户 allow/ask/deny 规则（默认空 = 纯 tier×mode，行为与旧版一致）
+	approver     Approver         // nil = 无 HITL（Prompt 降级拒绝）
+	sem          chan struct{}    // 并发上限（Shared 工具并行数）
+	store        *runtime.ArtifactStore
+	allowMu      sync.Mutex
+	sessionAllow map[string]bool // 「本会话允许」的工具名（只对非 Override 的 prompt 生效）
 }
 
 func NewExecutor(r *Registry, mode permission.Mode, approver Approver) *Executor {
-	return &Executor{registry: r, mode: mode, approver: approver, sem: make(chan struct{}, 8)}
+	return &Executor{registry: r, mode: mode, approver: approver, sem: make(chan struct{}, 8), sessionAllow: map[string]bool{}}
 }
 
 // SetArtifactStore 设置截断落盘用的产物存储（nil = 只截断不落盘）。
 func (e *Executor) SetArtifactStore(s *runtime.ArtifactStore) { e.store = s }
+
+// SetRules 注入用户审批规则（装配层调用；子 agent 继承父的规则）。
+func (e *Executor) SetRules(r permission.Rules) { e.rules = r }
+
+// AllowSession 记录「本会话允许」某工具（TUI 弹窗按钮）。
+// 注意：只跳过 tier×mode 与 ask 规则产生的 prompt；危险分类的 Override 与 deny 规则不在此列。
+func (e *Executor) AllowSession(name string) {
+	e.allowMu.Lock()
+	e.sessionAllow[name] = true
+	e.allowMu.Unlock()
+}
+
+func (e *Executor) sessionAllowed(name string) bool {
+	e.allowMu.Lock()
+	defer e.allowMu.Unlock()
+	return e.sessionAllow[name]
+}
 
 // Mode 返回审批模式。
 func (e *Executor) Mode() permission.Mode { return e.mode }
@@ -57,26 +77,45 @@ func (e *Executor) Execute(ctx context.Context, call message.ToolCall) Result {
 	if !ok {
 		return Result{Content: "tool not found: " + call.Name, IsError: true}
 	}
-	if permission.Resolve(t.Tier(), e.mode) == permission.DecisionPrompt {
+	var args map[string]any
+	if call.Args != "" {
+		_ = json.Unmarshal([]byte(call.Args), &args) // 非法 JSON 按空参处理
+	}
+
+	// 工具自检（Decisioner 可选）→ 五步决策
+	td := permission.ToolDecision{Tier: t.Tier()}
+	if d, ok := t.(Decisioner); ok {
+		td = d.Decision(args)
+		if td.Tier == "" {
+			td.Tier = t.Tier()
+		}
+	}
+	decision, reason := permission.ResolveRules(td, e.rules, e.mode, call.Name, call.Args)
+	if reason == "" {
+		reason = "requires approval (tier=" + string(td.Tier) + ")"
+	}
+	switch decision {
+	case permission.DecisionAllow:
+		// 直接执行
+	case permission.DecisionDeny:
+		return Result{Content: "tool denied: " + reason, IsError: true}
+	case permission.DecisionPrompt:
+		if !td.Override && e.sessionAllowed(call.Name) {
+			break // 本会话已允许
+		}
 		if e.approver == nil {
-			return Result{Content: "tool denied: requires approval (tier=" + string(t.Tier()) + ", no approver)", IsError: true}
+			return Result{Content: "tool denied: " + reason + " (no approver)", IsError: true}
 		}
 		approved, err := e.approver.Approve(ctx, call)
 		if err != nil {
 			return Result{Content: "tool approval interrupted: " + err.Error(), IsError: true}
 		}
 		if !approved {
-			reason := "tool denied by user"
 			if r, ok := e.approver.(DenyReasoner); ok && r.DenyReason() != "" {
-				reason = r.DenyReason()
+				return Result{Content: "tool denied: " + reason + " (" + r.DenyReason() + ")", IsError: true}
 			}
-			return Result{Content: reason, IsError: true}
+			return Result{Content: "tool denied: " + reason + " (denied by user)", IsError: true}
 		}
-	}
-
-	var args map[string]any
-	if call.Args != "" {
-		_ = json.Unmarshal([]byte(call.Args), &args) // 非法 JSON 按空参处理
 	}
 
 	sink := runtime.NewSink(sinkHeadLimit, sinkTailLimit)

@@ -255,14 +255,17 @@ func (m teaModel) roster() []subagent.RunView {
 }
 
 func (m teaModel) handleKey(msg tea.KeyPressMsg) (teaModel, tea.Cmd) {
-	// 审批弹窗是 modal：待审批时只响应 y/n/esc
+	// 审批弹窗是 modal：待审批时只响应 y/a/n/esc
 	if m.pendingApproval != nil {
 		switch {
 		case key.Matches(msg, key.NewBinding(key.WithKeys("y", "enter"))):
-			m.pendingApproval.resp <- true
+			m.pendingApproval.resp <- approvalAnswer{allow: true}
+			m.pendingApproval = nil
+		case key.Matches(msg, key.NewBinding(key.WithKeys("a"))):
+			m.pendingApproval.resp <- approvalAnswer{allow: true, sessionAllow: true}
 			m.pendingApproval = nil
 		case key.Matches(msg, key.NewBinding(key.WithKeys("n", "esc"))):
-			m.pendingApproval.resp <- false
+			m.pendingApproval.resp <- approvalAnswer{allow: false}
 			m.pendingApproval = nil
 		}
 		return m, nil
@@ -538,7 +541,7 @@ func renderToolCall(ts *agent.ToolStart) string {
 func renderApprovalDialog(call message.ToolCall) string {
 	title := lipgloss.NewStyle().Foreground(lipgloss.Color("208")).Bold(true).Render("⚠ 审批")
 	cmd := lipgloss.NewStyle().Foreground(lipgloss.Color("250")).Render(call.Name + " " + call.Args)
-	return fmt.Sprintf("%s\n\n  %s\n\n  [y] 允许   [n] 拒绝", title, cmd)
+	return fmt.Sprintf("%s\n\n  %s\n\n  [y] 允许   [a] 本会话允许   [n] 拒绝", title, cmd)
 }
 
 // renderToolResult 渲染工具结果（头部 + 内容行，超长截断预览）。

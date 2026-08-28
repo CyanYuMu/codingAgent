@@ -258,7 +258,7 @@ func main() {
 	// worker 工具工厂：每个调用方（主 agent / 每个子 agent）拿到独立的 bash 实例
 	workerTools := func(cwd string, store *rt.ArtifactStore) *tool.Registry {
 		reg := tool.NewRegistry()
-		for _, t := range tool.Builtins(rt.NewBash(cwd), store) {
+		for _, t := range tool.Builtins(rt.NewBashWithTimeout(cwd, cfg.Bash.Timeout), store) {
 			reg.Register(t)
 		}
 		if mem != nil {
@@ -274,15 +274,26 @@ func main() {
 	}
 
 	mode := parseMode(cfg.ApprovalMode)
+	rules, ruleErrs := cfg.parseRules()
+	for _, e := range ruleErrs {
+		log.Printf("%v（该条规则被忽略）", e)
+	}
+
+	// 审批器：TUI 弹窗三态（允许/拒绝/本会话允许）；「本会话允许」经闭包接到 exec.AllowSession
+	var sessionAllowFn func(string)
 	var approver tool.Approver = headlessApprover{}
 	if *prompt == "" {
-		approver = tui.NewApprover()
+		approver = tui.NewApprover(func(name string) {
+			if sessionAllowFn != nil {
+				sessionAllowFn(name)
+			}
+		})
 	}
 
 	summ := agentctx.NewModelSummarizer(m)
 	evbus := bus.New()
 	mgr := subagent.NewManager(subagent.Options{
-		Model: m, WorkerTools: workerTools, Memory: mem, Mode: mode, Approver: approver,
+		Model: m, WorkerTools: workerTools, Memory: mem, Mode: mode, Rules: rules, Approver: approver,
 		Escalate: cfg.Subagent.ApprovalEscalation, SessionDir: artifactDir, CWD: cwd,
 		MaxConcurrency: cfg.Subagent.MaxConcurrency, Defs: discoverAgents(cwd), Summarizer: summ,
 		ContextWindow: cfg.Models[0].ContextWindow, Bus: evbus,
@@ -312,6 +323,8 @@ func main() {
 	mainRegistry.Register(subagent.NewHubTool(mgr, subagent.MainName))
 	exec := tool.NewExecutor(mainRegistry, mode, approver)
 	exec.SetArtifactStore(store)
+	exec.SetRules(rules)
+	sessionAllowFn = exec.AllowSession // 弹窗「本会话允许」→ Executor 记录
 
 	// system 前缀的排布是固定的：[基础指令 + env] [项目指令层] [记忆块]，
 	// 而且整块被 context.Manager 缓存，只在会话首轮/压缩后/换会话时重算——
