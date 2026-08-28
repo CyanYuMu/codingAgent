@@ -45,6 +45,9 @@ func New(name string, m model.Model, tools *tool.Registry, exec *tool.Executor, 
 // Name 返回 agent 名。
 func (a *Agent) Name() string { return a.name }
 
+// Registry 返回工具注册表（宿主在换会话时用它重置工具的会话级状态）。
+func (a *Agent) Registry() *tool.Registry { return a.tools }
+
 // SetMaxIterations 覆盖工具循环上限（子 agent 用，0 表示不覆盖）。
 func (a *Agent) SetMaxIterations(n int) {
 	if n > 0 {

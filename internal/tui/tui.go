@@ -350,6 +350,7 @@ func (m teaModel) handleSlash(text string) (bool, teaModel) {
 	switch {
 	case text == "/clear":
 		_ = m.session.Reset()
+		m.agent.Registry().ResetConv() // reset_boundary 封存旧上下文，已读记录随之失效
 		m.chatLines = nil
 		m.inputArea.Reset()
 		return true, m
@@ -362,6 +363,7 @@ func (m teaModel) handleSlash(text string) (bool, teaModel) {
 		return true, m
 	case text == "/new":
 		cancelCurrent()
+		m.agent.Registry().ResetConv() // 已读记录等会话级状态不能跨会话残留
 		ns, err := m.mgr.New(m.cwd)
 		if err != nil {
 			m.chatLines = append(m.chatLines, renderError(err))
@@ -392,6 +394,7 @@ func (m teaModel) handleSlash(text string) (bool, teaModel) {
 	case strings.HasPrefix(text, "/resume "):
 		id := strings.TrimSpace(strings.TrimPrefix(text, "/resume "))
 		cancelCurrent()
+		m.agent.Registry().ResetConv()
 		ns, err := m.mgr.Switch(id)
 		if err != nil {
 			m.chatLines = append(m.chatLines, renderError(err))

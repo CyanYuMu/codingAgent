@@ -61,6 +61,19 @@ func (r *Registry) List() []Tool {
 	return out
 }
 
+// ConvState 是带会话级状态的工具（如 read_file 的已读区间记录）。
+type ConvState interface{ ResetConv() }
+
+// ResetConv 重置所有工具的会话级状态。宿主在换会话（/new /resume）时调用：
+// 这些状态以「内容仍在上文中」为前提，跨会话保留会变成谎话。
+func (r *Registry) ResetConv() {
+	for _, t := range r.List() {
+		if c, ok := t.(ConvState); ok {
+			c.ResetConv()
+		}
+	}
+}
+
 // Specs 转成给模型的工具定义（按名字排序，保证稳定）。
 func (r *Registry) Specs() []model.ToolSpec {
 	r.mu.RLock()
