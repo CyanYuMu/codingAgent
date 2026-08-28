@@ -217,14 +217,14 @@
 
 **Interfaces:** `PlanPrune(msgs []message.Message, o PruneOpts) ([]int, int)`、`ApplyPrune(msgs []message.Message, idx []int) []message.Message`
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
   - `TestPlanPruneProtectsRecent`：最近 40k 内的结果不进候选。
   - `TestPlanPruneSkipsSmallResults`、`TestPlanPruneRequiresMinSavings`（省不够 → 空集）。
   - `TestApplyPruneKeepsArtifactPointer`：原文含 `artifact://7` → 占位里保留该指针。
   - `TestApplyPruneDoesNotMutateInput`、`TestApplyPruneKeepsPairing`（tool 消息还在，只是内容变了）。
 
-- [ ] **Step 2: 实现**（按 spec §4.1）
-- [ ] **Step 3: 验证** `go test ./internal/context/ -run Prune`
+- [x] **Step 2: 实现**（按 spec §4.1）
+- [x] **Step 3: 验证** `go test ./internal/context/ -run Prune`
 
 ---
 
