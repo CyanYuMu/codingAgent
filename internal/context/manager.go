@@ -59,6 +59,7 @@ type Manager struct {
 	summarizer Summarizer
 	window     int
 	keepRecent int
+	prune      PruneOpts                                   // L6 剪枝参数；零值用默认（40k/20k/50）
 	lastPrompt int                                         // 最近一次 provider 报告的 prompt tokens（估算校准用）
 	system     func(ctx context.Context) []message.Message // 系统提示 + 记忆块等前缀，由装配方注入
 
@@ -155,15 +156,21 @@ func (m *Manager) keepBudget() int {
 	return max(min(m.keepRecent, m.threshold()/2), 1)
 }
 
-// Compact 正常压缩：保留最近 keepBudget 的内容，更早的段落摘要化。返回是否发生了压缩。
-func (m *Manager) Compact(ctx context.Context) (bool, error) { return m.compact(ctx, m.keepBudget()) }
+// 压缩方式（Compact / RecoverOverflow 的返回值，进事件 reason）。
+const (
+	compactPrune   = "prune"   // L6 剪枝：零模型调用，旧工具结果替换占位
+	compactSummary = "summary" // 模型摘要：六字段有损压缩
+)
+
+// Compact 正常压缩：先剪枝（零模型调用），省不够再摘要。返回压缩方式，"" 表示未压缩。
+func (m *Manager) Compact(ctx context.Context) (string, error) { return m.compact(ctx, m.keepBudget()) }
 
 // RecoverOverflow 溢出恢复：把保留量减半再压缩；仍无可压内容则只保留最后一段。
-func (m *Manager) RecoverOverflow(ctx context.Context) (bool, error) {
+func (m *Manager) RecoverOverflow(ctx context.Context) (string, error) {
 	keep := max(m.keepBudget()/2, 512)
-	did, err := m.compact(ctx, keep)
-	if err != nil || did {
-		return did, err
+	method, err := m.compact(ctx, keep)
+	if err != nil || method != "" {
+		return method, err
 	}
 	return m.compact(ctx, 1)
 }
@@ -194,36 +201,63 @@ func (m *Manager) AfterTurn(ctx context.Context, usage model.Usage) error {
 	return err
 }
 
-func (m *Manager) compact(ctx context.Context, keep int) (bool, error) {
-	if m.summarizer == nil {
-		return false, nil
-	}
+// compact 压缩阶梯：L6 剪枝（零模型调用）→ 模型摘要。返回压缩方式（""=未压缩）。
+// 剪枝不需要 summarizer——溢出恢复在没有摘要器时也有廉价手段可用。
+func (m *Manager) compact(ctx context.Context, keep int) (string, error) {
 	sess := m.Session()
 	msgs, err := sess.Replay()
 	if err != nil {
-		return false, err
+		return "", err
+	}
+	if method, pruned, err := m.tryPrune(sess, msgs); err != nil || pruned {
+		return method, err
+	}
+	if m.summarizer == nil {
+		return "", nil
 	}
 	cut := findCutPoint(msgs, m.keepInEstimateUnits(keep, msgs))
 	if cut <= 0 {
-		return false, nil
+		return "", nil
 	}
 	summary, err := m.summarizer.Summarize(ctx, msgs[:cut])
 	if err != nil {
-		return false, err
+		return "", err
 	}
 	firstKept, err := m.entryIDOfMessageIndex(cut)
 	if err != nil {
-		return false, err
+		return "", err
 	}
 	before := 0
 	for _, mm := range msgs {
 		before += estimateTokens(mm)
 	}
 	if err := sess.Compact(summary, firstKept, before); err != nil {
-		return false, err
+		return "", err
 	}
 	m.InvalidateSystem() // 压缩后重贴记忆与粘性规则：这是前缀允许变化的少数时刻之一
-	return true, nil
+	return compactSummary, nil
+}
+
+// tryPrune L6 剪枝：省够 MinSavings 就向会话落一条 prune 边界。
+// 边界 = 第一个保留的消息（最新被剪结果的下一条）——保护窗非空时必然存在；
+// 回放按边界统一占位，前缀单调。剪枝不动 system 前缀（历史归历史）。
+func (m *Manager) tryPrune(sess *session.Session, msgs []message.Message) (string, bool, error) {
+	idx, savings := PlanPrune(msgs, m.prune)
+	if len(idx) == 0 {
+		return "", false, nil
+	}
+	ids, err := sess.ContextEntryIDs()
+	if err != nil {
+		return "", false, err
+	}
+	boundary := idx[len(idx)-1] + 1
+	if boundary >= len(ids) {
+		return "", false, nil // 保护窗为空：宁可不剪，也不把最新结果占位掉
+	}
+	if err := sess.Prune(ids[boundary], savings); err != nil {
+		return "", false, err
+	}
+	return compactPrune, true, nil
 }
 
 // entryIDOfMessageIndex 把 Replay 下标映射回 session 条目 id（与 Replay 一一对应）。

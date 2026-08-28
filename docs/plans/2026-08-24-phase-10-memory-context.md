@@ -234,14 +234,18 @@
 
 **Interfaces:** `session.EntryCustom` 的 `prune` 类型 + `Session.Prune(beforeEntryID string, savings int) error`
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
   - `TestReplayAppliesPrune`：写入若干工具结果 + 一条 prune 条目 → `Replay()` 里边界前的结果被占位替换、边界后的完整。
   - `TestPruneIsMonotonic`：两条 prune 条目（边界前进）→ 回放按最新边界。
-  - `TestCompactPrunesBeforeSummarizing`：造出足够可剪的历史 → `Compact` 返回 true 且**没有调用 summarizer**（用假 summarizer 计数断言）。
+  - `TestCompactPrunesBeforeSummarizing`：造出足够可剪的历史 → `Compact` 返回 "prune" 且**没有调用 summarizer**（计数断言）；剪无可剪后第二次压缩落摘要。
   - `TestCompactFallsBackToSummary`：可剪内容不足 → 正常摘要。
+  - 附加：`TestNilSummarizerStillPrunes`（无摘要器也能剪）、`TestPlanPruneSkipsPlaceholders`（剪枝幂等：占位不再是候选，防前缀 churn）、`TestSessionPruneReplayMatchesApplyPrune`（回放与 ApplyPrune 占位逐字节一致）、压缩 × 剪枝边界交叠两个用例、`TestPrunedPlaceholderKeepsArtifactRef`。
 
-- [ ] **Step 2: 实现**
-- [ ] **Step 3: 验证** `go test ./internal/session/ ./internal/context/`
+- [x] **Step 2: 实现**
+  - `session.Prune(beforeEntryID, savings)` 落 `prune` 自定义条目；`buildContext` 回放期应用（`applyPruneBoundaries`，深拷贝 Blocks 不污染 JSONL）。
+  - 占位单一事实源：`session.PrunedPlaceholder`（context 侧复用）；`session.PrunedMarker` 让 PlanPrune 跳过已占位结果（幂等）。
+  - `Manager.compact` 先剪后摘；`Compact/RecoverOverflow` 返回方式（"prune"/"summary"/""），`agent.Context` 接口跟进，事件 reason 变为 `mid-turn:prune` / `overflow:summary`。
+- [x] **Step 3: 验证** `go test ./internal/session/ ./internal/context/ ./internal/agent/ -race` 全绿
 
 ---
 

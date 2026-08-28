@@ -1,11 +1,11 @@
 package context
 
 import (
-	"fmt"
-	"regexp"
 	"slices"
+	"strings"
 
 	"einoclaw-build/internal/message"
+	"einoclaw-build/internal/session"
 )
 
 // PruneOpts 剪枝参数：先保护最近一段工具结果，再剪掉更早的大块结果（零模型调用）。
@@ -41,8 +41,8 @@ func PlanPrune(msgs []message.Message, o PruneOpts) ([]int, int) {
 	savings := 0
 	for j := len(msgs) - 1; j >= 0; j-- {
 		tok := toolResultTokens(msgs[j])
-		if tok == 0 {
-			continue // 非工具结果消息
+		if tok == 0 || allPruned(msgs[j]) {
+			continue // 非工具结果消息，或已是占位（剪枝幂等：占位再剪只会改写字节）
 		}
 		if protected < o.ProtectRecent {
 			protected += tok
@@ -78,7 +78,7 @@ func ApplyPrune(msgs []message.Message, idx []int) []message.Message {
 	return out
 }
 
-// toolResultTokens 返回一条消息里所有工具结果的估算 token（与 EstimateTokens 一致：rune/2 + framing）。
+// toolResultTokens 返回一条消息里所有工具结果的估算 token（rune/2 + framing）。
 // 不含工具结果的消息返回 0。
 func toolResultTokens(m message.Message) int {
 	total, has := 0, false
@@ -94,7 +94,23 @@ func toolResultTokens(m message.Message) int {
 	return total + 4
 }
 
+// allPruned 判断消息里的工具结果是否已全部是剪枝占位。
+func allPruned(m message.Message) bool {
+	seen := false
+	for _, b := range m.Blocks {
+		if b.Kind != message.BlockToolResult || b.ToolResult == nil {
+			continue
+		}
+		seen = true
+		if !strings.HasPrefix(b.ToolResult.Content, session.PrunedMarker) {
+			return false
+		}
+	}
+	return seen
+}
+
 // pruneMessage 深拷贝一条消息，并把其中所有工具结果块的内容替换成占位。
+// 占位文本复用 session.PrunedPlaceholder：计划（这里）与回放（session）必须产出同一字节。
 func pruneMessage(m message.Message) message.Message {
 	tok := toolResultTokens(m)
 	blocks := make([]message.ContentBlock, len(m.Blocks))
@@ -105,21 +121,9 @@ func pruneMessage(m message.Message) message.Message {
 			continue
 		}
 		tr := *b.ToolResult
-		tr.Content = placeholder(b.ToolResult.Content, tok)
+		tr.Content = session.PrunedPlaceholder(b.ToolResult.Content, tok)
 		b.ToolResult = &tr
 	}
 	m.Blocks = blocks
 	return m
-}
-
-// artifactRefRE 匹配内容里的 artifact://<数字 id> 指针。
-var artifactRefRE = regexp.MustCompile(`artifact://\d+`)
-
-// placeholder 构造剪枝占位：说明省略了多少，并保留 artifact:// 指针以便按行读回完整内容。
-func placeholder(content string, tokens int) string {
-	s := fmt.Sprintf("[输出已省略：约 %d tokens]", tokens)
-	if ref := artifactRefRE.FindString(content); ref != "" {
-		s += fmt.Sprintf("（完整内容 %s）", ref)
-	}
-	return s
 }

@@ -36,8 +36,9 @@ type contextMsg struct {
 // buildContext 把 root→leaf 路径展开成模型上下文：
 //  1. 最新 reset_boundary 之后才进入上下文；
 //  2. 最新 compaction 展开为 [摘要] + 从 FirstKeptEntryID 起的 message 条目（v1 无起点：其后全部）；
-//  3. header / session_init / custom / title_change 不产生消息；
-//  4. 修复悬空 tool_call：没有配对结果的调用合成一条 error 结果。
+//  3. 剪枝边界（prune 条目）之前的工具结果替换为占位（见 applyPruneBoundaries）；
+//  4. header / session_init / custom / title_change 不产生消息；
+//  5. 修复悬空 tool_call：没有配对结果的调用合成一条 error 结果。
 func buildContext(path []Entry) []contextMsg {
 	start := 0
 	for i, e := range path {
@@ -81,7 +82,7 @@ func buildContext(path []Entry) []contextMsg {
 			}
 		}
 	}
-	return repairDangling(out)
+	return repairDangling(applyPruneBoundaries(path, out))
 }
 
 // repairDangling 为没有配对 tool 结果的 tool_call 合成一条 error 结果（仅回放，不落盘）。

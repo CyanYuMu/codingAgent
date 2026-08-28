@@ -158,7 +158,7 @@ func TestLoopRecoversFromOverflow(t *testing.T) {
 	if cc.recovers != 1 || len(fm.calls) != 2 {
 		t.Fatalf("recovers=%d calls=%d", cc.recovers, len(fm.calls))
 	}
-	if !hasEvent(evs, func(e AgentEvent) bool { return e.Type == EventCompaction && e.Compaction.Reason == "overflow" }) {
+	if !hasEvent(evs, func(e AgentEvent) bool { return e.Type == EventCompaction && e.Compaction.Reason == "overflow:summary" }) {
 		t.Fatal("no overflow compaction event")
 	}
 	if hasEvent(evs, func(e AgentEvent) bool { return e.Type == EventError }) {
@@ -211,7 +211,7 @@ func TestLoopMidTurnCompaction(t *testing.T) {
 	cc.compactAt = 500
 	_ = cc.Record(message.NewUserMessage("go"), model.Usage{})
 	evs := drain(newTestAgent(fm, cc).Run(context.Background(), nil))
-	if !hasEvent(evs, func(e AgentEvent) bool { return e.Type == EventCompaction && e.Compaction.Reason == "mid-turn" }) || cc.compacts != 1 {
+	if !hasEvent(evs, func(e AgentEvent) bool { return e.Type == EventCompaction && e.Compaction.Reason == "mid-turn:summary" }) || cc.compacts != 1 {
 		t.Fatalf("compacts=%d evs=%+v", cc.compacts, evs)
 	}
 }

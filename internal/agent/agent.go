@@ -16,8 +16,10 @@ type Context interface {
 	Build(ctx context.Context) ([]message.Message, error)
 	Record(m message.Message, u model.Usage) error
 	ShouldCompact(u model.Usage) bool
-	Compact(ctx context.Context) (bool, error)
-	RecoverOverflow(ctx context.Context) (bool, error)
+	// Compact 压缩并返回方式："prune"（零模型调用的剪枝）| "summary"（模型摘要）| ""（未压缩）。
+	// RecoverOverflow 同。方式进事件 reason，让 TUI / headless 能观测压缩阶梯。
+	Compact(ctx context.Context) (method string, err error)
+	RecoverOverflow(ctx context.Context) (method string, err error)
 }
 
 // Agent 是一个可运行的编程智能体。
@@ -89,22 +91,25 @@ func (c *MemoryContext) ShouldCompact(u model.Usage) bool {
 	return c.compactAt > 0 && u.PromptTokens > c.compactAt
 }
 
-func (c *MemoryContext) Compact(context.Context) (bool, error) {
+func (c *MemoryContext) Compact(context.Context) (string, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.compacts++
 	if len(c.msgs) > 2 {
 		c.msgs = append([]message.Message{message.NewUserMessage("[summary]")}, c.msgs[len(c.msgs)-1:]...)
 	}
-	return true, nil
+	return "summary", nil
 }
 
-func (c *MemoryContext) RecoverOverflow(context.Context) (bool, error) {
+func (c *MemoryContext) RecoverOverflow(context.Context) (string, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.recovers++
 	if c.recoverOK && len(c.msgs) > 0 {
 		c.msgs = c.msgs[len(c.msgs)-1:]
 	}
-	return c.recoverOK, nil
+	if !c.recoverOK {
+		return "", nil
+	}
+	return "summary", nil
 }

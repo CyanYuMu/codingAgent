@@ -112,9 +112,9 @@ func TestCompactWritesFirstKeptAndRebuilds(t *testing.T) {
 	if cm.ShouldCompact(model.Usage{PromptTokens: 100}) {
 		t.Fatal("100 < 500 should not compact")
 	}
-	did, err := cm.Compact(context.Background())
-	if err != nil || !did {
-		t.Fatalf("compact did=%v err=%v", did, err)
+	method, err := cm.Compact(context.Background())
+	if err != nil || method != "summary" {
+		t.Fatalf("compact method=%q err=%v", method, err)
 	}
 	if len(fs.got) != 2 || fs.got[0].Blocks[0].Text != "m0" || fs.got[1].Blocks[0].Text != "m1" {
 		t.Fatalf("summarize input = %+v", fs.got)
@@ -145,9 +145,9 @@ func TestCompactKeepsToolPairsIntact(t *testing.T) {
 	_ = cm.Record(ctxMsg(message.RoleUser, "u2"), model.Usage{})
 	_ = cm.Record(callMsg("c1", "read", strings.Repeat("x", 20)), model.Usage{})
 	_ = cm.Record(message.NewToolMessage("c1", "read", strings.Repeat("y", 60), false), model.Usage{})
-	did, err := cm.Compact(context.Background())
-	if err != nil || !did {
-		t.Fatalf("did=%v err=%v", did, err)
+	method, err := cm.Compact(context.Background())
+	if err != nil || method != "summary" {
+		t.Fatalf("method=%q err=%v", method, err)
 	}
 	msgs, _ := cm.Build(context.Background())
 	// 保留段必须从 u2 开始（tool 对不可拆）
@@ -165,12 +165,12 @@ func TestRecoverOverflowCutsDeeper(t *testing.T) {
 		_ = cm.Record(ctxMsg(message.RoleAssistant, strings.Repeat("a", 50)), model.Usage{})
 	}
 	// keep=1000 覆盖全部（总估算 ≈ 348）→ 正常 Compact 无可压内容
-	if did, _ := cm.Compact(context.Background()); did {
+	if method, _ := cm.Compact(context.Background()); method != "" {
 		t.Fatal("nothing to compact at keep=1000")
 	}
-	did, err := cm.RecoverOverflow(context.Background())
-	if err != nil || !did {
-		t.Fatalf("recover did=%v err=%v", did, err)
+	method, err := cm.RecoverOverflow(context.Background())
+	if err != nil || method != "summary" {
+		t.Fatalf("recover method=%q err=%v", method, err)
 	}
 	msgs, _ := cm.Build(context.Background())
 	if len(msgs) >= 12 {
@@ -191,9 +191,9 @@ func TestSmallWindowStillCompacts(t *testing.T) {
 	if !cm.ShouldCompact(model.Usage{PromptTokens: 4500}) {
 		t.Fatal("4500 > 3000 should compact")
 	}
-	did, err := cm.Compact(context.Background())
-	if err != nil || !did {
-		t.Fatalf("small window must compact: did=%v err=%v", did, err)
+	method, err := cm.Compact(context.Background())
+	if err != nil || method != "summary" {
+		t.Fatalf("small window must compact: method=%q err=%v", method, err)
 	}
 	msgs, _ := cm.Build(context.Background())
 	if len(msgs) >= 12 || msgs[0].Blocks[0].Text != "S" {
@@ -223,13 +223,13 @@ func TestCalibrationShrinksKeepWhenProviderCountsHigher(t *testing.T) {
 	}
 }
 
-func TestNilSummarizerNeverCompacts(t *testing.T) {
+func TestNilSummarizerSkipsWithoutPrunableContent(t *testing.T) {
 	s, _ := session.New("s1", &session.MemoryStorage{})
 	cm := New(s, nil, 1000, 1, nil)
 	_ = cm.Record(ctxMsg(message.RoleUser, "u"), model.Usage{})
 	_ = cm.Record(ctxMsg(message.RoleAssistant, "a"), model.Usage{})
-	if did, err := cm.Compact(context.Background()); did || err != nil {
-		t.Fatalf("did=%v err=%v", did, err)
+	if method, err := cm.Compact(context.Background()); method != "" || err != nil {
+		t.Fatalf("method=%q err=%v", method, err)
 	}
 }
 

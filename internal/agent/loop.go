@@ -45,10 +45,10 @@ func (a *Agent) loop(ctx context.Context, steer <-chan message.Message, emit fun
 			default:
 			}
 		}
-		// mid-turn 压缩：上一步 usage 超阈值，在下一次模型调用前压缩
+		// mid-turn 压缩：上一步 usage 超阈值，在下一次模型调用前压缩（先剪枝后摘要）
 		if lastUsage.PromptTokens > 0 && a.cc.ShouldCompact(lastUsage) {
-			if did, err := a.cc.Compact(ctx); err == nil && did {
-				emit(AgentEvent{Type: EventCompaction, Compaction: &CompactionInfo{Reason: "mid-turn"}})
+			if method, err := a.cc.Compact(ctx); err == nil && method != "" {
+				emit(AgentEvent{Type: EventCompaction, Compaction: &CompactionInfo{Reason: compactionReason("mid-turn", method)}})
 				lastUsage = model.Usage{}
 			}
 		}
@@ -114,6 +114,12 @@ func (a *Agent) loop(ctx context.Context, steer <-chan message.Message, emit fun
 	}
 }
 
+// compactionReason 合成压缩事件 reason：触发点:方式（prune / summary），
+// TUI 与 headless 据此观测压缩阶梯（先剪枝、后摘要）。
+func compactionReason(trigger, method string) string {
+	return trigger + ":" + method
+}
+
 // handleModelError 分流模型错误：溢出 → 压缩恢复；瞬时 → 退避重试；其它 → EventError。
 // 返回 true 表示应继续循环（本步不计数）。
 func (a *Agent) handleModelError(ctx context.Context, err error, retries *int, emit func(AgentEvent)) bool {
@@ -121,9 +127,9 @@ func (a *Agent) handleModelError(ctx context.Context, err error, retries *int, e
 		return false // 取消：安静退出
 	}
 	if model.IsContextOverflow(err) {
-		did, cerr := a.cc.RecoverOverflow(ctx)
-		if cerr == nil && did {
-			emit(AgentEvent{Type: EventCompaction, Compaction: &CompactionInfo{Reason: "overflow"}})
+		method, cerr := a.cc.RecoverOverflow(ctx)
+		if cerr == nil && method != "" {
+			emit(AgentEvent{Type: EventCompaction, Compaction: &CompactionInfo{Reason: compactionReason("overflow", method)}})
 			return true
 		}
 		emit(AgentEvent{Type: EventError, Err: err})
