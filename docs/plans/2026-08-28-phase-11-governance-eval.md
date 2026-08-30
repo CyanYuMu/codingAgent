@@ -152,13 +152,18 @@
 
 ---
 
-# P11.2 edit 与文件守卫（下一步）
+# P11.2 edit 与文件守卫（已完成）
 
 ### Task 7: `FileGuard` + `editFileTool`
 
-- 失败测试：未 read → 拒；old 不唯一 → 拒（报告次数）；mtime 变了 → 拒；replace_all 全替换；换行/BOM 保留。
-- 实现：`internal/tool/fsguard.go`；read_file 成功读取登记；write_file 写后更新指纹。
-- 验证：`go test ./internal/tool/ -race`；提交。
+- [x] **Step 1: 写失败测试**（`internal/tool/fsguard_test.go` + `tools_test.go` edit 段 + `loop_read_dedup_test.go` 压缩失效冒烟）
+  - 守卫三态：未 read → 拒；指纹一致 → 过；外部修改（mtime+size 变）→ 拒并要求重读。
+  - old 不唯一 → 拒（报告出现次数与 replace_all 出路），拒绝时文件不得改动；replace_all 全替换。
+  - CRLF/BOM 字节级保留；old 为空 / old==new / 文件不存在 / 未找到 → 拒。
+  - write_file 后 edit 免重读（写后登记新指纹）；edit 后连续编辑免重读（指纹随写更新）。
+  - 压缩失效：`Registry.InvalidateReadHistory` 清已读区间、保留指纹；loop 层 mid-turn 与溢出恢复两个入口冒烟——压缩后重读同一文件必须返回真实内容而非「未变更」（修复 P10.4 去重 × 压缩的交互缺口）。
+- [x] **Step 2: 实现**：`internal/tool/fsguard.go`（fileGuard：recordRead/alreadyRead/markWritten/freshRead/invalidateReads/reset + 路径 Clean 归一）；`tools.go` 新增 editFileTool（Tier=Write、Exclusive、原始字节替换保留换行/BOM、写后 markWritten）与 write_file 指纹登记；read_file 去重状态迁移为 read/write/edit 三工具共享 guard（spec §4「共享同一条记录路径」）；`registry.go` 新增 `ReadHistoryInvalidator`；`agent/loop.go` 两处压缩成功点调用失效。会话隔离免费成立：workerTools 工厂给主 agent 与每个子 agent 各建独立 Builtins 实例。
+- [x] **Step 3: 验证** `go test ./internal/tool/ ./internal/agent/ -race`；build/vet/test 全绿。
 
 # P11.3 hooks（再下一步）
 

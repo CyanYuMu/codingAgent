@@ -74,6 +74,20 @@ func (r *Registry) ResetConv() {
 	}
 }
 
+// ReadHistoryInvalidator 压缩/剪枝成功后需要失效「内容仍在上文中」前提的工具。
+// 与 ConvState 的分工：ResetConv 换会话清全部；InvalidateReadHistory 只清已读区间、
+// 保留 edit 守卫的指纹——旧内容进了摘要/占位后去重提示是谎话，但「本会话读过且文件未变」仍是事实。
+type ReadHistoryInvalidator interface{ InvalidateReadHistory() }
+
+// InvalidateReadHistory 在压缩/剪枝成功后由循环调用（mid-turn 与溢出恢复两个入口）。
+func (r *Registry) InvalidateReadHistory() {
+	for _, t := range r.List() {
+		if inv, ok := t.(ReadHistoryInvalidator); ok {
+			inv.InvalidateReadHistory()
+		}
+	}
+}
+
 // Specs 转成给模型的工具定义（按名字排序，保证稳定）。
 func (r *Registry) Specs() []model.ToolSpec {
 	r.mu.RLock()

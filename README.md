@@ -151,6 +151,6 @@ memory:
 | P8 (M1) | 项目作用域数据目录、Session v2、压缩正确性、子 agent 运行时修正 | ✅ |
 | P9 (M2) | 委派运行时：frontmatter agent、TaskBatch 预检、yield 三态、Agent Hub、后台作业、hub 邮箱 | ✅ |
 | P10 (M3) | 记忆正确性、前缀缓存、L1 项目层、剪枝阶梯、项目知识、read 去重 | ✅ |
-| P11 (M4) | 审批规则引擎 + bash 分类器/超时/进程组/env 脱敏（P11.1）；edit / hooks / trace.db / eval v2（后续） | 🚧 P11.1 完成 |
+| P11 (M4) | 审批规则引擎 + bash 分类器/超时/进程组/env 脱敏（P11.1）；edit 工具与文件守卫（P11.2）；hooks / trace.db / eval v2（后续） | 🚧 P11.1–P11.2 完成 |
 
 详细演进方案见 [docs/specs/2026-08-24-evolution-plan.md](docs/specs/2026-08-24-evolution-plan.md)，完整开发记录见 [docs/DEVELOPMENT_LOG.md](docs/DEVELOPMENT_LOG.md)。

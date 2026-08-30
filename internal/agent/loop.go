@@ -48,6 +48,7 @@ func (a *Agent) loop(ctx context.Context, steer <-chan message.Message, emit fun
 		// mid-turn 压缩：上一步 usage 超阈值，在下一次模型调用前压缩（先剪枝后摘要）
 		if lastUsage.PromptTokens > 0 && a.cc.ShouldCompact(lastUsage) {
 			if method, err := a.cc.Compact(ctx); err == nil && method != "" {
+				a.tools.InvalidateReadHistory() // 旧内容已进摘要/占位：read_file 去重的前提失效
 				emit(AgentEvent{Type: EventCompaction, Compaction: &CompactionInfo{Reason: compactionReason("mid-turn", method)}})
 				lastUsage = model.Usage{}
 			}
@@ -129,6 +130,7 @@ func (a *Agent) handleModelError(ctx context.Context, err error, retries *int, e
 	if model.IsContextOverflow(err) {
 		method, cerr := a.cc.RecoverOverflow(ctx)
 		if cerr == nil && method != "" {
+			a.tools.InvalidateReadHistory() // 同 mid-turn：恢复后的上文里旧内容已不在
 			emit(AgentEvent{Type: EventCompaction, Compaction: &CompactionInfo{Reason: compactionReason("overflow", method)}})
 			return true
 		}
