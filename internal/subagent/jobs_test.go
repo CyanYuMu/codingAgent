@@ -2,12 +2,14 @@ package subagent
 
 import (
 	"context"
+	"os"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"einoclaw-build/internal/model"
+	"einoclaw-build/internal/runtime"
 )
 
 // bgOpts 后台作业测试用的装配：慢一点的模型，方便断言「立刻返回」。
@@ -77,6 +79,88 @@ func TestSettledDeliveredExactlyOnce(t *testing.T) {
 	}
 	if got := mgr.TakeSettled(); len(got) != 0 {
 		t.Fatalf("第二次取件应为空，实际 %d 条", len(got))
+	}
+}
+
+func TestSettledDeliveryIsScopedAndAckedAfterPersistence(t *testing.T) {
+	o := bgOpts(t, &scriptModel{steps: []model.ModelEvent{call("c1", "yield", `{"data":{"ok":true}}`)}})
+	o.SessionID = "session-a"
+	dirA := o.SessionDir
+	dirB := t.TempDir()
+	o.ArtifactStore = runtime.NewArtifactStore(dirA)
+	mgr := NewManager(o)
+
+	env := mgr.Env(0, "", nil)
+	env.Owner = "ParentRun"
+	_, _, err := mgr.StartBackground(context.Background(), one("explorer", "x"), env)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mgr.SetMainSession("session-b", dirB)
+	if got := o.ArtifactStore.Dir(); got != dirB {
+		t.Fatalf("main artifact store still points at old session: %q", got)
+	}
+	waitFor(t, 3*time.Second, func() bool { return mgr.Pending() == 0 })
+
+	if got := mgr.PeekSettled(MainName, "session-a"); len(got) != 0 {
+		t.Fatalf("wrong owner saw delivery: %+v", got)
+	}
+	if got := mgr.PeekSettled("ParentRun", "session-b"); len(got) != 0 {
+		t.Fatalf("wrong session saw delivery: %+v", got)
+	}
+	first := mgr.PeekSettled("ParentRun", "session-a")
+	second := mgr.PeekSettled("ParentRun", "session-a")
+	if len(first) != 1 || len(second) != 1 || first[0].DeliveryID == "" || first[0].DeliveryID != second[0].DeliveryID {
+		t.Fatalf("delivery should remain stable before ack: first=%+v second=%+v", first, second)
+	}
+	if !strings.HasPrefix(first[0].Result.OutputFile, dirA) {
+		t.Fatalf("old-session job wrote into switched session: %q, want prefix %q", first[0].Result.OutputFile, dirA)
+	}
+	mgr.AckSettled([]string{first[0].DeliveryID})
+	if got := mgr.PeekSettled("ParentRun", "session-a"); len(got) != 0 {
+		t.Fatalf("acked delivery remained pending: %+v", got)
+	}
+}
+
+func TestNestedBackgroundResultRevivesItsParkedOwner(t *testing.T) {
+	m := &scriptModel{steps: []model.ModelEvent{
+		call("parent-first", "yield", `{"data":{"round":1}}`),
+		call("child-done", "yield", `{"data":{"child":"done"}}`),
+		call("parent-resumed", "yield", `{"data":{"integrated":true}}`),
+	}}
+	o := bgOpts(t, m)
+	o.SessionID = "session-a"
+	mgr := NewManager(o)
+
+	parentBatch := one("explorer", "start parent")
+	parentBatch.Tasks[0].Name = "ParentRun"
+	if got := runOne(t, mgr, context.Background(), parentBatch); got.Status != StatusCompleted {
+		t.Fatalf("parent first run = %+v", got)
+	}
+	env := mgr.Env(1, "parent-agent", []string{"explorer"})
+	env.Owner = "ParentRun"
+	childBatch := one("explorer", "background child")
+	childBatch.Tasks[0].Name = "ChildRun"
+	if _, _, err := mgr.StartBackground(context.Background(), childBatch, env); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, 3*time.Second, func() bool {
+		return len(mgr.PeekSettled(MainName, "session-a")) == 1
+	})
+
+	if got := mgr.PeekSettled("ParentRun", "session-a"); len(got) != 0 {
+		t.Fatalf("child result was not acknowledged after reviving parent: %+v", got)
+	}
+	mainResults := mgr.PeekSettled(MainName, "session-a")
+	if len(mainResults) != 1 || mainResults[0].JobID != "ParentRun" || mainResults[0].Result.Status != StatusCompleted {
+		t.Fatalf("resumed parent result was not routed to Main: %+v", mainResults)
+	}
+	transcript, err := os.ReadFile(mainResults[0].Result.SessionFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(transcript), "后台作业 ChildRun 已完成") {
+		t.Fatalf("parent transcript lacks child delivery: %s", transcript)
 	}
 }
 

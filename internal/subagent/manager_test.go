@@ -387,6 +387,29 @@ func TestToolSetSpawnsAndDepth(t *testing.T) {
 	}
 }
 
+func TestNestedSynchronousDelegationDoesNotDeadlockAtConcurrencyLimit(t *testing.T) {
+	m := &scriptModel{steps: []model.ModelEvent{
+		call("parent-task", "task", `{"context":"nested contract","tasks":[{"agent":"worker","task":"inspect target and return the result"}]}`),
+		call("child-yield", "yield", `{"data":{"ok":true}}`),
+		call("parent-yield", "yield", `{"data":{"nested":"completed"}}`),
+	}}
+	o := baseOpts(m, t.TempDir())
+	o.MaxConcurrency = 1
+	o.Defs[0].Spawns = []string{"worker"}
+	o.Defs = append(o.Defs, AgentDef{Name: "worker", Description: "nested worker", SystemPrompt: "work", MaxTurns: 5})
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	started := time.Now()
+	r := runOne(t, NewManager(o), ctx, one("explorer", "delegate nested work"))
+	if elapsed := time.Since(started); elapsed > 500*time.Millisecond {
+		t.Fatalf("nested delegation blocked for %s", elapsed)
+	}
+	if r.Status != StatusCompleted || !r.Yielded {
+		t.Fatalf("result = %+v", r)
+	}
+}
+
 func TestResolveDefAppliesDefaultsAndBudgetCeiling(t *testing.T) {
 	mgr := NewManager(Options{DefaultMaxTurns: 40, DefaultTimeout: time.Minute, SoftBudget: 200})
 	got := mgr.resolveDef(AgentDef{Name: "a"})
@@ -482,6 +505,32 @@ func TestDeliverRouting(t *testing.T) {
 		}
 	default:
 		t.Fatal("消息没进 steer 队列")
+	}
+}
+
+func TestMainMailboxIsScopedAndAcked(t *testing.T) {
+	o := baseOpts(&scriptModel{}, t.TempDir())
+	o.SessionID = "session-a"
+	mgr := NewManager(o)
+	run := newOwnedRun("Scout", "explorer", 1, MainName, "session-a")
+	mgr.register(run)
+	run.setStatus(StatusRunning)
+
+	mgr.SetMainSession("session-b", t.TempDir())
+	if _, err := mgr.Deliver("Scout", MainName, "old session result", ""); err != nil {
+		t.Fatal(err)
+	}
+	if got := mgr.PeekMainInbox("session-b"); len(got) != 0 {
+		t.Fatalf("message leaked into current session: %+v", got)
+	}
+	first := mgr.PeekMainInbox("session-a")
+	second := mgr.PeekMainInbox("session-a")
+	if len(first) != 1 || len(second) != 1 || first[0].DeliveryID != second[0].DeliveryID {
+		t.Fatalf("mail should remain until ack: first=%+v second=%+v", first, second)
+	}
+	mgr.AckMainInbox([]string{first[0].DeliveryID})
+	if got := mgr.PeekMainInbox("session-a"); len(got) != 0 {
+		t.Fatalf("acked mail remained pending: %+v", got)
 	}
 }
 

@@ -15,6 +15,7 @@ import (
 // hubTickMsg 表示子 agent 那边有新状态，重绘即可（面板每次渲染直接读名册快照，
 // 不在 TUI 里维护第二份状态，避免两处状态不一致）。
 type hubTickMsg struct{}
+type hubPollMsg struct{}
 
 var (
 	hubTitleStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("14")).Bold(true)
@@ -61,6 +62,12 @@ func waitHubEvent(ch <-chan bus.Envelope) tea.Cmd {
 			}
 		}
 	}
+}
+
+// pollHub 是可靠性兜底：bus 的生命周期/进度事件允许丢弃，但后台结果本身是
+// Manager 内的真相源。即使唤醒事件在 UI 忙时被合并或丢弃，轮询也会最终触发投递。
+func pollHub() tea.Cmd {
+	return tea.Tick(time.Second, func(time.Time) tea.Msg { return hubPollMsg{} })
 }
 
 // renderHub 渲染 Agent Hub 面板：表头聚合 + 每个 Run 一行。

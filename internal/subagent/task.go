@@ -14,15 +14,21 @@ import (
 // taskTool 让模型派发子 agent。一次调用 = 一个批次（tasks 多项 = 并行）。
 // depth/self/spawns 决定它自己能派谁：主 agent 是 (0, "", nil)，子 agent 带着自己的定义约束。
 type taskTool struct {
-	mgr    *Manager
-	depth  int
-	self   string
-	spawns []string
+	mgr       *Manager
+	depth     int
+	self      string
+	owner     string
+	sessionID string
+	spawns    []string
 }
 
 // NewTaskTool 构造 task 工具。
 func NewTaskTool(mgr *Manager, depth int, self string, spawns []string) tool.Tool {
 	return taskTool{mgr: mgr, depth: depth, self: self, spawns: spawns}
+}
+
+func newTaskTool(mgr *Manager, depth int, self, owner, sessionID string, spawns []string) tool.Tool {
+	return taskTool{mgr: mgr, depth: depth, self: self, owner: owner, sessionID: sessionID, spawns: spawns}
 }
 
 func (taskTool) Name() string { return "task" }
@@ -97,6 +103,12 @@ func (taskTool) Concurrency() tool.Concurrency {
 func (t taskTool) Execute(ctx context.Context, args map[string]any, sink *runtime.Sink) error {
 	batch, legacy := parseBatch(args)
 	env := t.mgr.Env(t.depth, t.self, t.spawns)
+	if t.owner != "" {
+		env.Owner = t.owner
+	}
+	if t.sessionID != "" {
+		env.SessionID = t.sessionID
+	}
 	var sb strings.Builder
 	if legacy != "" {
 		sb.WriteString(legacy + "\n\n")

@@ -365,7 +365,8 @@ func main() {
 	evbus := bus.New()
 	mgr := subagent.NewManager(subagent.Options{
 		Model: m, WorkerTools: workerTools, Memory: mem, Mode: mode, Rules: rules, Approver: approver,
-		Escalate: cfg.Subagent.ApprovalEscalation, SessionDir: artifactDir, CWD: cwd,
+		Escalate: cfg.Subagent.ApprovalEscalation, ArtifactStore: store,
+		SessionID: s.Header().ID, SessionDir: artifactDir, CWD: cwd,
 		MaxConcurrency: cfg.Subagent.MaxConcurrency, Defs: discoverAgents(cwd), Summarizer: summ,
 		ContextWindow: cfg.Models[0].ContextWindow, Bus: evbus,
 		DefaultTimeout: cfg.Subagent.DefaultTimeout, DefaultMaxTurns: cfg.Subagent.DefaultMaxTurns,

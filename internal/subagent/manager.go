@@ -35,11 +35,13 @@ type Options struct {
 	Model          model.Model
 	WorkerTools    func(cwd string, store *runtime.ArtifactStore) *tool.Registry // 每个 Run 调用一次，返回独立工具集
 	Memory         memory.Recaller
-	Mode           permission.Mode  // 继承父的审批模式（不是 yolo）
-	Rules          permission.Rules // 继承父的审批规则（deny 在任何模式都生效）
-	Approver       tool.Approver    // 父的审批器；Escalate 时使用
-	Escalate       bool             // true = headless 子 agent 的 Prompt 决策升级到父审批（弹窗带子 agent 标签）
-	SessionDir     string           // 父会话产物目录；"" = 不落盘（MemoryStorage）
+	Mode           permission.Mode        // 继承父的审批模式（不是 yolo）
+	Rules          permission.Rules       // 继承父的审批规则（deny 在任何模式都生效）
+	Approver       tool.Approver          // 父的审批器；Escalate 时使用
+	Escalate       bool                   // true = headless 子 agent 的 Prompt 决策升级到父审批（弹窗带子 agent 标签）
+	ArtifactStore  *runtime.ArtifactStore // 主 Agent 工具共享的 store；换会话时同步切目录
+	SessionID      string                 // 当前根会话 id；后台结果按它路由
+	SessionDir     string                 // 父会话产物目录；"" = 不落盘（MemoryStorage）
 	CWD            string
 	MaxConcurrency int
 	Defs           []AgentDef
@@ -63,20 +65,27 @@ type Options struct {
 // 名册按运行名索引（运行名同时是 hub 地址、agent:// 地址与作业 id，预检保证唯一）；
 // 结束的 Run 留在名册里（parked），这样父 agent 与 TUI 事后还能读它的产出与转录。
 type Manager struct {
-	o    Options
-	gate *gate
-	seq  atomic.Int64
+	o           Options
+	gate        *gate
+	runModel    model.Model
+	seq         atomic.Int64
+	deliverySeq atomic.Int64
+	mailSeq     atomic.Int64
 
 	// 后台作业挂在这个根 ctx 上：父 turn 结束、用户 Esc 都不该带走后台任务，只有进程退出才收。
 	root       context.Context
 	rootCancel context.CancelFunc
 	wg         sync.WaitGroup
+	reviveMu   sync.Mutex // 防止多个子结果同时唤醒同一个 parked Run
 
 	mu      sync.Mutex
 	runs    map[string]*Run
 	order   []string // 启动顺序，名册展示用
 	pending []JobResult
 	boxes   map[string]*mailbox
+	// 会话可在 TUI 中切换；旧映射必须保留，才能让仍在跑的旧作业落回原目录。
+	currentSession string
+	sessionDirs    map[string]string
 }
 
 // maxParkedRuns 名册里保留的已结束 Run 上限：超出后丢最早的（磁盘上的转录与产出不删）。
@@ -94,8 +103,40 @@ func NewManager(o Options) *Manager {
 		o.DefaultMaxTurns = 50
 	}
 	root, cancel := context.WithCancel(context.Background())
-	return &Manager{o: o, gate: newGate(o.MaxConcurrency), runs: map[string]*Run{},
-		boxes: map[string]*mailbox{}, root: root, rootCancel: cancel}
+	g := newGate(o.MaxConcurrency)
+	dirs := map[string]string{o.SessionID: o.SessionDir}
+	return &Manager{o: o, gate: g, runModel: &gatedModel{base: o.Model, gate: g}, runs: map[string]*Run{},
+		boxes: map[string]*mailbox{}, currentSession: o.SessionID, sessionDirs: dirs, root: root, rootCancel: cancel}
+}
+
+// SetMainSession 切换主 agent 的会话归属。已有 Run 仍保留创建时的 session id/dir。
+func (m *Manager) SetMainSession(id, dir string) {
+	m.mu.Lock()
+	m.currentSession = id
+	m.sessionDirs[id] = dir
+	m.mu.Unlock()
+	if m.o.ArtifactStore != nil {
+		m.o.ArtifactStore.SetDir(dir)
+	}
+}
+
+// CurrentSessionID 返回新派发任务所属的根会话。
+func (m *Manager) CurrentSessionID() string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.currentSession
+}
+
+func (m *Manager) sessionDir(id string) string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if id == "" {
+		id = m.currentSession
+	}
+	if dir, ok := m.sessionDirs[id]; ok {
+		return dir
+	}
+	return m.o.SessionDir
 }
 
 // register 把 Run 放进名册（同名覆盖：预检已保证同时只有一个活的同名 Run）。
@@ -137,6 +178,13 @@ func (m *Manager) lookup(name string) *Run {
 
 // Roster 返回名册快照（按启动顺序）。
 func (m *Manager) Roster() []RunView {
+	return m.rosterFor("")
+}
+
+// RosterFor 只返回一个根会话里的 Run；空 sessionID 表示全部（兼容管理视图）。
+func (m *Manager) RosterFor(sessionID string) []RunView { return m.rosterFor(sessionID) }
+
+func (m *Manager) rosterFor(sessionID string) []RunView {
 	m.mu.Lock()
 	runs := make([]*Run, 0, len(m.order))
 	for _, n := range m.order {
@@ -147,6 +195,10 @@ func (m *Manager) Roster() []RunView {
 	m.mu.Unlock()
 	out := make([]RunView, 0, len(runs))
 	for _, r := range runs {
+		_, runSession := r.deliveryRoute()
+		if sessionID != "" && runSession != sessionID {
+			continue
+		}
 		out = append(out, r.View())
 	}
 	return out
@@ -182,7 +234,12 @@ func (m *Manager) Cancel(names []string) int {
 //   - 运行中的子 agent：作为 steering 注入它的下一步
 //   - 已结束的子 agent：唤醒续跑（后台作业），结果按 async-result 回投
 func (m *Manager) Deliver(from, to, text, replyTo string) (string, error) {
-	mail := Mail{From: from, Text: text, ReplyTo: replyTo, At: time.Now()}
+	sessionID := m.CurrentSessionID()
+	if sender := m.lookup(from); sender != nil {
+		_, sessionID = sender.deliveryRoute()
+	}
+	mail := Mail{DeliveryID: fmt.Sprintf("mail-%d", m.mailSeq.Add(1)), SessionID: sessionID,
+		From: from, Text: text, ReplyTo: replyTo, At: time.Now()}
 	if to == MainName {
 		m.box(MainName).push(mail)
 		if m.o.Bus != nil {
@@ -194,8 +251,13 @@ func (m *Manager) Deliver(from, to, text, replyTo string) (string, error) {
 	if r == nil {
 		return "", fmt.Errorf("没有名为 %q 的 peer；当前名册：%s", to, strings.Join(append([]string{MainName}, m.names()...), ", "))
 	}
+	_, targetSession := r.deliveryRoute()
+	if targetSession != sessionID {
+		return "", fmt.Errorf("%s 属于另一个根会话，不能跨会话投递", to)
+	}
 	if r.settled() {
-		job, err := m.Revive(to, formatMail(mail))
+		_, sessionID := r.deliveryRoute()
+		job, err := m.revive(to, formatMail(mail), from, sessionID)
 		if err != nil {
 			return "", err
 		}
@@ -249,7 +311,7 @@ func (m *Manager) ResolveAgentURL(name string) (string, error) {
 		}
 	}
 	// 名册里没有（例如 resume 之后）：回落到产物目录里按名字找
-	p := filepath.Join(m.o.SessionDir, sanitizeName(name)+".md")
+	p := filepath.Join(m.sessionDir(""), sanitizeName(name)+".md")
 	if _, err := os.Stat(p); err == nil {
 		return p, nil
 	}
@@ -263,7 +325,7 @@ func (m *Manager) ResolveHistoryURL(name string) (string, error) {
 			return f, nil
 		}
 	}
-	matches, _ := filepath.Glob(filepath.Join(m.o.SessionDir, "agent-"+sanitizeName(name)+"-*.jsonl"))
+	matches, _ := filepath.Glob(filepath.Join(m.sessionDir(""), "agent-"+sanitizeName(name)+"-*.jsonl"))
 	if len(matches) == 0 {
 		return "", fmt.Errorf("找不到 %q 的转录；当前名册：%s", name, strings.Join(m.names(), ", "))
 	}
@@ -282,7 +344,7 @@ func (m *Manager) List() []AgentDef { return m.o.Defs }
 // Env 返回一次派发的调用者环境：主 agent 用 Env(0, "", nil)，子 agent 用 Env(depth, 自己的 agent 名, 自己的 spawns)。
 func (m *Manager) Env(depth int, self string, spawns []string) Env {
 	return Env{
-		Defs: m.o.Defs, Depth: depth, MaxDepth: m.o.MaxDepth, Spawns: spawns, SelfAgent: self,
+		Defs: m.o.Defs, Owner: MainName, SessionID: m.CurrentSessionID(), Depth: depth, MaxDepth: m.o.MaxDepth, Spawns: spawns, SelfAgent: self,
 		MinTaskChars: m.o.MinTaskChars,
 		SeqNext:      func(agent string) string { return fmt.Sprintf("%s-%d", agent, m.seq.Add(1)) },
 		NameTaken:    func(name string) bool { return m.lookup(name) != nil }, // 名册里的名字（含 parked）不复用
@@ -318,21 +380,16 @@ func (m *Manager) RunBatch(ctx context.Context, b TaskBatch, env Env) ([]Result,
 	results := make([]Result, len(items))
 	var wg sync.WaitGroup
 	for i, it := range items {
-		if err := m.gate.acquire(ctx); err != nil {
-			results[i] = Result{Name: it.Item.Name, Agent: it.Item.Agent, Status: StatusAborted, Err: err}
-			continue
-		}
 		wg.Add(1)
 		go func(i int, it Resolved) {
 			defer wg.Done()
-			defer m.gate.release()
 			defer func() {
 				if r := recover(); r != nil {
 					results[i] = Result{Name: it.Item.Name, Agent: it.Item.Agent, Status: StatusFailed,
 						Err: fmt.Errorf("子 agent panic: %v", r)}
 				}
 			}()
-			results[i] = m.Run(ctx, b.Context, it, env.Depth+1)
+			results[i] = m.run(ctx, b.Context, it, env.Depth+1, env.SessionID)
 		}(i, it)
 	}
 	wg.Wait()
@@ -342,26 +399,34 @@ func (m *Manager) RunBatch(ctx context.Context, b TaskBatch, env Env) ([]Result,
 // Run 执行一项已预检的任务并等待其结束。
 // Context Isolation：子 agent 只看到 system + batch context + task，不看父历史；父只拿结构化产出/最后文本 + 指针。
 func (m *Manager) Run(ctx context.Context, batchContext string, r Resolved, depth int) Result {
+	return m.run(ctx, batchContext, r, depth, m.CurrentSessionID())
+}
+
+func (m *Manager) run(ctx context.Context, batchContext string, r Resolved, depth int, sessionID string) Result {
 	def := m.resolveDef(r.Def)
-	run := newRun(r.Item.Name, def.Name, depth)
+	run := newOwnedRun(r.Item.Name, def.Name, depth, MainName, sessionID)
 	m.register(run)
 	rs, err := m.setup(def, r, batchContext, depth, run)
 	if err != nil {
 		run.setStatus(StatusFailed)
 		return Result{ID: run.name, Name: run.name, Agent: def.Name, Status: StatusFailed, Err: err}
 	}
-	defer rs.sess.Close()
-	return m.drive(ctx, run, rs)
+	result := func() Result {
+		defer rs.sess.Close()
+		return m.drive(ctx, run, rs)
+	}()
+	m.wakeOwner(run.name, run.sessionID)
+	return result
 }
 
 // setup 装配一个 Run 的运行时：新建 sidecar 会话、写 session_init、记录任务，
 // 并把重建所需的信息挂到 Run 上（唤醒续跑时用）。
 func (m *Manager) setup(def AgentDef, r Resolved, batchContext string, depth int, run *Run) (*runtimeSet, error) {
-	sess, file, err := m.openSidecar(r.Item.Name, def, r, depth)
+	sess, file, err := m.openSidecar(r.Item.Name, def, r, depth, run.sessionID)
 	if err != nil {
 		return nil, err
 	}
-	rs := m.buildRuntime(def, r.Item.Name, depth, sess, file, r.Schema, r.SchemaMode)
+	rs := m.buildRuntime(def, r.Item.Name, depth, sess, file, r.Schema, r.SchemaMode, run.sessionID)
 	if err := rs.cc.Record(message.NewUserMessage(buildTaskPrompt(batchContext, r.Item)), model.Usage{}); err != nil {
 		sess.Close()
 		return nil, err
@@ -370,7 +435,7 @@ func (m *Manager) setup(def AgentDef, r Resolved, batchContext string, depth int
 		run.mu.Lock()
 		run.sessionFile = file
 		run.spawn = spawnSpec{def: def, item: r.Item, batchContext: batchContext,
-			schema: r.Schema, mode: r.SchemaMode, depth: depth, file: file}
+			schema: r.Schema, mode: r.SchemaMode, depth: depth, file: file, sessionID: run.sessionID}
 		run.mu.Unlock()
 	}
 	// session_init 里带上工具集，转录本身就能回答「它当时能做什么」
@@ -396,19 +461,19 @@ func (m *Manager) setupResume(spec spawnSpec) (*runtimeSet, error) {
 		st.Close()
 		return nil, err
 	}
-	return m.buildRuntime(spec.def, spec.item.Name, spec.depth, sess, spec.file, spec.schema, spec.mode), nil
+	return m.buildRuntime(spec.def, spec.item.Name, spec.depth, sess, spec.file, spec.schema, spec.mode, spec.sessionID), nil
 }
 
 // buildRuntime 组装工具集（含只含 yield 的备用集）、继承父审批的执行器与上下文管理器。
 func (m *Manager) buildRuntime(def AgentDef, name string, depth int, sess *session.Session, file string,
-	schema map[string]any, mode string) *runtimeSet {
+	schema map[string]any, mode, sessionID string) *runtimeSet {
 	var store *runtime.ArtifactStore
-	if m.o.SessionDir != "" {
-		store = runtime.NewArtifactStore(m.o.SessionDir)
+	if dir := m.sessionDir(sessionID); dir != "" {
+		store = runtime.NewArtifactStore(dir)
 		m.registerSchemes(store) // 子 agent 之间也能 read_file agent://<Name>
 	}
 	ys := NewYieldState()
-	tools, yieldOnly := m.buildTools(def, name, depth, store, ys, schema, mode)
+	tools, yieldOnly := m.buildTools(def, name, depth, store, ys, schema, mode, sessionID)
 
 	var approver tool.Approver = denyApprover{}
 	if m.o.Escalate && m.o.Approver != nil {
@@ -440,7 +505,7 @@ func (m *Manager) buildRuntime(def AgentDef, name string, depth int, sess *sessi
 
 // buildTools 构造一个 Run 的工具集，并返回「只含 yield」的备用注册表（强制收尾那一 turn 用）。
 // 规则：默认集（或定义指定的子集）→ 只读 agent 裁到读工具 → 加 yield → 满足 spawn policy 与深度才加 task。
-func (m *Manager) buildTools(def AgentDef, name string, depth int, store *runtime.ArtifactStore, ys *YieldState, schema map[string]any, mode string) (all, yieldOnly *tool.Registry) {
+func (m *Manager) buildTools(def AgentDef, name string, depth int, store *runtime.ArtifactStore, ys *YieldState, schema map[string]any, mode, sessionID string) (all, yieldOnly *tool.Registry) {
 	base := tool.NewRegistry()
 	if m.o.WorkerTools != nil {
 		base = m.o.WorkerTools(m.o.CWD, store)
@@ -464,14 +529,14 @@ func (m *Manager) buildTools(def AgentDef, name string, depth int, store *runtim
 	}
 	y := NewYieldTool(ys, schema, mode)
 	all.Register(y)
-	all.Register(NewHubTool(m, name)) // 协调用：看名册、给同伴发消息、等作业
+	all.Register(newHubTool(m, name, sessionID)) // 协调用：看名册、给同伴发消息、等作业
 
 	maxDepth := m.o.MaxDepth
 	if maxDepth <= 0 {
 		maxDepth = defaultMaxDepth
 	}
 	if len(def.Spawns) > 0 && depth < maxDepth {
-		all.Register(NewTaskTool(m, depth, def.Name, def.Spawns))
+		all.Register(newTaskTool(m, depth, def.Name, name, sessionID, def.Spawns))
 	}
 
 	yieldOnly = tool.NewRegistry()
@@ -502,15 +567,16 @@ const subagentCompletionNote = `
 如果确实无法完成，也要调用 yield，在 error 参数里说明尝试过什么、卡在哪里。`
 
 // openSidecar 为子 agent 建独立会话：有 SessionDir 则落盘为 agent-<name>-<rand>.jsonl，否则内存。
-func (m *Manager) openSidecar(name string, def AgentDef, r Resolved, depth int) (*session.Session, string, error) {
+func (m *Manager) openSidecar(name string, def AgentDef, r Resolved, depth int, sessionID string) (*session.Session, string, error) {
 	var st session.Storage
 	file := ""
-	if m.o.SessionDir != "" {
-		if err := os.MkdirAll(m.o.SessionDir, 0o755); err != nil {
+	dir := m.sessionDir(sessionID)
+	if dir != "" {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
 			return nil, "", err
 		}
 		// 文件名带随机后缀：同名任务重跑 / 会话 resume 后再派发都不会追加进旧转录
-		file = filepath.Join(m.o.SessionDir, "agent-"+sanitizeName(name)+"-"+randSuffix()+".jsonl")
+		file = filepath.Join(dir, "agent-"+sanitizeName(name)+"-"+randSuffix()+".jsonl")
 		fs, err := session.NewFileStorage(file)
 		if err != nil {
 			return nil, "", err
@@ -519,7 +585,7 @@ func (m *Manager) openSidecar(name string, def AgentDef, r Resolved, depth int) 
 	} else {
 		st = &session.MemoryStorage{}
 	}
-	sess, err := session.NewWithHeader(session.Header{ID: "agent-" + name, CWD: m.o.CWD, ParentSession: filepath.Base(m.o.SessionDir)}, st)
+	sess, err := session.NewWithHeader(session.Header{ID: "agent-" + name, CWD: m.o.CWD, ParentSession: sessionID}, st)
 	if err != nil {
 		return nil, "", err
 	}

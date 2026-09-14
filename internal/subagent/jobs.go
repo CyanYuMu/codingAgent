@@ -104,8 +104,11 @@ type JobInfo struct {
 
 // JobResult 已结算、还没投递给父的结果。
 type JobResult struct {
-	JobID  string
-	Result Result
+	DeliveryID string
+	JobID      string
+	Owner      string
+	SessionID  string
+	Result     Result
 }
 
 // StartBackground 派发一批后台作业：立刻返回作业 id，结果结算后按 async-result 投递。
@@ -119,10 +122,18 @@ func (m *Manager) StartBackground(ctx context.Context, b TaskBatch, env Env) (in
 	for _, it := range items {
 		def := m.resolveDef(it.Def)
 		if def.Blocking {
-			inline = append(inline, m.Run(ctx, b.Context, it, env.Depth+1))
+			inline = append(inline, m.run(ctx, b.Context, it, env.Depth+1, env.SessionID))
 			continue
 		}
-		run := newRun(it.Item.Name, def.Name, env.Depth+1)
+		owner := env.Owner
+		if owner == "" {
+			owner = MainName
+		}
+		sessionID := env.SessionID
+		if sessionID == "" {
+			sessionID = m.CurrentSessionID()
+		}
+		run := newOwnedRun(it.Item.Name, def.Name, env.Depth+1, owner, sessionID)
 		run.background = true
 		m.register(run)
 		jobs = append(jobs, JobInfo{ID: run.name, Agent: def.Name, Status: StatusString(StatusPending), Started: run.startedAt})
@@ -134,20 +145,20 @@ func (m *Manager) StartBackground(ctx context.Context, b TaskBatch, env Env) (in
 				if rec := recover(); rec != nil {
 					m.settleJob(run, Result{ID: run.name, Name: run.name, Agent: def.Name,
 						Status: StatusFailed, Err: fmt.Errorf("子 agent panic: %v", rec)})
+					m.wakeOwner(run.name, run.sessionID)
 				}
 			}()
-			if err := m.gate.acquire(m.root); err != nil {
-				m.settleJob(run, Result{ID: run.name, Name: run.name, Agent: def.Name, Status: StatusAborted, Err: err})
-				return
-			}
-			defer m.gate.release()
 			rs, err := m.setup(def, it, b.Context, env.Depth+1, run)
 			if err != nil {
 				m.settleJob(run, Result{ID: run.name, Name: run.name, Agent: def.Name, Status: StatusFailed, Err: err})
 				return
 			}
-			defer rs.sess.Close()
-			m.settleJob(run, m.drive(m.root, run, rs))
+			res := func() Result {
+				defer rs.sess.Close()
+				return m.drive(m.root, run, rs)
+			}()
+			m.settleJob(run, res)
+			m.wakeOwner(run.name, run.sessionID)
 		}(it, def, run)
 	}
 	return inline, jobs, nil
@@ -156,13 +167,43 @@ func (m *Manager) StartBackground(ctx context.Context, b TaskBatch, env Env) (in
 // settleJob 把一个后台作业的结果放进待投递队列，并广播作业结束。
 func (m *Manager) settleJob(run *Run, res Result) {
 	run.setStatus(StatusParked)
+	owner, sessionID := run.deliveryRoute()
 	m.mu.Lock()
-	m.pending = append(m.pending, JobResult{JobID: run.name, Result: res})
+	m.pending = append(m.pending, JobResult{
+		DeliveryID: fmt.Sprintf("delivery-%d", m.deliverySeq.Add(1)),
+		JobID:      run.name, Owner: owner, SessionID: sessionID, Result: res,
+	})
 	m.mu.Unlock()
 	if m.o.Bus != nil {
 		m.o.Bus.Publish(ChJob, JobSettled{JobID: run.name, Name: run.name,
 			Status: StatusString(res.Status), Summary: firstLine(res)})
 	}
+	m.wakeOwner(owner, sessionID)
+}
+
+// wakeOwner 把属于某个已 parked 父 Run 的结果持久化进它的 sidecar，并自动续跑。
+// 结果只有在 Record 成功、revive 已启动后才 ACK；父仍在运行时先保留，等它结算后再处理。
+func (m *Manager) wakeOwner(owner, sessionID string) {
+	if owner == "" || owner == MainName {
+		return
+	}
+	parent := m.lookup(owner)
+	if parent == nil || !parent.settled() {
+		return
+	}
+	items := m.PeekSettled(owner, sessionID)
+	if len(items) == 0 {
+		return
+	}
+	parentOwner, parentSession := parent.deliveryRoute()
+	if _, err := m.revive(owner, RenderAsyncResult(items, nil), parentOwner, parentSession); err != nil {
+		return
+	}
+	ids := make([]string, 0, len(items))
+	for _, item := range items {
+		ids = append(ids, item.DeliveryID)
+	}
+	m.AckSettled(ids)
 }
 
 // JobSettled 是作业结束广播（TUI 用它触发投递）。
@@ -171,7 +212,12 @@ type JobSettled struct{ JobID, Name, Status, Summary string }
 // Jobs 返回后台作业快照。已结束的行会**同时消费投递**：模型从这里看到结果后，
 // 就不该再收到一份 async-result（对齐 oh-my-pi 的 "settled row consumes auto-delivery"）。
 func (m *Manager) Jobs() []JobInfo {
-	taken := m.TakeSettled()
+	return m.JobsFor(MainName, m.CurrentSessionID())
+}
+
+// JobsFor 返回指定调用者/根会话能看到的后台作业，并消费其中已结算的结果。
+func (m *Manager) JobsFor(owner, sessionID string) []JobInfo {
+	taken := m.TakeSettledFor(owner, sessionID)
 	byID := map[string]Result{}
 	for _, s := range taken {
 		byID[s.JobID] = s.Result
@@ -183,6 +229,10 @@ func (m *Manager) Jobs() []JobInfo {
 	for _, n := range names {
 		r := runs[n]
 		if r == nil || !r.isBackground() {
+			continue
+		}
+		runOwner, runSession := r.deliveryRoute()
+		if runOwner != owner || runSession != sessionID {
 			continue
 		}
 		v := r.View()
@@ -203,6 +253,56 @@ func (m *Manager) TakeSettled() []JobResult {
 	out := m.pending
 	m.pending = nil
 	return out
+}
+
+// PeekSettled 返回指定收件人/根会话的待投递结果，但不删除；调用方在把通知
+// 成功写入目标会话后再 AckSettled，避免“先取走、后注入失败”导致结果丢失。
+func (m *Manager) PeekSettled(owner, sessionID string) []JobResult {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var out []JobResult
+	for _, item := range m.pending {
+		if item.Owner == owner && item.SessionID == sessionID {
+			out = append(out, item)
+		}
+	}
+	return out
+}
+
+// AckSettled 确认已持久化的投递；其它结果保持原顺序。
+func (m *Manager) AckSettled(deliveryIDs []string) {
+	if len(deliveryIDs) == 0 {
+		return
+	}
+	done := make(map[string]bool, len(deliveryIDs))
+	for _, id := range deliveryIDs {
+		done[id] = true
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	keep := m.pending[:0]
+	for _, item := range m.pending {
+		if !done[item.DeliveryID] {
+			keep = append(keep, item)
+		}
+	}
+	m.pending = keep
+}
+
+// TakeSettledFor 是 hub 的作用域化一次性取件入口。
+func (m *Manager) TakeSettledFor(owner, sessionID string) []JobResult {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var items, keep []JobResult
+	for _, item := range m.pending {
+		if item.Owner == owner && item.SessionID == sessionID {
+			items = append(items, item)
+		} else {
+			keep = append(keep, item)
+		}
+	}
+	m.pending = keep
+	return items
 }
 
 // Pending 返回还在跑的后台作业数。
@@ -240,6 +340,12 @@ func (m *Manager) Shutdown(grace time.Duration) error {
 // Revive 唤醒一个已结束的 Run：重开它的 sidecar 续跑，结果按后台作业投递。
 // text 原样记进它的会话（署名由调用方写好，见 formatMail），转录里能直接看出是谁在追问。
 func (m *Manager) Revive(name, text string) (JobInfo, error) {
+	return m.revive(name, text, MainName, m.CurrentSessionID())
+}
+
+func (m *Manager) revive(name, text, owner, sessionID string) (JobInfo, error) {
+	m.reviveMu.Lock()
+	defer m.reviveMu.Unlock()
 	run := m.lookup(name)
 	if run == nil {
 		return JobInfo{}, fmt.Errorf("没有名为 %q 的子 agent", name)
@@ -259,24 +365,27 @@ func (m *Manager) Revive(name, text string) (JobInfo, error) {
 		rs.sess.Close()
 		return JobInfo{}, err
 	}
+	run.mu.Lock()
+	run.owner, run.sessionID = owner, sessionID
+	run.mu.Unlock()
 	run.resetForRevive()
 
 	m.wg.Add(1)
 	go func() {
 		defer m.wg.Done()
-		defer rs.sess.Close()
 		defer func() {
 			if rec := recover(); rec != nil {
 				m.settleJob(run, Result{ID: run.name, Name: run.name, Agent: spec.def.Name,
 					Status: StatusFailed, Err: fmt.Errorf("子 agent panic: %v", rec)})
+				m.wakeOwner(run.name, run.sessionID)
 			}
 		}()
-		if err := m.gate.acquire(m.root); err != nil {
-			m.settleJob(run, Result{ID: run.name, Name: run.name, Agent: spec.def.Name, Status: StatusAborted, Err: err})
-			return
-		}
-		defer m.gate.release()
-		m.settleJob(run, m.drive(m.root, run, rs))
+		res := func() Result {
+			defer rs.sess.Close()
+			return m.drive(m.root, run, rs)
+		}()
+		m.settleJob(run, res)
+		m.wakeOwner(run.name, run.sessionID)
 	}()
 	return JobInfo{ID: run.name, Agent: spec.def.Name, Status: StatusString(StatusRunning), Started: time.Now()}, nil
 }

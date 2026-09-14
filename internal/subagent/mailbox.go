@@ -8,10 +8,12 @@ import (
 // Mail 是一条 peer 之间的消息。只用来协调（确认接口、说进度、问一句），
 // 长内容走 agent:// / artifact:// / 文件路径，不塞进消息里。
 type Mail struct {
-	From    string
-	Text    string
-	ReplyTo string
-	At      time.Time
+	DeliveryID string
+	SessionID  string
+	From       string
+	Text       string
+	ReplyTo    string
+	At         time.Time
 }
 
 // mailbox 是一个收件人的信箱。运行中的子 agent 收到消息是直接注入它的 steering 通道的，
@@ -43,6 +45,52 @@ func (b *mailbox) drain() []Mail {
 	return out
 }
 
+func (b *mailbox) peek(sessionID string) []Mail {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	var out []Mail
+	for _, mail := range b.msgs {
+		if mail.SessionID == sessionID {
+			out = append(out, mail)
+		}
+	}
+	return out
+}
+
+func (b *mailbox) ack(ids []string) {
+	if len(ids) == 0 {
+		return
+	}
+	done := make(map[string]bool, len(ids))
+	for _, id := range ids {
+		done[id] = true
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	keep := b.msgs[:0]
+	for _, mail := range b.msgs {
+		if !done[mail.DeliveryID] {
+			keep = append(keep, mail)
+		}
+	}
+	b.msgs = keep
+}
+
+func (b *mailbox) drainSession(sessionID string) []Mail {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	var items, keep []Mail
+	for _, item := range b.msgs {
+		if item.SessionID == sessionID {
+			items = append(items, item)
+		} else {
+			keep = append(keep, item)
+		}
+	}
+	b.msgs = keep
+	return items
+}
+
 func (b *mailbox) count() int {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -68,6 +116,10 @@ func (m *Manager) box(name string) *mailbox {
 
 // TakeMainInbox 取走发给主 agent 的消息（TUI/headless 负责把它们注入主会话）。
 func (m *Manager) TakeMainInbox() []Mail { return m.box(MainName).drain() }
+
+// PeekMainInbox/AckMainInbox 给自动投递通道提供“持久化后确认”语义。
+func (m *Manager) PeekMainInbox(sessionID string) []Mail { return m.box(MainName).peek(sessionID) }
+func (m *Manager) AckMainInbox(deliveryIDs []string)     { m.box(MainName).ack(deliveryIDs) }
 
 // MainInboxWait 返回主信箱的「有新消息」信号（headless 等待用）。
 func (m *Manager) MainInboxWait() <-chan struct{} { return m.box(MainName).waitCh() }

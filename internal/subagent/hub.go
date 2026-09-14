@@ -22,12 +22,24 @@ const (
 // hubTool 是 peer 协调工具：看名册、发消息、收消息、等事件、看作业、取消作业。
 // 主 agent 的地址固定是 Main，子 agent 用自己的运行名。
 type hubTool struct {
-	mgr  *Manager
-	self string
+	mgr       *Manager
+	self      string
+	sessionID string
 }
 
 // NewHubTool 构造 hub 工具；self 是调用者在名册里的地址。
 func NewHubTool(mgr *Manager, self string) tool.Tool { return hubTool{mgr: mgr, self: self} }
+
+func newHubTool(mgr *Manager, self, sessionID string) tool.Tool {
+	return hubTool{mgr: mgr, self: self, sessionID: sessionID}
+}
+
+func (h hubTool) scope() string {
+	if h.sessionID != "" {
+		return h.sessionID
+	}
+	return h.mgr.CurrentSessionID()
+}
 
 func (hubTool) Name() string { return "hub" }
 
@@ -78,13 +90,13 @@ func (h hubTool) Execute(ctx context.Context, args map[string]any, sink *runtime
 		sink.Write([]byte(res))
 		return nil
 	case "inbox":
-		sink.Write([]byte(renderMails(h.mgr.box(h.self).drain())))
+		sink.Write([]byte(renderMails(h.mgr.box(h.self).drainSession(h.scope()))))
 		return nil
 	case "wait":
 		sink.Write([]byte(h.wait(ctx, stringsOf(args["ids"]), waitDuration(args))))
 		return nil
 	case "jobs":
-		sink.Write([]byte(renderJobs(h.mgr.Jobs())))
+		sink.Write([]byte(renderJobs(h.mgr.JobsFor(h.self, h.scope()))))
 		return nil
 	case "cancel":
 		ids := stringsOf(args["ids"])
@@ -104,7 +116,7 @@ func (h hubTool) wait(ctx context.Context, ids []string, d time.Duration) string
 	ticker := time.NewTicker(hubWaitPoll)
 	defer ticker.Stop()
 	for {
-		if mails := box.drain(); len(mails) > 0 {
+		if mails := box.drainSession(h.scope()); len(mails) > 0 {
 			return "收到消息：\n" + renderMails(mails)
 		}
 		if done := h.settledAmong(ids); done != "" {
@@ -128,7 +140,7 @@ func (h hubTool) settledAmong(ids []string) string {
 		want[id] = true
 	}
 	var keep, hit []JobResult
-	for _, s := range h.mgr.TakeSettled() {
+	for _, s := range h.mgr.TakeSettledFor(h.self, h.scope()) {
 		if len(want) == 0 || want[s.JobID] {
 			hit = append(hit, s)
 		} else {
@@ -162,7 +174,7 @@ func waitDuration(args map[string]any) time.Duration {
 }
 
 func (h hubTool) renderRoster() string {
-	rows := h.mgr.Roster()
+	rows := h.mgr.RosterFor(h.scope())
 	var sb strings.Builder
 	sb.WriteString("可寻址的 peer：\n")
 	n := 0
