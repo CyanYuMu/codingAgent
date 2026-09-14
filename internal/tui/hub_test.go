@@ -1,10 +1,12 @@
 package tui
 
 import (
+	"context"
 	"strings"
 	"testing"
 	"time"
 
+	"einoclaw-build/internal/message"
 	"einoclaw-build/internal/subagent"
 )
 
@@ -70,5 +72,24 @@ func TestClipVisibleKeepsEscapes(t *testing.T) {
 	got := clipVisible(colored, 3)
 	if !strings.HasPrefix(got, "\x1b[31m") || strings.Contains(got, "DEF") {
 		t.Fatalf("截断结果 = %q", got)
+	}
+}
+
+func TestOldRunCannotClearNewRunState(t *testing.T) {
+	steerMu.Lock()
+	currentCancel, currentSteer, currentRunID = nil, nil, 0
+	steerMu.Unlock()
+
+	_, cancel1 := context.WithCancel(context.Background())
+	_, cancel2 := context.WithCancel(context.Background())
+	id1 := setCurrentRun(cancel1, make(chan message.Message, 1))
+	id2 := setCurrentRun(cancel2, make(chan message.Message, 1))
+	clearCurrentRun(id1)
+	if !runActive() {
+		t.Fatal("old run cleared the newer run state")
+	}
+	clearCurrentRun(id2)
+	if runActive() {
+		t.Fatal("current run state was not cleared")
 	}
 }

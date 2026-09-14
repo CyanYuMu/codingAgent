@@ -38,8 +38,9 @@ func (m mcpTool) Description() string        { return m.desc }
 func (m mcpTool) Parameters() map[string]any { return m.schema }
 func (m mcpTool) Required() []string         { return m.required }
 
-// Tier 外部工具默认按 write 处理（未知副作用不能当只读放行）。
-func (m mcpTool) Tier() permission.Tier    { return permission.TierWrite }
+// Tier 外部工具默认按 exec 处理：远端 schema 没有可靠的副作用标注，默认 write
+// 会在 write 模式静默放行外部变更，因此必须先经过审批；yolo 仍可显式放行。
+func (m mcpTool) Tier() permission.Tier    { return permission.TierExec }
 func (m mcpTool) Concurrency() Concurrency { return ConcurrencyShared }
 
 func (m mcpTool) Execute(ctx context.Context, args map[string]any, sink *runtime.Sink) error {

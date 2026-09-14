@@ -79,6 +79,8 @@ type Run struct {
 	noticeSent  bool
 	killed      bool
 	background  bool // 后台作业（结算后按 async-result 投递给父）
+	owner       string
+	sessionID   string
 	spawn       spawnSpec
 	startedAt   time.Time
 	settledAt   time.Time
@@ -99,6 +101,7 @@ type spawnSpec struct {
 	mode         string
 	depth        int
 	file         string // sidecar 转录路径；"" = 内存会话（不可 revive）
+	sessionID    string
 }
 
 // runtimeSet 是一个 Run 的运行时装配：工具集（含只含 yield 的备用集）、会话、上下文与产出累积。
@@ -115,8 +118,13 @@ type runtimeSet struct {
 }
 
 func newRun(name, agentName string, depth int) *Run {
+	return newOwnedRun(name, agentName, depth, MainName, "")
+}
+
+func newOwnedRun(name, agentName string, depth int, owner, sessionID string) *Run {
 	return &Run{
 		id: name, name: name, agentName: agentName, depth: depth,
+		owner: owner, sessionID: sessionID,
 		status: StatusPending, startedAt: time.Now(),
 		steer: make(chan message.Message, 8),
 	}
@@ -178,6 +186,12 @@ func (r *Run) statusNow() Status {
 // settled 表示已结算（不再消耗模型请求，可读产出与转录）。
 func (r *Run) settled() bool { return r.statusNow().Settled() }
 
+func (r *Run) deliveryRoute() (owner, sessionID string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.owner, r.sessionID
+}
+
 // resetForRevive 把一个 parked 的 Run 恢复成可再跑的状态：
 // 预算与提醒按「这一次续跑」重新计（否则上次用满的预算会让新一轮一上来就被强制收尾）。
 func (r *Run) resetForRevive() {
@@ -222,7 +236,7 @@ func (m *Manager) drive(parent context.Context, r *Run, rs *runtimeSet) Result {
 		if forced {
 			reg, exec, iters = rs.yieldOnly, rs.yieldExec, forcedTurnIterations
 		}
-		sub := agent.New(def.Name, m.o.Model, reg, exec, rs.cc)
+		sub := agent.New(def.Name, m.runModel, reg, exec, rs.cc)
 		sub.SetMaxIterations(iters)
 		// 必须把事件通道读到关闭：agent.Run 的 goroutine 在那之后才结束，否则下一 turn 会与它并发写同一 session
 		m.consume(r, def, sub.Run(turnCtx, r.steer))
@@ -364,7 +378,7 @@ func (m *Manager) settle(parent, runCtx context.Context, r *Run, rs *runtimeSet)
 	if m.o.Notes != nil {
 		m.upsertNotes(res)
 	}
-	if f, err := m.writeOutput(r.name, res); err == nil {
+	if f, err := m.writeOutput(r.name, res, r.sessionID); err == nil {
 		res.OutputFile = f
 	}
 	_ = rs.sess.AppendCustom("session_exit", map[string]any{
@@ -408,11 +422,12 @@ func (m *Manager) upsertNotes(res Result) {
 }
 
 // writeOutput 把完整产出写进会话产物目录，父只拿摘要 + agent://<Name> 指针。
-func (m *Manager) writeOutput(name string, res Result) (string, error) {
-	if m.o.SessionDir == "" {
+func (m *Manager) writeOutput(name string, res Result, sessionID string) (string, error) {
+	dir := m.sessionDir(sessionID)
+	if dir == "" {
 		return "", errors.New("no session dir")
 	}
-	if err := os.MkdirAll(m.o.SessionDir, 0o755); err != nil {
+	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return "", err
 	}
 	var sb strings.Builder
@@ -446,7 +461,7 @@ func (m *Manager) writeOutput(name string, res Result) (string, error) {
 		sb.WriteString(res.Text)
 		sb.WriteString("\n")
 	}
-	path := filepath.Join(m.o.SessionDir, sanitizeName(name)+".md")
+	path := filepath.Join(dir, sanitizeName(name)+".md")
 	return path, os.WriteFile(path, []byte(sb.String()), 0o644)
 }
 

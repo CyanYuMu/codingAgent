@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"time"
 
@@ -36,6 +37,7 @@ func (a *Agent) Run(ctx context.Context, steer <-chan message.Message) <-chan Ag
 func (a *Agent) loop(ctx context.Context, steer <-chan message.Message, emit func(AgentEvent)) {
 	var lastUsage model.Usage
 	retries := 0
+	completionRetries := 0
 	for step := 0; step < a.maxIterations; step++ {
 		// steering：非阻塞取修正，记录为用户消息
 		if steer != nil {
@@ -48,6 +50,7 @@ func (a *Agent) loop(ctx context.Context, steer <-chan message.Message, emit fun
 		// mid-turn 压缩：上一步 usage 超阈值，在下一次模型调用前压缩（先剪枝后摘要）
 		if lastUsage.PromptTokens > 0 && a.cc.ShouldCompact(lastUsage) {
 			if method, err := a.cc.Compact(ctx); err == nil && method != "" {
+				a.tools.InvalidateReadHistory() // 旧内容已进摘要/占位：read_file 去重的前提失效
 				emit(AgentEvent{Type: EventCompaction, Compaction: &CompactionInfo{Reason: compactionReason("mid-turn", method)}})
 				lastUsage = model.Usage{}
 			}
@@ -85,6 +88,20 @@ func (a *Agent) loop(ctx context.Context, steer <-chan message.Message, emit fun
 		}
 		calls := toolCallsOf(assistant)
 		if len(calls) == 0 {
+			if a.completionCheck != nil {
+				if err := a.completionCheck(ctx); err != nil {
+					if completionRetries >= 2 || ctx.Err() != nil {
+						emit(AgentEvent{Type: EventError, Err: fmt.Errorf("completion blocked: %w", err)})
+						return
+					}
+					completionRetries++
+					if recordErr := a.cc.Record(message.NewUserMessage("[verification gate] "+err.Error()), model.Usage{}); recordErr != nil {
+						emit(AgentEvent{Type: EventError, Err: recordErr})
+						return
+					}
+					continue
+				}
+			}
 			return // 无工具调用，turn 结束
 		}
 		// 三档中断「跳过」：已取消则不启动工具（回放时悬空调用会被合成 interrupted 结果）
@@ -112,6 +129,9 @@ func (a *Agent) loop(ctx context.Context, steer <-chan message.Message, emit fun
 			return
 		}
 	}
+	if a.completionCheck != nil {
+		emit(AgentEvent{Type: EventError, Err: fmt.Errorf("iteration limit reached before completion (%d steps)", a.maxIterations)})
+	}
 }
 
 // compactionReason 合成压缩事件 reason：触发点:方式（prune / summary），
@@ -129,6 +149,7 @@ func (a *Agent) handleModelError(ctx context.Context, err error, retries *int, e
 	if model.IsContextOverflow(err) {
 		method, cerr := a.cc.RecoverOverflow(ctx)
 		if cerr == nil && method != "" {
+			a.tools.InvalidateReadHistory() // 同 mid-turn：恢复后的上文里旧内容已不在
 			emit(AgentEvent{Type: EventCompaction, Compaction: &CompactionInfo{Reason: compactionReason("overflow", method)}})
 			return true
 		}

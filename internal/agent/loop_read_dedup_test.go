@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -73,4 +74,94 @@ func mustBuild(t *testing.T, cc Context) []message.Message {
 		t.Fatal(err)
 	}
 	return msgs
+}
+
+// TestCompactionInvalidatesReadDedup mid-turn 压缩成功后，read_file 的去重历史必须失效：
+// 旧内容已进摘要/占位，「内容仍在上文中」不再成立——重读同一区间要返回真实内容（P11.2 修复）。
+func TestCompactionInvalidatesReadDedup(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "f.txt")
+	if err := os.WriteFile(path, []byte("alpha\nbeta\ngamma\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	arg := `{"file_path":` + strconv.Quote(path) + `}`
+	fm := &fakeModel{steps: []func() (model.ModelStream, error){
+		usageCallStep("c1", "read_file", model.Usage{PromptTokens: 999}), // 用量超阈 → 下一步前压缩
+		callStep("c2", "read_file", arg),
+		textStep("done"),
+	}}
+	cc := NewMemoryContext(nil)
+	cc.compactAt = 500
+	_ = cc.Record(message.NewUserMessage("read the file twice"), model.Usage{})
+
+	reg := tool.NewRegistry()
+	for _, tl := range tool.Builtins(runtime.NewBash(dir), nil) {
+		reg.Register(tl)
+	}
+	a := New("t", fm, reg, tool.NewExecutor(reg, permission.ModeYolo, nil), cc)
+	a.retryBase = 0
+
+	var results []string
+	for e := range a.Run(context.Background(), nil) {
+		switch e.Type {
+		case EventToolEnd:
+			results = append(results, e.ToolEnd.Content)
+		case EventError:
+			t.Fatalf("意外错误：%v", e.Err)
+		}
+	}
+	if cc.compacts != 1 {
+		t.Fatalf("应发生 1 次 mid-turn 压缩，got %d", cc.compacts)
+	}
+	if len(results) != 2 {
+		t.Fatalf("应有 2 次工具结果：%v", results)
+	}
+	if strings.Contains(results[1], "未变更") || !strings.Contains(results[1], "alpha") {
+		t.Fatalf("压缩后重读同一文件必须返回真实内容（去重前提已失效）：%q", results[1])
+	}
+}
+
+// TestOverflowRecoveryInvalidatesReadDedup 溢出恢复成功后同样要失效去重历史（loop 的另一个压缩入口）。
+func TestOverflowRecoveryInvalidatesReadDedup(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "f.txt")
+	if err := os.WriteFile(path, []byte("alpha\nbeta\ngamma\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	arg := `{"file_path":` + strconv.Quote(path) + `}`
+	fm := &fakeModel{steps: []func() (model.ModelStream, error){
+		callStep("c1", "read_file", arg),
+		errStep(errors.New("context_length_exceeded")),
+		callStep("c2", "read_file", arg),
+		textStep("done"),
+	}}
+	cc := NewMemoryContext(nil)
+	cc.recoverOK = true
+	_ = cc.Record(message.NewUserMessage("read the file twice"), model.Usage{})
+
+	reg := tool.NewRegistry()
+	for _, tl := range tool.Builtins(runtime.NewBash(dir), nil) {
+		reg.Register(tl)
+	}
+	a := New("t", fm, reg, tool.NewExecutor(reg, permission.ModeYolo, nil), cc)
+	a.retryBase = 0
+
+	var results []string
+	for e := range a.Run(context.Background(), nil) {
+		switch e.Type {
+		case EventToolEnd:
+			results = append(results, e.ToolEnd.Content)
+		case EventError:
+			t.Fatalf("意外错误：%v", e.Err)
+		}
+	}
+	if cc.recovers != 1 {
+		t.Fatalf("应发生 1 次溢出恢复，got %d", cc.recovers)
+	}
+	if len(results) != 2 {
+		t.Fatalf("应有 2 次工具结果：%v", results)
+	}
+	if strings.Contains(results[1], "未变更") || !strings.Contains(results[1], "alpha") {
+		t.Fatalf("溢出恢复后重读必须返回真实内容：%q", results[1])
+	}
 }

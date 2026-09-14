@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"math"
 	"sort"
+	"strings"
 	"time"
 )
 
@@ -120,10 +121,10 @@ func (s *Store) fallbackCandidates(limit int, scope string) ([]scored, error) {
 	return out, rows.Err()
 }
 
-// Recall 多信号召回 topK 条相关记忆，并回写访问计数。
+// ranked 多信号召回 topK 条相关记忆，但不产生访问副作用。
 // 查询先经 FTSQuery 清洗——把用户原文直接交给 MATCH 会在含 ?()"- 时报语法错，
 // 而那个错误一旦被上层吞掉，表现就是「记忆功能看起来在，实际永远召回不到」。
-func (s *Store) Recall(query string, topK int) ([]Memory, error) {
+func (s *Store) ranked(query string, topK int) ([]scored, error) {
 	if topK <= 0 {
 		topK = 5
 	}
@@ -134,6 +135,15 @@ func (s *Store) Recall(query string, topK int) ([]Memory, error) {
 	sort.SliceStable(cands, func(i, j int) bool { return cands[i].score > cands[j].score })
 	if len(cands) > topK {
 		cands = cands[:topK]
+	}
+	return cands, nil
+}
+
+// Recall 返回最终 topK 并只回写实际返回条目的访问计数。
+func (s *Store) Recall(query string, topK int) ([]Memory, error) {
+	cands, err := s.ranked(query, topK)
+	if err != nil {
+		return nil, err
 	}
 	out := make([]Memory, len(cands))
 	ids := make([]int64, len(cands))
@@ -167,8 +177,13 @@ func sortByScoreAsc(xs []scored) {
 	sort.SliceStable(xs, func(i, j int) bool { return xs[i].score < xs[j].score })
 }
 
-// union 把多个库当一个召回源：各自召回后合并、按分数排序、按内容去重。
+// union 把多个库当一个召回源：无副作用地取候选，最终合并去重后才回写访问计数。
 type union struct{ stores []*Store }
+
+type sourcedScored struct {
+	scored
+	store *Store
+}
 
 // Union 构造多库召回器（项目库 + 全局库）。单个 store 出错不拖垮其它库。
 func Union(stores ...*Store) Recaller {
@@ -182,35 +197,56 @@ func Union(stores ...*Store) Recaller {
 }
 
 func (u union) Recall(query string, topK int) ([]Memory, error) {
-	now := time.Now().Unix()
-	var all []scored
+	if topK <= 0 {
+		topK = 5
+	}
+	var all []sourcedScored
 	var firstErr error
 	for _, s := range u.stores {
-		ms, err := s.Recall(query, topK)
+		cands, err := s.ranked(query, topK)
 		if err != nil {
 			if firstErr == nil {
 				firstErr = err
 			}
 			continue
 		}
-		for _, m := range ms {
-			all = append(all, scored{m, scoreMemory(m, 0.5, now)}) // 已在各库内排过序，这里只做跨库对齐
+		for _, c := range cands {
+			all = append(all, sourcedScored{scored: c, store: s})
 		}
 	}
 	sort.SliceStable(all, func(i, j int) bool { return all[i].score > all[j].score })
-	seen := map[string]bool{}
+	seenExact := map[string]bool{}
+	selected := map[*Store][]int64{}
 	out := make([]Memory, 0, topK)
 	for _, c := range all {
-		if seen[c.m.Content] {
+		normalized := strings.ToLower(strings.Join(strings.Fields(c.m.Content), " "))
+		if seenExact[normalized] || nearDuplicateOfAny(c.m.Content, out) {
 			continue
 		}
-		seen[c.m.Content] = true
-		if out = append(out, c.m); len(out) >= topK {
+		seenExact[normalized] = true
+		out = append(out, c.m)
+		selected[c.store] = append(selected[c.store], c.m.ID)
+		if len(out) >= topK {
 			break
 		}
+	}
+	for store, ids := range selected {
+		store.touch(ids)
 	}
 	if len(out) == 0 && firstErr != nil {
 		return nil, firstErr
 	}
 	return out, nil
+}
+
+// 跨库比单库写入去重略严格，避免项目事实与相似但不同的全局偏好被误合并。
+const unionNearDupThreshold = 0.90
+
+func nearDuplicateOfAny(content string, selected []Memory) bool {
+	for _, m := range selected {
+		if Similarity(content, m.Content) >= unionNearDupThreshold {
+			return true
+		}
+	}
+	return false
 }

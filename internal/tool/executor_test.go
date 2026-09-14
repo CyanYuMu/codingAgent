@@ -3,6 +3,8 @@ package tool
 import (
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -163,11 +165,16 @@ func waitStarted(t *testing.T, r *Registry, name string) {
 // stopTool 按调用参数决定是否终止（模拟 yield 的三态：增量提交不终止、出错不终止）。
 type stopTool struct{}
 
-func (stopTool) Name() string               { return "stop" }
-func (stopTool) Description() string        { return "" }
-func (stopTool) Parameters() map[string]any { return map[string]any{} }
-func (stopTool) Tier() permission.Tier      { return permission.TierRead }
-func (stopTool) Concurrency() Concurrency   { return ConcurrencyShared }
+func (stopTool) Name() string        { return "stop" }
+func (stopTool) Description() string { return "" }
+func (stopTool) Parameters() map[string]any {
+	return map[string]any{
+		"stop": map[string]any{"type": "boolean"},
+		"bad":  map[string]any{"type": "boolean"},
+	}
+}
+func (stopTool) Tier() permission.Tier    { return permission.TierRead }
+func (stopTool) Concurrency() Concurrency { return ConcurrencyShared }
 func (stopTool) IsTerminal(args map[string]any, err error) bool {
 	if err != nil {
 		return false
@@ -271,6 +278,29 @@ func TestExecutorOverrideForcesPrompt(t *testing.T) {
 	e2 := NewExecutor(r, permission.ModeWrite, a2)
 	if out := e2.Execute(context.Background(), message.ToolCall{Name: "bash", Args: "{}"}); !out.IsError || !strings.Contains(out.Content, "危险") {
 		t.Fatalf("Override + 拒绝应 denied 带原因，got %+v", out)
+	}
+	// yolo 只绕过普通 tier，不绕过高风险 Override。
+	a3 := &fakeApprover{decision: false}
+	e3 := NewExecutor(r, permission.ModeYolo, a3)
+	if out := e3.Execute(context.Background(), message.ToolCall{Name: "bash", Args: "{}"}); !a3.called || !out.IsError {
+		t.Fatalf("yolo 下 Override 仍应进入审批，got called=%v out=%+v", a3.called, out)
+	}
+}
+
+func TestSensitiveReadRequiresApprovalEvenInYolo(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, ".env"), []byte("TOKEN=secret"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	reg := NewRegistry()
+	for _, tl := range Builtins(runtime.NewBash(dir), nil) {
+		reg.Register(tl)
+	}
+	a := &fakeApprover{decision: false}
+	exec := NewExecutor(reg, permission.ModeYolo, a)
+	got := exec.Execute(context.Background(), message.ToolCall{Name: "read_file", Args: `{"file_path":".env"}`})
+	if !a.called || !got.IsError || !strings.Contains(got.Content, "敏感文件") {
+		t.Fatalf("sensitive read should require approval: called=%v result=%+v", a.called, got)
 	}
 }
 

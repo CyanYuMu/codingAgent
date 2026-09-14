@@ -78,8 +78,24 @@ func (e *Executor) Execute(ctx context.Context, call message.ToolCall) Result {
 		return Result{Content: "tool not found: " + call.Name, IsError: true}
 	}
 	var args map[string]any
-	if call.Args != "" {
-		_ = json.Unmarshal([]byte(call.Args), &args) // 非法 JSON 按空参处理
+	if call.Args == "" {
+		args = map[string]any{}
+	} else {
+		if err := json.Unmarshal([]byte(call.Args), &args); err != nil || args == nil {
+			return Result{Content: "invalid tool arguments: expected JSON object", IsError: true}
+		}
+	}
+	var validationErr error
+	if validator, ok := t.(RuntimeArgumentValidator); ok {
+		validationErr = validator.ValidateToolArguments(args)
+	} else {
+		validationErr = validateArguments(t, args)
+	}
+	if validationErr != nil {
+		return Result{Content: "invalid tool arguments: " + validationErr.Error(), IsError: true}
+	}
+	if ctx.Err() != nil {
+		return Result{Content: ctx.Err().Error(), IsError: true}
 	}
 
 	// 工具自检（Decisioner 可选）→ 五步决策
@@ -106,7 +122,13 @@ func (e *Executor) Execute(ctx context.Context, call message.ToolCall) Result {
 		if e.approver == nil {
 			return Result{Content: "tool denied: " + reason + " (no approver)", IsError: true}
 		}
-		approved, err := e.approver.Approve(ctx, call)
+		approvalCall := call
+		if preview, ok := t.(interface{ ApprovalPreview() any }); ok {
+			if b, err := json.Marshal(preview.ApprovalPreview()); err == nil {
+				approvalCall.Args = string(b)
+			}
+		}
+		approved, err := e.approver.Approve(ctx, approvalCall)
 		if err != nil {
 			return Result{Content: "tool approval interrupted: " + err.Error(), IsError: true}
 		}

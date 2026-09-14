@@ -130,6 +130,25 @@ func (y *yieldTool) Parameters() map[string]any {
 
 func (*yieldTool) Required() []string { return nil } // 三态互斥，语义在工具内校验（顶层组合子对部分 provider 不安全）
 
+// ValidateToolArguments handles yield's conditional shape: data 的 schema 取决于
+// section，而空的最终 yield 还可从累计分段装配，无法用单个静态 root schema 准确表达。
+// data 的业务校验仍在 Execute 中执行，以保留“退回模型自我纠正”的协议。
+func (*yieldTool) ValidateToolArguments(args map[string]any) error {
+	for name, value := range args {
+		switch name {
+		case "data":
+			// 任意 JSON 值；由 section/final 对应 schema 校验。
+		case "section", "error":
+			if _, ok := value.(string); !ok {
+				return fmt.Errorf("arguments.%s must be string", name)
+			}
+		default:
+			return fmt.Errorf("arguments.%s is not an allowed argument", name)
+		}
+	}
+	return nil
+}
+
 func (*yieldTool) Tier() permission.Tier { return permission.TierRead }
 
 // Concurrency 串行：同一条消息里的多次 yield 必须按序执行，重试计数与分段顺序才是确定的。

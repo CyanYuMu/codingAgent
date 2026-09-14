@@ -46,6 +46,15 @@ func (rememberTool) Required() []string       { return []string{"content"} }
 func (rememberTool) Tier() permission.Tier    { return permission.TierWrite }
 func (rememberTool) Concurrency() Concurrency { return ConcurrencyShared }
 
+// 长期记忆会在未来会话进入 system 上下文，不能等同普通文件写入静默放行。
+// 项目记忆默认询问；跨项目全局记忆属于更高风险，yolo 下也必须进入 HITL。
+func (rememberTool) Decision(args map[string]any) permission.ToolDecision {
+	if scope, _ := args["scope"].(string); scope == memory.ScopeGlobal {
+		return permission.ToolDecision{Tier: permission.TierWrite, Override: true, Reason: "写入跨项目全局长期记忆"}
+	}
+	return permission.ToolDecision{Tier: permission.TierWrite, Policy: permission.PolicyPrompt, Reason: "写入项目长期记忆"}
+}
+
 func (r rememberTool) Execute(_ context.Context, args map[string]any, sink *runtime.Sink) error {
 	content, _ := args["content"].(string)
 	if strings.TrimSpace(content) == "" {
@@ -70,8 +79,8 @@ func (r rememberTool) Execute(_ context.Context, args map[string]any, sink *runt
 	if updated {
 		verb = "已更新已有记忆"
 	}
-	// 说明生效时机：记忆块是缓存的背景上下文，不会在本轮立刻重新注入
-	fmt.Fprintf(sink, "%s（id=%d）%s。它会在下次压缩或新会话时进入背景上下文；本轮请直接用你刚写下的内容。", verb, id, note)
+	// 新用户 turn 会刷新记忆块；当前 turn 内不重建前缀。
+	fmt.Fprintf(sink, "%s（id=%d）%s。它会在下一条用户消息、压缩或新会话时进入背景上下文；本轮请直接用你刚写下的内容。", verb, id, note)
 	return nil
 }
 
@@ -115,6 +124,13 @@ func (forgetTool) Parameters() map[string]any {
 func (forgetTool) Required() []string       { return []string{"ref"} }
 func (forgetTool) Tier() permission.Tier    { return permission.TierWrite }
 func (forgetTool) Concurrency() Concurrency { return ConcurrencyShared }
+
+func (forgetTool) Decision(args map[string]any) permission.ToolDecision {
+	if scope, _ := args["scope"].(string); scope == memory.ScopeGlobal {
+		return permission.ToolDecision{Tier: permission.TierWrite, Override: true, Reason: "失效跨项目全局长期记忆"}
+	}
+	return permission.ToolDecision{Tier: permission.TierWrite, Policy: permission.PolicyPrompt, Reason: "失效项目长期记忆"}
+}
 
 func (f forgetTool) Execute(_ context.Context, args map[string]any, sink *runtime.Sink) error {
 	ref, _ := args["ref"].(string)

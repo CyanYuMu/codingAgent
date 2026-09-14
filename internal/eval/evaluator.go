@@ -16,6 +16,7 @@ import (
 	"einoclaw-build/internal/runtime"
 	"einoclaw-build/internal/session"
 	"einoclaw-build/internal/tool"
+	"einoclaw-build/internal/workspace"
 )
 
 // evalInstruction 评测用 agent 的系统指令（非空，避免空 content 被模型拒绝）。
@@ -36,34 +37,45 @@ type Result struct {
 	Detail string
 }
 
-// Run 在隔离 workdir 里跑 agent，比较 expected 文件。
-// 用 os.Chdir 切到 workdir，让 write_file/read_file/glob 的相对路径也落到隔离目录。
+// Run uses the same scoped file tools and required native sandbox as the CLI.
 func Run(ctx context.Context, fx Fixture, m model.Model, mem memory.Recaller) Result {
-	workdir, err := os.MkdirTemp("", "eval-*")
+	return RunWithSandbox(ctx, fx, m, mem, runtime.SandboxConfig{})
+}
+
+// RunWithSandbox permits trusted embedders/tests to supply host capabilities.
+// It never changes process cwd, so independent fixtures can run concurrently.
+func RunWithSandbox(ctx context.Context, fx Fixture, m model.Model, mem memory.Recaller, cfg runtime.SandboxConfig) Result {
+	base, err := os.MkdirTemp("", "eval-*")
 	if err != nil {
 		return Result{Name: fx.Name, Pass: false, Detail: "workdir: " + err.Error()}
 	}
-	defer os.RemoveAll(workdir)
-
-	oldCwd, _ := os.Getwd()
-	if err := os.Chdir(workdir); err != nil {
-		return Result{Name: fx.Name, Pass: false, Detail: err.Error()}
+	defer os.RemoveAll(base)
+	workdir := filepath.Join(base, "workspace")
+	if err = os.Mkdir(workdir, 0o700); err != nil {
+		return Result{Name: fx.Name, Detail: err.Error()}
 	}
-	defer os.Chdir(oldCwd)
+	ws, err := workspace.Open(workdir, filepath.Join(base, "changes"))
+	if err != nil {
+		return Result{Name: fx.Name, Detail: err.Error()}
+	}
+	defer ws.Close()
 
 	for path, content := range fx.Input {
-		if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
-			return Result{Name: fx.Name, Pass: false, Detail: err.Error()}
-		}
-		if err := os.WriteFile(path, []byte(content), 0644); err != nil {
+		if _, err := ws.Apply([]workspace.Change{{Path: path, BeforeHash: "missing", Content: content}}); err != nil {
 			return Result{Name: fx.Name, Pass: false, Detail: err.Error()}
 		}
 	}
 
 	bash := runtime.NewBash(workdir)
-	store := runtime.NewArtifactStore(filepath.Join(workdir, ".artifacts"))
+	sandbox, err := runtime.NewProcessSandbox(workdir, cfg)
+	if err != nil {
+		return Result{Name: fx.Name, Detail: err.Error()}
+	}
+	defer sandbox.Close()
+	bash.SetSandbox(sandbox)
+	store := runtime.NewArtifactStore(filepath.Join(base, "artifacts"))
 	registry := tool.NewRegistry()
-	for _, t := range tool.Builtins(bash, store) {
+	for _, t := range tool.ScopedBuiltins(bash, store, ws) {
 		registry.Register(t)
 	}
 	exec := tool.NewExecutor(registry, permission.ModeYolo, nil)
@@ -90,9 +102,14 @@ func Run(ctx context.Context, fx Fixture, m model.Model, mem memory.Recaller) Re
 	cc := agentctx.New(sess, nil, 128000, 16384, system)
 	_ = cc.Record(message.NewUserMessage(fx.Prompt), model.Usage{})
 	ag := agent.New(fx.Name, m, registry, exec, cc)
+	ag.SetCompletionCheck(func(context.Context) error { return nil })
 
 	var text string
+	var runErr error
 	for ev := range ag.Run(ctx, nil) {
+		if ev.Type == agent.EventError {
+			runErr = ev.Err
+		}
 		if ev.Type == agent.EventMessageEnd {
 			if t := textOf(ev.Ended.Message); t != "" {
 				text = t
@@ -100,7 +117,20 @@ func Run(ctx context.Context, fx Fixture, m model.Model, mem memory.Recaller) Re
 		}
 	}
 
-	if diffs := verify(".", fx.Expected); len(diffs) > 0 {
+	if ctx.Err() != nil {
+		runErr = ctx.Err()
+	}
+	if runErr != nil {
+		return Result{Name: fx.Name, Detail: runErr.Error()}
+	}
+	var diffs []string
+	for path, want := range fx.Expected {
+		got, err := ws.ReadFile(path)
+		if err != nil || strings.TrimRight(string(got), " \t\r\n") != strings.TrimRight(want, " \t\r\n") {
+			diffs = append(diffs, path)
+		}
+	}
+	if len(diffs) > 0 {
 		return Result{Name: fx.Name, Pass: false, Detail: "diff: " + strings.Join(diffs, ", ")}
 	}
 	return Result{Name: fx.Name, Pass: true, Detail: text}

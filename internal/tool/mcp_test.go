@@ -11,8 +11,8 @@ func TestMCPToolNameNormalization(t *testing.T) {
 	if mt.Name() != "mcp__filesystem_read_file" {
 		t.Fatalf("Name = %q, want mcp__filesystem_read_file", mt.Name())
 	}
-	if mt.Tier() != permission.TierWrite {
-		t.Fatalf("MCP 工具默认应为 write tier，got %s", mt.Tier())
+	if mt.Tier() != permission.TierExec {
+		t.Fatalf("未知副作用的 MCP 工具默认应为 exec tier，got %s", mt.Tier())
 	}
 }
 

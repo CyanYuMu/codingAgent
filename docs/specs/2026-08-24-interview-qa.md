@@ -39,7 +39,7 @@
 
 **Q：为什么把 eino 关在一个包里？这是过度设计吗？**
 
-不是，是为了可测。`internal/model` 对外只暴露 `Stream(msgs, tools) → ModelStream + Usage`，业务代码只依赖自己的 `message.Message`。带来两个直接收益：换 provider 或换框架只改一个包；**harness 的 231 个测试可以用脚本化 fake model 跑，完全不 import eino、不联网**。如果 eino 的类型渗透进 agent/tool/session，这些测试就得起 mock server。
+不是，是为了可测。`internal/model` 对外只暴露 `Stream(msgs, tools) → ModelStream + Usage`，业务代码只依赖自己的 `message.Message`。带来两个直接收益：换 provider 或换框架只改一个包；**harness 的 322 个测试函数（含子用例更多，全量回归几秒完成）可以用脚本化 fake model 跑，完全不 import eino、不联网**。如果 eino 的类型渗透进 agent/tool/session，这些测试就得起 mock server。
 
 ---
 
@@ -154,16 +154,18 @@
 
 **Q：你说"减少重复读取"，具体是哪几个机制在起作用？怎么量化的？**
 
-诚实答：目前生效的是三条——工件指针替代重跑（长输出不用重新执行命令）、`agent://` / `history://` 让父与其它子 agent 复用已完成 agent 的完整结论、六字段摘要里的"文件/产物"段让压缩后仍知道哪些文件看过。
+诚实答：生效的有五条——工件指针替代重跑（长输出不用重新执行命令）、`agent://` / `history://` 让父与其它子 agent 复用已完成 agent 的完整结论、六字段摘要里的"文件/产物"段让压缩后仍知道哪些文件看过、`file_notes` 项目地图（新会话注入"这个仓库长什么样"，P10.4 落地）、会话内 read 区间去重（同文件指纹未变且区间已读则不再返回内容，P10.4 落地）。
 
-**跨会话那一层还没做**：file_notes 项目地图（新会话注入"这个仓库长什么样"）、read 命中未变更文件先返回笔记、会话内 read 缓存，都在 M3 排期。所以现在还没有"重复读取从 N 降到 M"的量化数据——要拿这个数字，得先把 M3 做完再跑对照。
+**还没做**：read 命中 file_notes 直接返回笔记（`NoteHit` 已留钩子，但全仓没有调用方）；以及至今没有"重复读取从 N 降到 M"的量化对照数据——机制落地了，测量是欠账。
 
 **Q：这套记忆现在有什么已知问题？**
 
-两个，都在 M3 修：
+曾经的两个问题都已在 P10.1/P10.2 修掉（修法留档如下，供审计追溯）：
 
-1. **FTS 查询原文直传**（`retrieval.go:33`）：用户问句里的 `? ( ) " -` 会触发 SQLite 全文检索的语法错误，而 `main.go:271` 用 `err == nil` 把错误吞掉了——表现是"一条都搜不到"，且没有任何提示。修法是分词后每个 term 加引号转义、丢弃 <3 rune 的词（trigram 限制）、用 OR 连接，永不把原文交给 MATCH。
-2. **每步都重新召回**：`system()` 在每次 `Build()` 被调用，导致发给模型的前缀每轮都在变，prompt cache 一直命中不了。修法是只在会话首轮和每次压缩后刷新，把召回块钉在 system prompt 的固定位置。
+1. **FTS 查询原文直传**（原 `retrieval.go`）：用户问句里的 `? ( ) " -` 会触发 SQLite 全文检索的语法错误，而调用方用 `err == nil` 把错误吞掉——表现是"一条都搜不到"。已修：`query.go` 的 `FTSQuery` 负责分词、CJK 3 字滑窗、丢弃 <3 rune 的词（trigram 限制）、逐词加引号转义后用 OR 连接，永不把原文交给 MATCH。
+2. **每步都重新召回**：`system()` 在每次 `Build()` 被调用，前缀每轮都变，prompt cache 一直命中不了。已修：`context.Manager` 的前缀缓存（`sysDirty`）只在会话首轮、压缩后、换会话三个时刻刷新，召回块钉在 system prompt 固定位置。
+
+当前已知问题：read 命中笔记未实现（见上文）；重复读取无量化对照；MCP 工具固定 write 档（未按参数动态定级，见下文"如果重做一遍"第 1 条）。
 
 ---
 
@@ -201,7 +203,7 @@ M4 的计划是补齐四件事：`edit` 工具 + read-before-write + mtime 冲�
 
 共享可变状态。bash 的 cwd 存在实例里（`bash.go:14`），两个 bash 并发执行、其中一个 `cd`，另一个的工作目录就变了；write_file 可能写同一个文件。实现上（`executor.go:106`）是：遇到 Exclusive 工具先 `wg.Wait()` 等前面并行的那批完成，再串行执行——**保证结果仍按调用序回填**，同时没有数据竞争。
 
-**Q：231 个测试怎么在不调模型的情况下测 agent 行为？**
+**Q：300+ 个测试怎么在不调模型的情况下测 agent 行为？**
 
 脚本化 fake model：按"第 N 次调用"返回预设的事件流，并且能断言这一次收到的工具定义列表。所以能覆盖真实模型很难稳定复现的时序行为——
 
@@ -234,6 +236,6 @@ M4 的计划是补齐四件事：`edit` 工具 + read-before-write + mtime 冲�
 
 三处：
 
-1. **工具的危险等级应该按参数判定，而不是固定一档。** 现在 `Tier()` 是工具级常量，导致 MCP 工具一律按 read 处理——外部未知工具自动放行是个洞。应该一开始就是 `Approval(args) → {tier, policy, reason}`。
+1. **工具的危险等级应该按参数判定，而不是固定一档。** 现在 `Tier()` 是工具级常量，只有 bash 按参数分类（`runtime/classify.go`）；MCP 工具在 P8 已从 read 收紧为 write（`mcp.go`："未知副作用不能当只读放行"），不再是"外部未知工具自动放行"的洞，但仍是固定档。更完整的形态是所有工具都走 `Decision(args) → {tier, policy, reason}`。
 2. **记忆的 scope/key 应该一开始就进表结构。** 现在靠目录分桶解决了跨项目串味，但没有 `key` 就做不了 upsert，同一条偏好 remember 三次会占三个 topK 名额。事后加列比一开始设计贵。
 3. **评测隔离不该用 `os.Chdir`。** 它是进程全局的（`eval/evaluator.go:49`），直接导致夹具不能并行跑。应该让工具通过 `ToolContext{CWD}` 解析相对路径。

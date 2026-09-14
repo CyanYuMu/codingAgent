@@ -48,7 +48,7 @@
 - 召回是纯代码算术融合：`0.45·bm25 + 0.2·importance + 0.15·recency + 0.1·access + 0.1·scopeBoost`，recency 72h 半衰期；
 - **FTS 查询清洗**：问句永不直传 `MATCH`（标点会语法报错且被静默吞掉）——分词、CJK 滑窗、双引号包裹、OR 连接；
 - upsert 去重（key / 近重复 trigram Jaccard ≥0.85）、失效（superseded_by）、双库（global + project）；
-- **注入位置固定 + 前缀缓存**：记忆块只在首轮与压缩后刷新——保持提示词前缀稳定，prompt cache 不失效；
+- **按用户 turn 刷新 + turn 内前缀缓存**：新用户消息触发召回刷新，同一轮的工具循环复用前缀，避免“会话首轮召回后一直陈旧”；
 - 项目知识层 `file_notes` + 项目地图注入，跨会话减少「从零 explore」的重复读取。
 
 ### 6. 多会话与项目隔离
@@ -62,13 +62,15 @@
 
 ### 8. 安全治理：审批规则引擎 + bash 分类器（P11）
 
-- `permissions.{allow,ask,deny}` 规则语法 `tool(args*)` 通配，五步决策（工具 deny → 用户 deny → yolo 忽略裸 Override → 非 yolo Override 强制询问 → 工具显式 policy → 用户规则 → tier×mode），**deny 在 yolo 下也生效**；
-- **bash 危险命令分类器**（纯函数）：按 shell 词法切段逐段保守判定——只读白名单（git status/go test）免审批；危险模式（`rm -rf`、`curl | sh`、`sudo`、fork bomb）**yolo 下也强制弹窗**；不认识的命令回落询问（漏判危险是事故，误判只读只是多一次审批）；
+- `permissions.{allow,ask,deny}` 规则语法 `tool(args*)` 通配，五步决策（工具 deny → 用户 deny → Override 强制询问 → yolo 放行其余调用 → 工具显式 policy → 用户规则 → tier×mode），**deny 与高风险 Override 在 yolo 下也生效**；参数规则会同时匹配解码值与规范化路径，不能靠 JSON 转义或 `foo/../.env` 绕过；
+- 工具调用在权限匹配前执行运行时 Schema 校验，拒绝缺失必填项、类型/枚举/嵌套约束错误和未知顶层参数；模型、MCP、`permissions.allow` 等能力只能由用户级配置授予，项目配置只能收紧审批；
+- **bash 危险命令分类器**（纯函数）：按 shell 词法切段逐段保守判定——只读白名单（git status/go list）免审批；危险模式（`rm -rf`、`curl | sh`、`sudo`、fork bomb）标记为 Override，**所有模式都强制询问**；不认识或会执行项目代码的命令回落 exec 档（write 模式询问；漏判危险是事故，误判只读只是多一次审批）；
 - bash **超时 + 进程组回收**：默认 120s，SIGTERM 进程组 → 5s 后 SIGKILL（只杀直接子进程留不住管道孙进程）；env 自动剔除密钥类（`*API_KEY*/*TOKEN*/*SECRET*`）。
 
 ### 9. 评测与审计闭环
 
 - JSONL 即 trace；eval 夹具 `prompt.md + input/ + expected/`，**字节 diff 验证，坚持不用 LLM judge**；
+- 记忆召回提供可复现的 `HitRate@K / Recall@K / MRR / DuplicateRate` 离线评测，覆盖跨库排序与重复压力；
 - **最有价值的部分：脚本化 fake model 回归套件**——不联网、不花钱、几秒钟跑完，钉死 harness 自身行为（yield 三态、schema 重试、idle 阶梯、软预算三段、状态机、并发闸缩容、后台投递恰好一次）。harness 的正确性不依赖真实模型。
 
 ---
@@ -103,6 +105,8 @@ einoclaw-build/
 
 ## 快速开始
 
+生产运行时初版已接入：文件工具绑定工作区、默认原生进程沙箱、Go AST/LSP、可恢复变更日志与可配置验证门禁。升级前请阅读 [配置与使用说明](docs/PRODUCTION_RUNTIME.md) 和 [逐步设计/代码构造](docs/specs/2026-09-14-production-runtime.md)。默认禁止子进程联网；Go 工具链/模块缓存等额外读取目录在用户配置中授权。
+
 ```bash
 # 配置（复制模板并填入模型 API key）
 cp example.yaml config.yaml
@@ -135,7 +139,7 @@ bash:
   timeout: 120s             # 超时 SIGTERM 进程组、5s 后 SIGKILL；env 自动剔除密钥类
 subagent:
   max_concurrency: 4        # 并行子 agent 上限（可运行时 resize）
-  soft_budget: 200          # 模型请求软预算，0 = 关闭护栏
+  soft_budget: 200          # 模型请求软预算；未配置或 0 使用默认 200
   max_recursion_depth: 2    # 委派递归深度上限
   min_task_chars: 40        # 任务描述最短长度（拒绝一句话派发）
 memory:
@@ -151,6 +155,7 @@ memory:
 | P8 (M1) | 项目作用域数据目录、Session v2、压缩正确性、子 agent 运行时修正 | ✅ |
 | P9 (M2) | 委派运行时：frontmatter agent、TaskBatch 预检、yield 三态、Agent Hub、后台作业、hub 邮箱 | ✅ |
 | P10 (M3) | 记忆正确性、前缀缓存、L1 项目层、剪枝阶梯、项目知识、read 去重 | ✅ |
-| P11 (M4) | 审批规则引擎 + bash 分类器/超时/进程组/env 脱敏（P11.1）；edit / hooks / trace.db / eval v2（后续） | 🚧 P11.1 完成 |
+| P11 (M4) | 审批规则引擎 + bash 分类器/超时/进程组/env 脱敏（P11.1）；edit 工具与文件守卫（P11.2）；hooks / trace.db / eval v2（后续） | 🚧 P11.1–P11.2 完成 |
+| 生产化第一轮 | Workspace / 原生 sandbox / Go AST + stdio LSP / 哈希前置条件与恢复日志 / verify + 完成检查 | 初版落地；平台验收与限制见设计文档 |
 
 详细演进方案见 [docs/specs/2026-08-24-evolution-plan.md](docs/specs/2026-08-24-evolution-plan.md)，完整开发记录见 [docs/DEVELOPMENT_LOG.md](docs/DEVELOPMENT_LOG.md)。

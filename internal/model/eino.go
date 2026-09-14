@@ -157,7 +157,7 @@ func toolJSONSchema(t ToolSpec) (*jsonschema.Schema, error) {
 	if required == nil {
 		required = []string{}
 	}
-	raw := map[string]any{"type": "object", "properties": props, "required": required}
+	raw := map[string]any{"type": "object", "properties": props, "required": required, "additionalProperties": false}
 	b, err := json.Marshal(raw)
 	if err != nil {
 		return nil, err

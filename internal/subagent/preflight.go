@@ -14,6 +14,8 @@ const (
 // Env 是一次派发的调用者环境（谁在派、允许派谁、能派多深）。
 type Env struct {
 	Defs         []AgentDef
+	Owner        string                    // 后台结果的收件人：Main 或调用者的运行名
+	SessionID    string                    // 根会话归属；切换会话后旧结果不能串入新会话
 	Depth        int                       // 调用者深度：主 agent = 0
 	MaxDepth     int                       // 0 = 用默认 2
 	Spawns       []string                  // 调用者允许派发的 agent；nil = 无限制（主 agent）；含 "*" = 无限制

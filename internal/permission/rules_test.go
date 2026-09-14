@@ -54,6 +54,8 @@ func TestMatchArgsWildcard(t *testing.T) {
 		{"bash(git status*)", "bash", `{"command":"git push origin main"}`, false},
 		{"read(**) ", "read_file", `{"file_path":"./.env"}`, true},
 		{"read(./.env*)", "read_file", `{"file_path":"./.env"}`, true},
+		{"read(./.env*)", "read_file", `{"file_path":"src/../.env.local"}`, true},
+		{"read(./.env*)", "read_file", `{"file_path":"\u002eenv"}`, true},
 		{"read(./.env*)", "read_file", `{"file_path":"src/main.go"}`, false},
 		{"bash(git status*)", "grep", `{"command":"git status"}`, false}, // 工具名不匹配
 		{"bash", "bash", `{"command":"rm -rf /"}`, true},                 // 无括号 = 全部参数
@@ -105,11 +107,11 @@ func TestResolveRulesToolPolicyDenyWins(t *testing.T) {
 	}
 }
 
-func TestResolveRulesYoloIgnoresOverride(t *testing.T) {
+func TestResolveRulesYoloHonorsOverride(t *testing.T) {
 	td := ToolDecision{Tier: TierExec, Override: true, Reason: "危险"}
 	got, reason := ResolveRules(td, Rules{}, ModeYolo, "bash", `{"command":"rm -rf /"}`)
-	if got != DecisionAllow || reason != "" {
-		t.Fatalf("yolo 下裸 Override 应忽略：got %s %q", got, reason)
+	if got != DecisionPrompt || !strings.Contains(reason, "危险") {
+		t.Fatalf("yolo 下 Override 仍应询问：got %s %q", got, reason)
 	}
 	// yolo 下工具显式 prompt 也是放行
 	got, _ = ResolveRules(ToolDecision{Tier: TierExec, Policy: PolicyPrompt, Reason: "x"}, Rules{}, ModeYolo, "bash", `{}`)

@@ -21,6 +21,7 @@ type Bash struct {
 	mu      sync.Mutex
 	cwd     string
 	timeout time.Duration
+	sandbox *ProcessSandbox
 }
 
 // NewBash 创建 bash 执行器（默认 120s 超时）；cwd 为空时用进程当前目录，相对路径转绝对。
@@ -47,11 +48,30 @@ func (b *Bash) CWD() string {
 	return b.cwd
 }
 
+// SetSandbox is called once by the host before any tool execution.
+func (b *Bash) SetSandbox(s *ProcessSandbox) { b.sandbox = s }
+
 // Execute 执行 command，stdout/stderr 都进 sink。
 // 超时（b.timeout）→ SIGTERM 整个进程组，5s 后 SIGKILL 补刀；返回明确的超时错误。
 func (b *Bash) Execute(ctx context.Context, command string, sink *Sink) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+
+	// Scoped tools use a stable cwd; shell-local cd only affects this call.
+	if b.sandbox != nil {
+		ctx2, cancel := context.WithTimeout(ctx, b.timeout)
+		defer cancel()
+		cmd, err := b.sandbox.Command(ctx2, b.cwd, "bash", "--noprofile", "--norc", "-c", command)
+		if err != nil {
+			return err
+		}
+		cmd.Stdout, cmd.Stderr = sink, sink
+		err = cmd.Run()
+		if errors.Is(ctx2.Err(), context.DeadlineExceeded) && ctx.Err() == nil {
+			return fmt.Errorf("命令超时（%s），已终止进程组", b.timeout)
+		}
+		return err
+	}
 
 	if newCwd, rest, ok := parseCd(command); ok {
 		if !filepath.IsAbs(newCwd) {

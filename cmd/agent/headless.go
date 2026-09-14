@@ -14,12 +14,12 @@ import (
 	"einoclaw-build/internal/subagent"
 )
 
-// headlessApprover：-p 模式没有弹窗，需要审批的调用一律拒绝并说明（用 --yolo 放行）。
+// headlessApprover：-p 模式没有弹窗，需要审批的调用一律拒绝并说明。
 type headlessApprover struct{}
 
 func (headlessApprover) Approve(context.Context, message.ToolCall) (bool, error) { return false, nil }
 func (headlessApprover) DenyReason() string {
-	return "tool denied: headless mode cannot prompt for approval (run with --yolo or set approval_mode)"
+	return "tool denied: headless mode cannot prompt for approval (use --yolo only for non-dangerous calls, or run interactively)"
 }
 
 // maxAutoContinue headless 下因后台作业结果自动续跑的上限：够把结果综合完，又不会在 CI 里无限循环。
@@ -40,7 +40,23 @@ func runHeadless(ctx context.Context, ag *agent.Agent, cmgr *agentctx.Manager, m
 		for _, ml := range mails {
 			fmt.Printf("[来自 %s 的消息: %s]\n", ml.From, ml.Text)
 		}
-		if c := runOnce(ctx, ag, cmgr, subagent.RenderAsyncResult(jobs, mails)); c != 0 {
+		notice := subagent.RenderAsyncResult(jobs, mails)
+		if err := cmgr.Record(message.NewUserMessage(notice), model.Usage{}); err != nil {
+			fmt.Fprintf(os.Stderr, "error: 后台结果写入会话失败（保留待重试）: %v\n", err)
+			code = 1
+			break
+		}
+		jobIDs := make([]string, 0, len(jobs))
+		for _, job := range jobs {
+			jobIDs = append(jobIDs, job.DeliveryID)
+		}
+		mailIDs := make([]string, 0, len(mails))
+		for _, mail := range mails {
+			mailIDs = append(mailIDs, mail.DeliveryID)
+		}
+		mgr.AckSettled(jobIDs)
+		mgr.AckMainInbox(mailIDs)
+		if c := runRecordedOnce(ctx, ag); c != 0 {
 			code = c
 		}
 	}
@@ -54,7 +70,8 @@ func waitDeliveries(ctx context.Context, mgr *subagent.Manager, wait time.Durati
 	}
 	deadline := time.Now().Add(wait)
 	for {
-		jobs, mails := mgr.TakeSettled(), mgr.TakeMainInbox()
+		sessionID := mgr.CurrentSessionID()
+		jobs, mails := mgr.PeekSettled(subagent.MainName, sessionID), mgr.PeekMainInbox(sessionID)
 		if len(jobs) > 0 || len(mails) > 0 {
 			return jobs, mails
 		}
@@ -71,7 +88,14 @@ func waitDeliveries(ctx context.Context, mgr *subagent.Manager, wait time.Durati
 
 // runOnce 记录一条用户消息并跑一轮循环，把事件打印到 stdout。
 func runOnce(ctx context.Context, ag *agent.Agent, cmgr *agentctx.Manager, prompt string) int {
-	_ = cmgr.Record(message.NewUserMessage(prompt), model.Usage{})
+	if err := cmgr.Record(message.NewUserMessage(prompt), model.Usage{}); err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		return 1
+	}
+	return runRecordedOnce(ctx, ag)
+}
+
+func runRecordedOnce(ctx context.Context, ag *agent.Agent) int {
 	var final strings.Builder
 	code := 0
 	for ev := range ag.Run(ctx, nil) {

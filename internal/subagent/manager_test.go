@@ -15,6 +15,7 @@ import (
 	"einoclaw-build/internal/model"
 	"einoclaw-build/internal/permission"
 	"einoclaw-build/internal/runtime"
+	"einoclaw-build/internal/skills"
 	"einoclaw-build/internal/tool"
 )
 
@@ -52,10 +53,11 @@ type scriptModel struct {
 	steps []model.ModelEvent
 	delay time.Duration
 	tools [][]string // 每次调用收到的工具名（排序后）
+	msgs  [][]message.Message
 	calls int
 }
 
-func (m *scriptModel) Stream(ctx context.Context, _ []message.Message, tools []model.ToolSpec) (model.ModelStream, error) {
+func (m *scriptModel) Stream(ctx context.Context, msgs []message.Message, tools []model.ToolSpec) (model.ModelStream, error) {
 	if ctx.Err() != nil {
 		return nil, ctx.Err()
 	}
@@ -66,6 +68,7 @@ func (m *scriptModel) Stream(ctx context.Context, _ []message.Message, tools []m
 	}
 	sort.Strings(names)
 	m.tools = append(m.tools, names)
+	m.msgs = append(m.msgs, append([]message.Message(nil), msgs...))
 	m.calls++
 	var ev model.ModelEvent
 	if len(m.steps) == 0 {
@@ -76,6 +79,15 @@ func (m *scriptModel) Stream(ctx context.Context, _ []message.Message, tools []m
 	delay := m.delay
 	m.mu.Unlock()
 	return &fakeStream{events: []model.ModelEvent{ev}, delay: delay, ctx: ctx}, nil
+}
+
+func (m *scriptModel) messagesAt(i int) []message.Message {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if i < 0 || i >= len(m.msgs) {
+		return nil
+	}
+	return append([]message.Message(nil), m.msgs[i]...)
 }
 
 func (m *scriptModel) remaining() int {
@@ -242,6 +254,53 @@ func TestIndependentBashPerRun(t *testing.T) {
 	}
 }
 
+func TestReadOnlySubagentKeepsSkillToolAndIndex(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, ".git"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	skillFile := filepath.Join(dir, ".codeclaw", "skills", "review", "SKILL.md")
+	if err := os.MkdirAll(filepath.Dir(skillFile), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(skillFile, []byte("---\nname: review\ndescription: review changes\n---\nSECRET SKILL BODY"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	catalog, err := skills.NewManager(skills.Options{CWD: dir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := &scriptModel{}
+	o := baseOpts(m, dir)
+	o.Defs[0].ReadOnly = true
+	o.WorkerTools = func(cwd string, store *runtime.ArtifactStore) *tool.Registry {
+		reg := workerTools(cwd, store)
+		reg.Register(tool.NewSkillTool(catalog))
+		if store != nil {
+			store.AddScheme("skill", catalog.Resolve)
+		}
+		return reg
+	}
+	o.SkillIndex = catalog.RenderIndex
+	r := runOne(t, NewManager(o), context.Background(), one("explorer", "review it"))
+	if r.Status != StatusCompleted {
+		t.Fatalf("result = %+v", r)
+	}
+	names := strings.Join(m.toolsAt(0), ",")
+	if !strings.Contains(names, "skill") || strings.Contains(names, "bash") || strings.Contains(names, "edit") {
+		t.Fatalf("read-only tools = %s", names)
+	}
+	var prompt strings.Builder
+	for _, msg := range m.messagesAt(0) {
+		for _, block := range msg.Blocks {
+			prompt.WriteString(block.Text)
+		}
+	}
+	if got := prompt.String(); !strings.Contains(got, "review: review changes") || strings.Contains(got, "SECRET SKILL BODY") {
+		t.Fatalf("skill index should be present without body: %s", got)
+	}
+}
+
 func TestRunBatchOrderAndDefaultNames(t *testing.T) {
 	mgr := NewManager(baseOpts(&scriptModel{}, t.TempDir()))
 	rs, err := mgr.RunBatch(context.Background(), TaskBatch{
@@ -325,6 +384,29 @@ func TestToolSetSpawnsAndDepth(t *testing.T) {
 				t.Fatalf("task in toolset = %v, want %v（工具集 %v）", hasTask, tc.wantTask, m.toolsAt(0))
 			}
 		})
+	}
+}
+
+func TestNestedSynchronousDelegationDoesNotDeadlockAtConcurrencyLimit(t *testing.T) {
+	m := &scriptModel{steps: []model.ModelEvent{
+		call("parent-task", "task", `{"context":"nested contract","tasks":[{"agent":"worker","task":"inspect target and return the result"}]}`),
+		call("child-yield", "yield", `{"data":{"ok":true}}`),
+		call("parent-yield", "yield", `{"data":{"nested":"completed"}}`),
+	}}
+	o := baseOpts(m, t.TempDir())
+	o.MaxConcurrency = 1
+	o.Defs[0].Spawns = []string{"worker"}
+	o.Defs = append(o.Defs, AgentDef{Name: "worker", Description: "nested worker", SystemPrompt: "work", MaxTurns: 5})
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	started := time.Now()
+	r := runOne(t, NewManager(o), ctx, one("explorer", "delegate nested work"))
+	if elapsed := time.Since(started); elapsed > 500*time.Millisecond {
+		t.Fatalf("nested delegation blocked for %s", elapsed)
+	}
+	if r.Status != StatusCompleted || !r.Yielded {
+		t.Fatalf("result = %+v", r)
 	}
 }
 
@@ -423,6 +505,32 @@ func TestDeliverRouting(t *testing.T) {
 		}
 	default:
 		t.Fatal("消息没进 steer 队列")
+	}
+}
+
+func TestMainMailboxIsScopedAndAcked(t *testing.T) {
+	o := baseOpts(&scriptModel{}, t.TempDir())
+	o.SessionID = "session-a"
+	mgr := NewManager(o)
+	run := newOwnedRun("Scout", "explorer", 1, MainName, "session-a")
+	mgr.register(run)
+	run.setStatus(StatusRunning)
+
+	mgr.SetMainSession("session-b", t.TempDir())
+	if _, err := mgr.Deliver("Scout", MainName, "old session result", ""); err != nil {
+		t.Fatal(err)
+	}
+	if got := mgr.PeekMainInbox("session-b"); len(got) != 0 {
+		t.Fatalf("message leaked into current session: %+v", got)
+	}
+	first := mgr.PeekMainInbox("session-a")
+	second := mgr.PeekMainInbox("session-a")
+	if len(first) != 1 || len(second) != 1 || first[0].DeliveryID != second[0].DeliveryID {
+		t.Fatalf("mail should remain until ack: first=%+v second=%+v", first, second)
+	}
+	mgr.AckMainInbox([]string{first[0].DeliveryID})
+	if got := mgr.PeekMainInbox("session-a"); len(got) != 0 {
+		t.Fatalf("acked mail remained pending: %+v", got)
 	}
 }
 

@@ -14,7 +14,10 @@ import (
 // ArtifactScheme 是产物引用的 URL 前缀：artifact://<id>。
 const ArtifactScheme = "artifact://"
 
-var artifactName = regexp.MustCompile(`^(\d+)\.[A-Za-z0-9_-]+\.log$`)
+var (
+	artifactName    = regexp.MustCompile(`^(\d+)\.[A-Za-z0-9_-]+\.log$`)
+	reservationName = regexp.MustCompile(`^\.artifact-(\d+)\.reserved$`)
+)
 
 // ArtifactStore 管理一个会话的产物目录：<dir>/<id>.<tool>.log，id 单调递增。
 // 首次分配前扫描已有文件取最大 id，resume 不会覆盖旧产物。
@@ -32,7 +35,19 @@ type ArtifactStore struct {
 func NewArtifactStore(dir string) *ArtifactStore { return &ArtifactStore{dir: dir} }
 
 // Dir 返回产物目录。
-func (s *ArtifactStore) Dir() string { return s.dir }
+func (s *ArtifactStore) Dir() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.dir
+}
+
+// SetDir 切换当前根会话的产物目录；URL scheme 保留，编号在新目录重新扫描。
+// 调用方必须先结束使用旧会话的主 Agent run。
+func (s *ArtifactStore) SetDir(dir string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.dir, s.next, s.init = dir, 0, false
+}
 
 func (s *ArtifactStore) scanLocked() error {
 	if s.init {
@@ -46,7 +61,11 @@ func (s *ArtifactStore) scanLocked() error {
 		return err
 	}
 	for _, de := range des {
-		if m := artifactName.FindStringSubmatch(de.Name()); m != nil {
+		m := artifactName.FindStringSubmatch(de.Name())
+		if m == nil {
+			m = reservationName.FindStringSubmatch(de.Name())
+		}
+		if m != nil {
 			if n, err := strconv.ParseInt(m[1], 10, 64); err == nil && n >= s.next {
 				s.next = n + 1
 			}
@@ -63,13 +82,38 @@ func (s *ArtifactStore) Create(tool string) (string, *os.File, error) {
 	if err := s.scanLocked(); err != nil {
 		return "", nil, err
 	}
-	id := strconv.FormatInt(s.next, 10)
-	s.next++
-	f, err := os.Create(filepath.Join(s.dir, id+"."+sanitizeTool(tool)+".log"))
-	if err != nil {
-		return "", nil, err
+	for {
+		id := strconv.FormatInt(s.next, 10)
+		s.next++
+		// Reserve the numeric id with O_EXCL. Different ArtifactStore instances may
+		// point at the same session directory, so an in-memory mutex alone is not enough.
+		marker := filepath.Join(s.dir, ".artifact-"+id+".reserved")
+		reservation, err := os.OpenFile(marker, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+		if os.IsExist(err) {
+			continue
+		}
+		if err != nil {
+			return "", nil, err
+		}
+		if err := reservation.Close(); err != nil {
+			_ = os.Remove(marker)
+			return "", nil, err
+		}
+		// The marker serializes this numeric id across stores. Check every tool
+		// suffix while holding it, because different suffixes would not conflict at
+		// the filesystem level even though artifact://<id> must stay unambiguous.
+		if matches, _ := filepath.Glob(filepath.Join(s.dir, id+".*.log")); len(matches) > 0 {
+			_ = os.Remove(marker)
+			continue
+		}
+		f, err := os.OpenFile(filepath.Join(s.dir, id+"."+sanitizeTool(tool)+".log"), os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
+		if err != nil {
+			_ = os.Remove(marker)
+			return "", nil, err
+		}
+		_ = os.Remove(marker)
+		return id, f, nil
 	}
-	return id, f, nil
 }
 
 // AddScheme 注册一个额外的 URL 方案（如 agent / history）；重复注册后者覆盖。
@@ -108,7 +152,10 @@ func (s *ArtifactStore) resolveArtifact(id string) (string, error) {
 	if _, err := strconv.Atoi(id); err != nil {
 		return "", fmt.Errorf("artifact id 必须是数字，got %q", id)
 	}
-	matches, _ := filepath.Glob(filepath.Join(s.dir, id+".*.log"))
+	s.mu.Lock()
+	dir := s.dir
+	s.mu.Unlock()
+	matches, _ := filepath.Glob(filepath.Join(dir, id+".*.log"))
 	if len(matches) == 0 {
 		return "", fmt.Errorf("artifact %s 不存在", id)
 	}
