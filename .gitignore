@@ -19,3 +19,6 @@ memory.db
 
 # 本地 Go 构建缓存（沙箱下工作区内构建用）
 /.gocache/
+
+# VS Code 临时计划文件
+.zcode/
