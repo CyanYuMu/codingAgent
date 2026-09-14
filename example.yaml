@@ -11,6 +11,14 @@
 #   yolo       —— 全部放行（无弹窗；命令行 --yolo 可临时强制）
 approval_mode: write
 
+# 生产运行时：默认 sandbox.mode=required，禁止进程联网。
+# sandbox / lsp 只能配置在用户级配置文件，具体路径示例见 docs/PRODUCTION_RUNTIME.md。
+# 原有无沙箱 MCP 启动器暂不能与 required 模式同时启用。
+# 项目可指定实际验证命令；配置后，修改代码须通过 verify 才能正常结算。
+# verification:
+#   commands: ["go test ./...", "go vet ./..."]
+#   timeout: 120s
+
 # 委派模式：控制主 agent 是否主动委派给子 agent
 #   conservative —— 不委派（除非用户明确要求）
 #   preferred    —— 优先委派（默认）
@@ -31,6 +39,21 @@ permissions:
 bash:
   timeout: 120s   # 单条命令 wall-clock 上限（最大 600s）；超时 SIGTERM 进程组、5s 后 SIGKILL
                   # 环境变量自动剔除密钥类（*API_KEY*/*TOKEN*/*SECRET*/*PASSWORD*/*CREDENTIAL*）
+
+# Skills：启动时只把 name + description 索引放入 system prompt，正文由 skill 工具按需加载。
+# 原生目录：~/.codeclaw/skills/<name>/SKILL.md 与 <项目>/.codeclaw/skills/<name>/SKILL.md。
+skills:
+  enabled: true
+  enable_commands: true       # /skills 与 /skill:<name>
+  compatibility:              # 兼容目录默认关闭，避免无意引入其它 harness 的 prompt
+    claude: false              # .claude/skills
+    codex: false               # .codex/skills
+    agents: false              # .agents/skills
+  custom_directories: []      # 额外目录；支持 ~/，优先级低于项目、高于用户原生目录
+  include: []                 # 可选名称 glob allowlist
+  ignore: []                  # 名称 glob denylist
+  max_file_bytes: 262144
+  max_skills: 500
 
 # 子 agent 运行时
 subagent:

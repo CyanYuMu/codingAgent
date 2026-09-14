@@ -9,6 +9,7 @@ import (
 
 	"einoclaw-build/internal/permission"
 	"einoclaw-build/internal/runtime"
+	"einoclaw-build/internal/workspace"
 )
 
 // Builtins 返回内置工具。bash 为该 agent 专属实例（cwd 隔离）；store 为会话产物存储（可 nil）。
@@ -54,11 +55,12 @@ func (t *readFileTool) InvalidateReadHistory() { t.guard.invalidateReads() }
 func (*readFileTool) Name() string { return "read_file" }
 func (*readFileTool) Description() string {
 	return "按行读取文件内容；offset 为起始行号（1 起），limit 为读取行数（默认 300）。" +
-		"file_path 还支持会话内 URL：artifact://N（被截断的完整工具输出）、agent://<子agent名>（它的完整产出）、history://<子agent名>（它的转录）。"
+		"file_path 还支持内部 URL：artifact://N（被截断的完整工具输出）、agent://<子agent名>（完整产出）、" +
+		"history://<子agent名>（转录）、skill://<name>/<path>（skill 配套资源）。"
 }
 func (*readFileTool) Parameters() map[string]any {
 	return map[string]any{
-		"file_path": map[string]any{"type": "string", "description": "文件路径，或 artifact://N"},
+		"file_path": map[string]any{"type": "string", "description": "文件路径，或 artifact://、agent://、history://、skill:// URL"},
 		"offset":    map[string]any{"type": "integer", "description": "起始行号（1 起）"},
 		"limit":     map[string]any{"type": "integer", "description": "读取行数，默认 300"},
 	}
@@ -85,12 +87,19 @@ func (t *readFileTool) Execute(ctx context.Context, args map[string]any, sink *r
 		}
 		path = p
 	}
-	data, err := os.ReadFile(path)
+	if !sessionURL && t.guard.workspace != nil {
+		var err error
+		path, err = t.guard.workspace.Rel(path)
+		if err != nil {
+			return err
+		}
+	}
+	data, err := t.guard.readFile(path, sessionURL)
 	if err != nil {
 		return err
 	}
 	var mtime, size int64
-	if st, err := os.Stat(path); err == nil {
+	if st, err := t.guard.stat(path, sessionURL); err == nil {
 		mtime, size = st.ModTime().UnixNano(), st.Size()
 	}
 	lines := strings.Split(string(data), "\n")
@@ -107,11 +116,16 @@ func (t *readFileTool) Execute(ctx context.Context, args map[string]any, sink *r
 	hasRange := start < end && size > 0
 
 	// 会话内去重只对真实文件路径生效（会话内 URL 的内容不会在上文里重复）
-	if !sessionURL && hasRange && t.guard.alreadyRead(path, mtime, size, start+1, end) {
+	contentUnchanged := t.guard.workspace == nil || t.guard.contentHash(path) == workspace.Hash(data)
+	if !sessionURL && hasRange && contentUnchanged && t.guard.alreadyRead(path, mtime, size, start+1, end) {
 		fmt.Fprintf(sink, "文件未变更（上次读过第 %d-%d 行），内容仍在上文中；需要其它区间就带 offset/limit 再读。", start+1, end)
 		return nil
 	}
 	sink.Write([]byte(strings.Join(lines[start:end], "\n")))
+	if !sessionURL && t.guard.workspace != nil {
+		t.guard.observe(path, data)
+		fmt.Fprintf(sink, "\n[sha256=%s]", t.guard.contentHash(path))
+	}
 	if end < len(lines) {
 		fmt.Fprintf(sink, "\n[共 %d 行，已显示 %d-%d；继续读取请用 offset=%d]", len(lines), start+1, end, end+1)
 	}
@@ -147,9 +161,21 @@ func (writeFileTool) Concurrency() Concurrency { return ConcurrencyExclusive }
 
 func (t writeFileTool) Execute(ctx context.Context, args map[string]any, sink *runtime.Sink) error {
 	path, _ := args["file_path"].(string)
-	content, _ := args["content"].(string)
+	content, contentOK := args["content"].(string)
+	if !contentOK {
+		return fmt.Errorf("content 必须是字符串（可为空）")
+	}
 	if path == "" {
 		return fmt.Errorf("file_path 必填")
+	}
+	if t.guard.workspace != nil {
+		id, err := t.guard.applyContent(path, []byte(content))
+		if err != nil {
+			return err
+		}
+		fmt.Fprintf(sink, "wrote %d bytes to %s [transaction=%s]", len(content), path, id)
+		emitSyntaxDiagnostics(path, []byte(content), sink)
+		return nil
 	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return err
@@ -207,15 +233,25 @@ func (t editFileTool) Execute(ctx context.Context, args map[string]any, sink *ru
 	if oldStr == newStr {
 		return fmt.Errorf("old_string 与 new_string 相同，无需编辑")
 	}
-	st, err := os.Stat(path)
+	if _, ok := args["new_string"].(string); !ok {
+		return fmt.Errorf("new_string 必须是字符串")
+	}
+	if t.guard.workspace != nil {
+		var err error
+		path, err = t.guard.workspace.Rel(path)
+		if err != nil {
+			return err
+		}
+	}
+	st, err := t.guard.stat(path, false)
 	if err != nil {
 		return fmt.Errorf("文件不存在：%s", path)
 	}
 	// 先读后改守卫：没读过、或读后文件被外部改动，都要求重新 read_file（fail-safe）
-	if !t.guard.freshRead(path, st.ModTime().UnixNano(), st.Size()) {
+	if t.guard.workspace == nil && !t.guard.freshRead(path, st.ModTime().UnixNano(), st.Size()) {
 		return fmt.Errorf("edit 前必须先用 read_file 读取该文件；若已读过但文件刚被外部修改（mtime 校验不过），请重读后再 edit")
 	}
-	data, err := os.ReadFile(path)
+	data, err := t.guard.readFile(path, false)
 	if err != nil {
 		return err
 	}
@@ -232,6 +268,15 @@ func (t editFileTool) Execute(ctx context.Context, args map[string]any, sink *ru
 		out = strings.ReplaceAll(content, oldStr, newStr)
 	} else {
 		out = strings.Replace(content, oldStr, newStr, 1)
+	}
+	if t.guard.workspace != nil {
+		id, err := t.guard.applyContent(path, []byte(out))
+		if err != nil {
+			return err
+		}
+		fmt.Fprintf(sink, "edited %s [transaction=%s]", path, id)
+		emitSyntaxDiagnostics(path, []byte(out), sink)
+		return nil
 	}
 	if err := os.WriteFile(path, []byte(out), st.Mode().Perm()); err != nil {
 		return err

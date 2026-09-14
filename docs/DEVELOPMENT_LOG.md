@@ -3,6 +3,12 @@
 > 从零手写一个 AI 编程智能体 harness 的完整历程。从「eino 全包办」到「手写核心 + eino 只做模型调用」。
 > 模块：`einoclaw-build`（参考原项目 `einoclaw`，学习对象 `oh-my-pi`）
 
+## 2026-09-14：生产运行时第一轮
+
+本轮在现有 skills 工作区基础上增加 Workspace 文件边界、默认 required 的进程沙箱、可恢复变更日志、Go AST / stdio LSP、版本绑定的验证和完成检查；评测入口同步移除进程级 `os.Chdir`。没有修改用户 Git 历史。
+
+逐步设计含义、代码结构、回归证据与明确未完成的生产门槛见 [生产运行时设计](specs/2026-09-14-production-runtime.md)，配置迁移与工具示例见 [使用说明](PRODUCTION_RUNTIME.md)。首轮不等同于跨文件 ACID 或完整生产安全认证：Linux 原生验收、worktree/overlay、资源配额、网络代理和长驻 LSP 仍待后续阶段。
+
 ---
 
 ## 0. 项目缘起与目标

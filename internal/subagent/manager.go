@@ -45,8 +45,9 @@ type Options struct {
 	Defs           []AgentDef
 	Summarizer     agentctx.Summarizer
 	ContextWindow  int
-	Bus            *bus.Bus // 事件总线（可 nil：不发布）
-	Notes          NoteSink // 项目笔记沉淀（explorer 产出 → file_notes；nil = 不沉淀）
+	Bus            *bus.Bus      // 事件总线（可 nil：不发布）
+	Notes          NoteSink      // 项目笔记沉淀（explorer 产出 → file_notes；nil = 不沉淀）
+	SkillIndex     func() string // 当前 skill 轻量索引；仅在该子 agent 实际拥有 skill 工具时注入
 
 	// 定义里没写时的兜底
 	DefaultTimeout  time.Duration
@@ -422,7 +423,13 @@ func (m *Manager) buildRuntime(def AgentDef, name string, depth int, sess *sessi
 		yieldExec.SetArtifactStore(store)
 	}
 	system := func(context.Context) []message.Message {
-		return []message.Message{message.NewSystemMessage(def.SystemPrompt + subagentCompletionNote)}
+		text := def.SystemPrompt + subagentCompletionNote
+		if _, ok := tools.Get("skill"); ok && m.o.SkillIndex != nil {
+			if index := m.o.SkillIndex(); index != "" {
+				text += "\n\n" + index
+			}
+		}
+		return []message.Message{message.NewSystemMessage(text)}
 	}
 	return &runtimeSet{
 		def: def, tools: tools, yieldOnly: yieldOnly, exec: exec, yieldExec: yieldExec,
@@ -442,8 +449,6 @@ func (m *Manager) buildTools(def AgentDef, name string, depth int, store *runtim
 	for _, n := range def.Tools {
 		allowed[n] = true
 	}
-	readOnly := map[string]bool{"read_file": true, "glob": true, "grep": true}
-
 	all = tool.NewRegistry()
 	for _, t := range base.List() {
 		if t.Name() == "task" { // 递归派发只能由 spawn policy 显式打开
@@ -452,7 +457,7 @@ func (m *Manager) buildTools(def AgentDef, name string, depth int, store *runtim
 		if len(allowed) > 0 && !allowed[t.Name()] {
 			continue
 		}
-		if def.ReadOnly && !readOnly[t.Name()] {
+		if def.ReadOnly && t.Tier() != permission.TierRead {
 			continue
 		}
 		all.Register(t)

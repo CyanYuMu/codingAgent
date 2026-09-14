@@ -24,14 +24,15 @@ type Context interface {
 
 // Agent 是一个可运行的编程智能体。
 type Agent struct {
-	name          string
-	model         model.Model
-	tools         *tool.Registry // 工具注册表（给模型的工具定义）
-	executor      *tool.Executor // 工具执行器（审批 + 执行）
-	cc            Context
-	maxIterations int           // 工具循环上限，防失控
-	maxRetries    int           // 瞬时错误重试上限
-	retryBase     time.Duration // 退避基数：base·2^(n-1)
+	name            string
+	model           model.Model
+	tools           *tool.Registry // 工具注册表（给模型的工具定义）
+	executor        *tool.Executor // 工具执行器（审批 + 执行）
+	cc              Context
+	maxIterations   int           // 工具循环上限，防失控
+	maxRetries      int           // 瞬时错误重试上限
+	retryBase       time.Duration // 退避基数：base·2^(n-1)
+	completionCheck func(context.Context) error
 }
 
 // New 创建一个 Agent。调用方负责在 Run 前把用户消息 Record 进 cc。
@@ -47,6 +48,9 @@ func (a *Agent) Name() string { return a.name }
 
 // Registry 返回工具注册表（宿主在换会话时用它重置工具的会话级状态）。
 func (a *Agent) Registry() *tool.Registry { return a.tools }
+
+// SetCompletionCheck installs a host gate; it must not execute unapproved tools.
+func (a *Agent) SetCompletionCheck(check func(context.Context) error) { a.completionCheck = check }
 
 // SetMaxIterations 覆盖工具循环上限（子 agent 用，0 表示不覆盖）。
 func (a *Agent) SetMaxIterations(n int) {

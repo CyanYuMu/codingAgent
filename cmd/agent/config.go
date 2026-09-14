@@ -8,9 +8,12 @@ import (
 
 	"gopkg.in/yaml.v3"
 
+	"einoclaw-build/internal/codeintel"
 	"einoclaw-build/internal/paths"
 	"einoclaw-build/internal/permission"
+	"einoclaw-build/internal/runtime"
 	"einoclaw-build/internal/tool"
+	"einoclaw-build/internal/verification"
 )
 
 // ModelProvider 标识模型服务商。
@@ -79,23 +82,59 @@ type bashConfig struct {
 	Timeout time.Duration `yaml:"timeout"` // 单条命令超时；默认 120s，上限 600s
 }
 
+type skillsCompatibilityConfig struct {
+	Claude *bool `yaml:"claude"`
+	Codex  *bool `yaml:"codex"`
+	Agents *bool `yaml:"agents"`
+}
+
+// skillsConfig 控制本地 SKILL.md 的发现与命令入口。布尔值用指针，允许后层显式 false 覆盖。
+type skillsConfig struct {
+	Enabled           *bool                     `yaml:"enabled"`
+	EnableCommands    *bool                     `yaml:"enable_commands"`
+	Compatibility     skillsCompatibilityConfig `yaml:"compatibility"`
+	CustomDirectories []string                  `yaml:"custom_directories"`
+	Include           []string                  `yaml:"include"`
+	Ignore            []string                  `yaml:"ignore"`
+	MaxFileBytes      int64                     `yaml:"max_file_bytes"`
+	MaxSkills         int                       `yaml:"max_skills"`
+}
+
+func (s skillsConfig) EnabledValue() bool    { return s.Enabled == nil || *s.Enabled }
+func (s skillsConfig) CommandsEnabled() bool { return s.EnableCommands == nil || *s.EnableCommands }
+func (s skillsConfig) ClaudeCompatible() bool {
+	return s.Compatibility.Claude != nil && *s.Compatibility.Claude
+}
+func (s skillsConfig) CodexCompatible() bool {
+	return s.Compatibility.Codex != nil && *s.Compatibility.Codex
+}
+func (s skillsConfig) AgentsCompatible() bool {
+	return s.Compatibility.Agents != nil && *s.Compatibility.Agents
+}
+
 // config 顶层配置。
 type config struct {
-	Models         []modelConfig    `yaml:"models"`
-	ApprovalMode   string           `yaml:"approval_mode"`   // always-ask/write/yolo，默认 write
-	MCPServers     []tool.MCPConfig `yaml:"mcp_servers"`     // 外部 MCP server（stdio）
-	DelegationMode string           `yaml:"delegation_mode"` // conservative/preferred/always，默认 preferred
-	Subagent       subagentConfig   `yaml:"subagent"`
-	Memory         memoryConfig     `yaml:"memory"`
-	Permissions    permissionConfig `yaml:"permissions"`
-	Bash           bashConfig       `yaml:"bash"`
+	Models         []modelConfig         `yaml:"models"`
+	ApprovalMode   string                `yaml:"approval_mode"`   // always-ask/write/yolo，默认 write
+	MCPServers     []tool.MCPConfig      `yaml:"mcp_servers"`     // 外部 MCP server（stdio）
+	DelegationMode string                `yaml:"delegation_mode"` // conservative/preferred/always，默认 preferred
+	Subagent       subagentConfig        `yaml:"subagent"`
+	Memory         memoryConfig          `yaml:"memory"`
+	Permissions    permissionConfig      `yaml:"permissions"`
+	Bash           bashConfig            `yaml:"bash"`
+	Skills         skillsConfig          `yaml:"skills"`
+	Sandbox        runtime.SandboxConfig `yaml:"sandbox"`
+	LSP            codeintel.LSPConfig   `yaml:"lsp"`
+	Verification   verification.Config   `yaml:"verification"`
 }
 
 // configPaths 返回三层配置路径（用户 → 项目 → 仓库内 legacy），后者覆盖前者。
 func configPaths(cwd string) []string {
-	var out []string
+	// Keep the trusted-user slot even if discovering it fails. A project must
+	// never become the first (capability-granting) layer by accident.
+	out := []string{""}
 	if p, err := paths.UserConfigPath(); err == nil {
-		out = append(out, p)
+		out[0] = p
 	}
 	out = append(out, paths.ProjectConfigPath(cwd), "config.yaml")
 	return out
@@ -105,7 +144,10 @@ func configPaths(cwd string) []string {
 func loadConfigFrom(files []string) (config, error) {
 	var cfg config
 	found := false
-	for _, p := range files {
+	for i, p := range files {
+		if p == "" {
+			continue
+		}
 		data, err := os.ReadFile(p)
 		if err != nil {
 			if errors.Is(err, os.ErrNotExist) {
@@ -117,6 +159,12 @@ func loadConfigFrom(files []string) (config, error) {
 		if err := yaml.Unmarshal(data, &layer); err != nil {
 			return cfg, fmt.Errorf("%s: %w", p, err)
 		}
+		// Capabilities belong to the user, never the repository.
+		if i == 0 {
+			cfg.Sandbox, cfg.LSP = layer.Sandbox, layer.LSP
+		} else if layer.Sandbox.Mode != "" || len(layer.Sandbox.ReadRoots) > 0 || len(layer.Sandbox.Env) > 0 || layer.LSP.Command != "" || len(layer.LSP.Args) > 0 || layer.LSP.LanguageID != "" || layer.LSP.Timeout != 0 {
+			return cfg, fmt.Errorf("%s: sandbox/lsp capabilities are user-only; move them to the user config", p)
+		}
 		mergeConfig(&cfg, layer)
 		found = true
 	}
@@ -124,11 +172,20 @@ func loadConfigFrom(files []string) (config, error) {
 		return cfg, errors.New("未找到模型配置：请在 ~/.codeclaw/config.yaml 或 <项目>/.codeclaw/config.yaml 填入 models（参考 example.yaml）")
 	}
 	applyDefaults(&cfg)
+	if cfg.Sandbox.Mode != "required" && cfg.Sandbox.Mode != "off" {
+		return cfg, fmt.Errorf("sandbox.mode must be required or off")
+	}
 	return cfg, nil
 }
 
 // mergeConfig 把 src 的非零字段覆盖进 dst；MCP servers 累加。
 func mergeConfig(dst *config, src config) {
+	if src.Verification.Commands != nil {
+		dst.Verification.Commands = src.Verification.Commands
+	}
+	if src.Verification.Timeout != 0 {
+		dst.Verification.Timeout = src.Verification.Timeout
+	}
 	if len(src.Models) > 0 {
 		dst.Models = src.Models
 	}
@@ -187,10 +244,37 @@ func mergeConfig(dst *config, src config) {
 	if src.Bash.Timeout != 0 {
 		dst.Bash.Timeout = src.Bash.Timeout
 	}
+	if src.Skills.Enabled != nil {
+		dst.Skills.Enabled = src.Skills.Enabled
+	}
+	if src.Skills.EnableCommands != nil {
+		dst.Skills.EnableCommands = src.Skills.EnableCommands
+	}
+	if src.Skills.Compatibility.Claude != nil {
+		dst.Skills.Compatibility.Claude = src.Skills.Compatibility.Claude
+	}
+	if src.Skills.Compatibility.Codex != nil {
+		dst.Skills.Compatibility.Codex = src.Skills.Compatibility.Codex
+	}
+	if src.Skills.Compatibility.Agents != nil {
+		dst.Skills.Compatibility.Agents = src.Skills.Compatibility.Agents
+	}
+	dst.Skills.CustomDirectories = append(dst.Skills.CustomDirectories, src.Skills.CustomDirectories...)
+	dst.Skills.Include = append(dst.Skills.Include, src.Skills.Include...)
+	dst.Skills.Ignore = append(dst.Skills.Ignore, src.Skills.Ignore...)
+	if src.Skills.MaxFileBytes != 0 {
+		dst.Skills.MaxFileBytes = src.Skills.MaxFileBytes
+	}
+	if src.Skills.MaxSkills != 0 {
+		dst.Skills.MaxSkills = src.Skills.MaxSkills
+	}
 }
 
 // applyDefaults 补默认值：approval_mode=write、delegation_mode=preferred、窗口 128k、子 agent 并发 4 / 超时 10m / 50 轮。
 func applyDefaults(cfg *config) {
+	if cfg.Sandbox.Mode == "" {
+		cfg.Sandbox.Mode = "required"
+	}
 	if cfg.Models[0].ContextWindow == 0 {
 		cfg.Models[0].ContextWindow = 128000
 	}
@@ -229,6 +313,12 @@ func applyDefaults(cfg *config) {
 	}
 	if cfg.Bash.Timeout > 600*time.Second {
 		cfg.Bash.Timeout = 600 * time.Second
+	}
+	if cfg.Skills.MaxFileBytes <= 0 {
+		cfg.Skills.MaxFileBytes = 256 * 1024
+	}
+	if cfg.Skills.MaxSkills <= 0 {
+		cfg.Skills.MaxSkills = 500
 	}
 }
 

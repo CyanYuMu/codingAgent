@@ -18,6 +18,7 @@ import (
 	"einoclaw-build/internal/message"
 	"einoclaw-build/internal/model"
 	"einoclaw-build/internal/session"
+	"einoclaw-build/internal/skills"
 	"einoclaw-build/internal/subagent"
 )
 
@@ -99,10 +100,14 @@ type teaModel struct {
 	hubCh   <-chan bus.Envelope // 子 agent 事件（唤醒重绘）
 	hubOpen bool
 	hubSel  int
+
+	skillCatalog  *skills.Manager
+	skillCommands bool
 }
 
 // NewModel 构造 TUI 模型；cmgr 持有当前会话，cwd 用于新建会话，sub/b 提供 Agent Hub。
-func NewModel(ag *agent.Agent, mgr *session.Manager, cmgr *agentctx.Manager, mem *memory.Store, cwd string, sub *subagent.Manager, b *bus.Bus) teaModel {
+func NewModel(ag *agent.Agent, mgr *session.Manager, cmgr *agentctx.Manager, mem *memory.Store, cwd string,
+	sub *subagent.Manager, b *bus.Bus, skillCatalog *skills.Manager, skillCommands bool) teaModel {
 	ta := textarea.New()
 	ta.Placeholder = " Type your message... (Enter=send, Ctrl+J=newline, Ctrl+E=steer, Ctrl+C=quit)"
 	ta.SetHeight(3)
@@ -112,7 +117,7 @@ func NewModel(ag *agent.Agent, mgr *session.Manager, cmgr *agentctx.Manager, mem
 	ta.Focus()
 	s := cmgr.Session()
 	m := teaModel{inputArea: ta, agent: ag, session: s, mgr: mgr, cmgr: cmgr, mem: mem, cwd: cwd,
-		sub: sub, hubCh: mergeHubEvents(b)}
+		sub: sub, hubCh: mergeHubEvents(b), skillCatalog: skillCatalog, skillCommands: skillCommands}
 	// 恢复历史：replay 后渲染进聊天区
 	if msgs, err := s.Replay(); err == nil {
 		m.chatLines = renderHistory(msgs)
@@ -351,6 +356,102 @@ func (m teaModel) handleKey(msg tea.KeyPressMsg) (teaModel, tea.Cmd) {
 // handleSlash 处理斜杠命令；返回是否已处理。
 func (m teaModel) handleSlash(text string) (bool, teaModel) {
 	switch {
+	case strings.HasPrefix(text, "/skill:"):
+		m.inputArea.Reset()
+		if !m.skillCommands || m.skillCatalog == nil {
+			m.chatLines = append(m.chatLines, dimStyle.Render("Skills 命令未启用"))
+			return true, m
+		}
+		name, args, ok := skills.ParseInvocation(text)
+		if !ok {
+			m.chatLines = append(m.chatLines, dimStyle.Render("用法：/skill:<name> [args]"))
+			return true, m
+		}
+		expanded, skill, err := m.skillCatalog.BuildPrompt(name, args, skills.InvocationUser)
+		if err != nil {
+			m.chatLines = append(m.chatLines, renderError(err))
+			return true, m
+		}
+		m = m.finalizeStreaming()
+		m.chatLines = append(m.chatLines, userPrefix+text)
+		m.scrollOffset = 0
+		m.pendingApproval = nil
+		_ = m.session.AppendCustom("skill_invocation", map[string]any{
+			"name": skill.Name, "path": skill.FilePath, "args": args, "source": "user",
+		})
+		m.startRun(expanded)
+		return true, m
+	case text == "/skills" || text == "/skills list":
+		m.inputArea.Reset()
+		if !m.skillCommands || m.skillCatalog == nil {
+			m.chatLines = append(m.chatLines, dimStyle.Render("Skills 命令未启用"))
+			return true, m
+		}
+		list := m.skillCatalog.List()
+		if len(list) == 0 {
+			m.chatLines = append(m.chatLines, dimStyle.Render("没有发现 skill"))
+			return true, m
+		}
+		m.chatLines = append(m.chatLines, fmt.Sprintf("Skills（%d）：", len(list)))
+		for _, skill := range list {
+			flags := ""
+			if skill.DisableModelInvocation {
+				flags += " [仅显式]"
+			}
+			if !skill.UserInvocable {
+				flags += " [仅模型]"
+			}
+			m.chatLines = append(m.chatLines, fmt.Sprintf("  %s%s — %s", skill.Name, flags, skill.Description))
+		}
+		return true, m
+	case strings.HasPrefix(text, "/skills show "):
+		m.inputArea.Reset()
+		if !m.skillCommands || m.skillCatalog == nil {
+			m.chatLines = append(m.chatLines, dimStyle.Render("Skills 命令未启用"))
+			return true, m
+		}
+		name := strings.TrimSpace(strings.TrimPrefix(text, "/skills show "))
+		skill, ok := m.skillCatalog.Get(name)
+		if !ok {
+			m.chatLines = append(m.chatLines, renderError(fmt.Errorf("未知 skill %q；运行 /skills 查看可用项", name)))
+			return true, m
+		}
+		m.chatLines = append(m.chatLines,
+			"Skill: "+skill.Name,
+			"  描述: "+skill.Description,
+			"  来源: "+skill.Source.Label,
+			"  路径: "+skill.FilePath,
+			fmt.Sprintf("  调用: model=%t user=%t", !skill.DisableModelInvocation, skill.UserInvocable),
+		)
+		if len(skill.AllowedTools) > 0 {
+			m.chatLines = append(m.chatLines, "  建议工具: "+strings.Join(skill.AllowedTools, ", "))
+		}
+		return true, m
+	case text == "/skills reload":
+		m.inputArea.Reset()
+		if !m.skillCommands || m.skillCatalog == nil {
+			m.chatLines = append(m.chatLines, dimStyle.Render("Skills 命令未启用"))
+			return true, m
+		}
+		warnings, err := m.skillCatalog.Reload()
+		if err != nil {
+			m.chatLines = append(m.chatLines, renderError(err))
+			return true, m
+		}
+		m.cmgr.InvalidateSystem()
+		m.chatLines = append(m.chatLines, fmt.Sprintf("已重新加载 %d 个 skills（%d 条告警）", len(m.skillCatalog.List()), len(warnings)))
+		for _, warning := range warnings {
+			where := warning.Path
+			if where != "" {
+				where += ": "
+			}
+			m.chatLines = append(m.chatLines, dimStyle.Render("  ⚠ "+where+warning.Message))
+		}
+		return true, m
+	case strings.HasPrefix(text, "/skills"):
+		m.inputArea.Reset()
+		m.chatLines = append(m.chatLines, dimStyle.Render("用法：/skills [list|show <name>|reload]；调用：/skill:<name> [args]"))
+		return true, m
 	case text == "/clear":
 		_ = m.session.Reset()
 		m.agent.Registry().ResetConv() // reset_boundary 封存旧上下文，已读记录随之失效

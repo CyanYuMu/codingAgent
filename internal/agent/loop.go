@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"time"
 
@@ -36,6 +37,7 @@ func (a *Agent) Run(ctx context.Context, steer <-chan message.Message) <-chan Ag
 func (a *Agent) loop(ctx context.Context, steer <-chan message.Message, emit func(AgentEvent)) {
 	var lastUsage model.Usage
 	retries := 0
+	completionRetries := 0
 	for step := 0; step < a.maxIterations; step++ {
 		// steering：非阻塞取修正，记录为用户消息
 		if steer != nil {
@@ -86,6 +88,20 @@ func (a *Agent) loop(ctx context.Context, steer <-chan message.Message, emit fun
 		}
 		calls := toolCallsOf(assistant)
 		if len(calls) == 0 {
+			if a.completionCheck != nil {
+				if err := a.completionCheck(ctx); err != nil {
+					if completionRetries >= 2 || ctx.Err() != nil {
+						emit(AgentEvent{Type: EventError, Err: fmt.Errorf("completion blocked: %w", err)})
+						return
+					}
+					completionRetries++
+					if recordErr := a.cc.Record(message.NewUserMessage("[verification gate] "+err.Error()), model.Usage{}); recordErr != nil {
+						emit(AgentEvent{Type: EventError, Err: recordErr})
+						return
+					}
+					continue
+				}
+			}
 			return // 无工具调用，turn 结束
 		}
 		// 三档中断「跳过」：已取消则不启动工具（回放时悬空调用会被合成 interrupted 结果）
@@ -112,6 +128,9 @@ func (a *Agent) loop(ctx context.Context, steer <-chan message.Message, emit fun
 			emit(AgentEvent{Type: EventTerminated, Terminated: &TerminatedInfo{ToolName: terminated}})
 			return
 		}
+	}
+	if a.completionCheck != nil {
+		emit(AgentEvent{Type: EventError, Err: fmt.Errorf("iteration limit reached before completion (%d steps)", a.maxIterations)})
 	}
 }
 

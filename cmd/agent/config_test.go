@@ -100,3 +100,22 @@ func TestBashTimeoutDefaults(t *testing.T) {
 		t.Fatalf("超时应被钳到 600s，got %v err=%v", cfg2.Bash.Timeout, err)
 	}
 }
+
+func TestSkillsConfigDefaultsAndFalseOverride(t *testing.T) {
+	dir := t.TempDir()
+	user := writeYAML(t, dir, "user.yaml", "models:\n  - provider: qwen\n    api_key: k\n    model_id: m\nskills:\n  enabled: true\n  enable_commands: true\n  compatibility:\n    claude: true\n  custom_directories: [~/shared-skills]\n")
+	project := writeYAML(t, dir, "project.yaml", "skills:\n  enable_commands: false\n  compatibility:\n    claude: false\n  ignore: [danger-*]\n")
+	cfg, err := loadConfigFrom([]string{user, project})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.Skills.EnabledValue() || cfg.Skills.CommandsEnabled() || cfg.Skills.ClaudeCompatible() {
+		t.Fatalf("skills bool merge failed: %+v", cfg.Skills)
+	}
+	if cfg.Skills.MaxFileBytes != 256*1024 || cfg.Skills.MaxSkills != 500 {
+		t.Fatalf("skills defaults failed: %+v", cfg.Skills)
+	}
+	if len(cfg.Skills.CustomDirectories) != 1 || len(cfg.Skills.Ignore) != 1 {
+		t.Fatalf("skills lists failed: %+v", cfg.Skills)
+	}
+}

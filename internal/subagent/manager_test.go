@@ -15,6 +15,7 @@ import (
 	"einoclaw-build/internal/model"
 	"einoclaw-build/internal/permission"
 	"einoclaw-build/internal/runtime"
+	"einoclaw-build/internal/skills"
 	"einoclaw-build/internal/tool"
 )
 
@@ -52,10 +53,11 @@ type scriptModel struct {
 	steps []model.ModelEvent
 	delay time.Duration
 	tools [][]string // 每次调用收到的工具名（排序后）
+	msgs  [][]message.Message
 	calls int
 }
 
-func (m *scriptModel) Stream(ctx context.Context, _ []message.Message, tools []model.ToolSpec) (model.ModelStream, error) {
+func (m *scriptModel) Stream(ctx context.Context, msgs []message.Message, tools []model.ToolSpec) (model.ModelStream, error) {
 	if ctx.Err() != nil {
 		return nil, ctx.Err()
 	}
@@ -66,6 +68,7 @@ func (m *scriptModel) Stream(ctx context.Context, _ []message.Message, tools []m
 	}
 	sort.Strings(names)
 	m.tools = append(m.tools, names)
+	m.msgs = append(m.msgs, append([]message.Message(nil), msgs...))
 	m.calls++
 	var ev model.ModelEvent
 	if len(m.steps) == 0 {
@@ -76,6 +79,15 @@ func (m *scriptModel) Stream(ctx context.Context, _ []message.Message, tools []m
 	delay := m.delay
 	m.mu.Unlock()
 	return &fakeStream{events: []model.ModelEvent{ev}, delay: delay, ctx: ctx}, nil
+}
+
+func (m *scriptModel) messagesAt(i int) []message.Message {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if i < 0 || i >= len(m.msgs) {
+		return nil
+	}
+	return append([]message.Message(nil), m.msgs[i]...)
 }
 
 func (m *scriptModel) remaining() int {
@@ -239,6 +251,53 @@ func TestIndependentBashPerRun(t *testing.T) {
 	bb, _ := os.ReadFile(rb.SessionFile)
 	if !strings.Contains(string(ba), filepath.Join(dir, "a")) || !strings.Contains(string(bb), filepath.Join(dir, "b")) {
 		t.Fatalf("cwd leaked between runs:\nA: %s\nB: %s", ba, bb)
+	}
+}
+
+func TestReadOnlySubagentKeepsSkillToolAndIndex(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, ".git"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	skillFile := filepath.Join(dir, ".codeclaw", "skills", "review", "SKILL.md")
+	if err := os.MkdirAll(filepath.Dir(skillFile), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(skillFile, []byte("---\nname: review\ndescription: review changes\n---\nSECRET SKILL BODY"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	catalog, err := skills.NewManager(skills.Options{CWD: dir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := &scriptModel{}
+	o := baseOpts(m, dir)
+	o.Defs[0].ReadOnly = true
+	o.WorkerTools = func(cwd string, store *runtime.ArtifactStore) *tool.Registry {
+		reg := workerTools(cwd, store)
+		reg.Register(tool.NewSkillTool(catalog))
+		if store != nil {
+			store.AddScheme("skill", catalog.Resolve)
+		}
+		return reg
+	}
+	o.SkillIndex = catalog.RenderIndex
+	r := runOne(t, NewManager(o), context.Background(), one("explorer", "review it"))
+	if r.Status != StatusCompleted {
+		t.Fatalf("result = %+v", r)
+	}
+	names := strings.Join(m.toolsAt(0), ",")
+	if !strings.Contains(names, "skill") || strings.Contains(names, "bash") || strings.Contains(names, "edit") {
+		t.Fatalf("read-only tools = %s", names)
+	}
+	var prompt strings.Builder
+	for _, msg := range m.messagesAt(0) {
+		for _, block := range msg.Blocks {
+			prompt.WriteString(block.Text)
+		}
+	}
+	if got := prompt.String(); !strings.Contains(got, "review: review changes") || strings.Contains(got, "SECRET SKILL BODY") {
+		t.Fatalf("skill index should be present without body: %s", got)
 	}
 }
 

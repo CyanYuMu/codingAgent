@@ -4,6 +4,8 @@ import (
 	"path/filepath"
 	"slices"
 	"sync"
+
+	"einoclaw-build/internal/workspace"
 )
 
 // fileGuard 会话级文件状态：read_file 的已读记录（区间去重）+ write/edit 的「先读后改」守卫。
@@ -11,8 +13,10 @@ import (
 // 状态有两个前提：去重靠「内容仍在上文中」（压缩/剪枝后失效，见 invalidateReads），
 // 守卫靠「本会话真的读过且此后未被外部改动」（指纹兜底，不依赖区间）。
 type fileGuard struct {
-	mu    sync.Mutex
-	reads map[string]*readRecord
+	mu        sync.Mutex
+	reads     map[string]*readRecord
+	workspace *workspace.Workspace
+	hashes    map[string]string
 }
 
 // readRecord 一个文件的已读状态：内容指纹（mtime+size）与已读行区间（1 起闭区间，不重叠有序）。
@@ -91,6 +95,7 @@ func (g *fileGuard) reset() {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	g.reads = map[string]*readRecord{}
+	g.hashes = nil
 }
 
 // insertRange 把 [from,to] 并入有序不重叠的区间列表（相邻合并）。

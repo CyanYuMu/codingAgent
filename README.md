@@ -103,6 +103,8 @@ einoclaw-build/
 
 ## 快速开始
 
+生产运行时初版已接入：文件工具绑定工作区、默认原生进程沙箱、Go AST/LSP、可恢复变更日志与可配置验证门禁。升级前请阅读 [配置与使用说明](docs/PRODUCTION_RUNTIME.md) 和 [逐步设计/代码构造](docs/specs/2026-09-14-production-runtime.md)。默认禁止子进程联网；Go 工具链/模块缓存等额外读取目录在用户配置中授权。
+
 ```bash
 # 配置（复制模板并填入模型 API key）
 cp example.yaml config.yaml
@@ -152,5 +154,6 @@ memory:
 | P9 (M2) | 委派运行时：frontmatter agent、TaskBatch 预检、yield 三态、Agent Hub、后台作业、hub 邮箱 | ✅ |
 | P10 (M3) | 记忆正确性、前缀缓存、L1 项目层、剪枝阶梯、项目知识、read 去重 | ✅ |
 | P11 (M4) | 审批规则引擎 + bash 分类器/超时/进程组/env 脱敏（P11.1）；edit 工具与文件守卫（P11.2）；hooks / trace.db / eval v2（后续） | 🚧 P11.1–P11.2 完成 |
+| 生产化第一轮 | Workspace / 原生 sandbox / Go AST + stdio LSP / 哈希前置条件与恢复日志 / verify + 完成检查 | 初版落地；平台验收与限制见设计文档 |
 
 详细演进方案见 [docs/specs/2026-08-24-evolution-plan.md](docs/specs/2026-08-24-evolution-plan.md)，完整开发记录见 [docs/DEVELOPMENT_LOG.md](docs/DEVELOPMENT_LOG.md)。
