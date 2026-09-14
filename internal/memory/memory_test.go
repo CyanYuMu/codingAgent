@@ -221,6 +221,26 @@ func TestMaxPerScopeEvictsLowest(t *testing.T) {
 	}
 }
 
+func TestInvalidatedRowsDoNotConsumeActiveQuota(t *testing.T) {
+	s := openTest(t)
+	s.SetMaxPerScope(2)
+	old := remember(t, s, "已经过时的构建约定", Opts{Key: "old-build", Importance: 0.9})
+	if err := s.Forget("old-build", "已迁移"); err != nil {
+		t.Fatal(err)
+	}
+	keep1 := remember(t, s, "当前构建命令使用 make build", Opts{Key: "build", Importance: 0.8})
+	keep2 := remember(t, s, "当前测试命令使用 make test", Opts{Key: "test", Importance: 0.8})
+
+	if row, err := s.Get(old); err != nil || row.Veracity != 0 {
+		t.Fatalf("失效审计行应保留：%+v err=%v", row, err)
+	}
+	for _, id := range []int64{keep1, keep2} {
+		if row, err := s.Get(id); err != nil || row.Veracity <= 0 {
+			t.Fatalf("活跃记忆不应被失效历史挤出配额：id=%d row=%+v err=%v", id, row, err)
+		}
+	}
+}
+
 func TestRecallWithPunctuationQuery(t *testing.T) {
 	s := openTest(t)
 	remember(t, s, "这个项目的构建命令是 env -u GOROOT go build ./...", Opts{})
@@ -310,6 +330,55 @@ func TestUnionMergesAndDedupes(t *testing.T) {
 	}
 	if got[0].Scope != ScopeProject {
 		t.Fatalf("同内容应优先取项目库的：%+v", got[0])
+	}
+	projectRow, _ := proj.Get(got[0].ID)
+	if projectRow.AccessCount != 1 {
+		t.Fatalf("最终返回的项目记忆访问数 = %d, want 1", projectRow.AccessCount)
+	}
+	var duplicateID int64
+	if err := global.db.QueryRow(`SELECT id FROM memories WHERE content=?`, "用户偏好中文回复").Scan(&duplicateID); err != nil {
+		t.Fatal(err)
+	}
+	globalDuplicate, _ := global.Get(duplicateID)
+	if globalDuplicate.AccessCount != 0 {
+		t.Fatalf("合并后未返回的重复记忆不应被计为访问：%d", globalDuplicate.AccessCount)
+	}
+}
+
+func TestUnionOnlyTouchesFinalTopK(t *testing.T) {
+	dir := t.TempDir()
+	proj, _ := Open(filepath.Join(dir, "p.db"), ScopeProject, "proj-1")
+	defer proj.Close()
+	global, _ := Open(filepath.Join(dir, "g.db"), ScopeGlobal, "")
+	defer global.Close()
+
+	selected := remember(t, proj, "首选测试框架是 Go testing", Opts{Importance: 0.9})
+	notSelected := remember(t, global, "备用测试框架是另一个工具", Opts{Importance: 0.1})
+	got, err := Union(proj, global).Recall("测试框架", 1)
+	if err != nil || len(got) != 1 || got[0].ID != selected || got[0].Scope != ScopeProject {
+		t.Fatalf("top1 = %+v err=%v", got, err)
+	}
+	p, _ := proj.Get(selected)
+	g, _ := global.Get(notSelected)
+	if p.AccessCount != 1 || g.AccessCount != 0 {
+		t.Fatalf("只应 touch 最终 topK：selected=%d excluded=%d", p.AccessCount, g.AccessCount)
+	}
+}
+
+func TestUnionDedupesNearDuplicateAcrossStores(t *testing.T) {
+	dir := t.TempDir()
+	proj, _ := Open(filepath.Join(dir, "p.db"), ScopeProject, "proj-1")
+	defer proj.Close()
+	global, _ := Open(filepath.Join(dir, "g.db"), ScopeGlobal, "")
+	defer global.Close()
+	remember(t, proj, "用户明确偏好所有技术讨论都使用简体中文回复", Opts{})
+	remember(t, global, "用户明确偏好所有技术讨论都使用简体中文回复。", Opts{})
+	got, err := Union(proj, global).Recall("用户技术讨论语言偏好", 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("跨库近重复应合并，got=%+v", got)
 	}
 }
 

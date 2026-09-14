@@ -48,6 +48,12 @@ func splitSegments(command string) []string {
 // dangerousPattern 任一段命中即返回原因（空 = 不危险）。
 func dangerousPattern(segs []string) string {
 	for _, seg := range segs {
+		if sensitivePath.MatchString(seg) {
+			return "读取可能包含凭据的敏感文件"
+		}
+		if bulkSearchRe.MatchString(seg) {
+			return "shell 批量内容搜索可能扫入凭据；请改用受控 grep 工具"
+		}
 		if !dangSegRe.MatchString(seg) {
 			continue
 		}
@@ -116,21 +122,24 @@ func redirectTarget(seg string) string {
 // readOnlyCommands 命令名白名单：不写文件、不执行副作用。
 var readOnlyCommands = map[string]bool{
 	"ls": true, "cat": true, "head": true, "tail": true, "wc": true,
-	"grep": true, "rg": true, "find": true, "du": true, "df": true, "pwd": true,
+	"find": true, "du": true, "df": true, "pwd": true,
 	"echo": true, "printf": true, "date": true, "env": true, "uname": true,
 	"which": true, "whoami": true, "hostname": true, "id": true,
-	"sort": true, "uniq": true, "cut": true, "tr": true, "file": true,
+	"cut": true, "tr": true, "file": true,
 	"test": true, "true": true, "false": true, "basename": true, "dirname": true,
 }
 
 var (
-	gitReadOnlySub = regexp.MustCompile(`^(status|log|diff|show|branch|tag|rev-parse|ls-files|ls-tree)(\s|$)`)
+	gitReadOnlySub = regexp.MustCompile(`^(status|log|diff|show|rev-parse|ls-files|ls-tree)(\s|$)`)
 	gitStashRead   = regexp.MustCompile(`^stash(\s+(list|show))?(\s|$)`)
 	gitRemoteRead  = regexp.MustCompile(`^remote(\s+(-v|--verbose))?(\s|$)`)
-	goReadOnlySub  = regexp.MustCompile(`^(build|test|vet|list|env|version)(\s|$)`)
-	goModRead      = regexp.MustCompile(`^mod\s+(download|verify|graph|why)(\s|$)`)
+	goReadOnlySub  = regexp.MustCompile(`^(list|env|version)(\s|$)`)
+	goModRead      = regexp.MustCompile(`^mod\s+(verify|graph)(\s|$)`)
 	goFmtList      = regexp.MustCompile(`^fmt\s+-l(\s|$)`)
 	gofmtList      = regexp.MustCompile(`^-l(\s|$)`)
+	fileRedirect   = regexp.MustCompile(`(^|\s)\d*>>?\s*([^\s]+)`)
+	sensitivePath  = regexp.MustCompile(`(?i)(^|[\s'"=])([^\s'"=]*/)?(\.env(\.[^/\s'"=]+)?|\.npmrc|\.pypirc|\.netrc|id_rsa|id_ed25519|credentials\.json|service-account\.json)([/\s'"=]|$)|[.]codeclaw/config[.]ya?ml`)
+	bulkSearchRe   = regexp.MustCompile(`(^|\s)(grep|rg)(\s|$)`)
 )
 
 // segmentReadOnly 单段是否确定只读。
@@ -138,6 +147,15 @@ func segmentReadOnly(seg string) bool {
 	seg = strings.TrimSpace(seg)
 	if seg == "" {
 		return false
+	}
+	if sensitivePath.MatchString(seg) {
+		return false // shell 读取敏感路径至少回落 exec tier；直接 read_file 会给出明确 Override
+	}
+	// 相对路径重定向也会改工作区；只有显式丢到 /dev/null 才仍算只读。
+	for _, m := range fileRedirect.FindAllStringSubmatch(seg, -1) {
+		if strings.Trim(m[2], `"'`) != "/dev/null" {
+			return false
+		}
 	}
 	fields := strings.Fields(seg)
 	cmd := fields[0]
@@ -165,7 +183,8 @@ func segmentReadOnly(seg string) bool {
 		fields = strings.Fields(rest)
 	}
 classify:
-	if cmd == "find" && (strings.Contains(seg, "-delete") || strings.Contains(seg, "-exec")) {
+	if cmd == "find" && (strings.Contains(seg, "-delete") || strings.Contains(seg, "-exec") ||
+		strings.Contains(seg, "-ok") || strings.Contains(seg, "-fprint")) {
 		return false
 	}
 	if readOnlyCommands[cmd] {
@@ -174,9 +193,15 @@ classify:
 	switch cmd {
 	case "git":
 		sub := strings.TrimSpace(strings.TrimPrefix(rest, "git"))
+		if strings.Contains(sub, "--ext-diff") || strings.Contains(sub, "--textconv") {
+			return false // 可执行仓库配置里的外部 helper/filter
+		}
 		return gitReadOnlySub.MatchString(sub) || gitStashRead.MatchString(sub) || gitRemoteRead.MatchString(sub)
 	case "go":
 		sub := strings.TrimSpace(strings.TrimPrefix(rest, "go"))
+		if strings.HasPrefix(sub, "env") && (strings.Contains(sub, " -w") || strings.Contains(sub, " -u")) {
+			return false
+		}
 		return goReadOnlySub.MatchString(sub) || goModRead.MatchString(sub) || goFmtList.MatchString(sub)
 	case "gofmt":
 		sub := strings.TrimSpace(strings.TrimPrefix(rest, "gofmt"))

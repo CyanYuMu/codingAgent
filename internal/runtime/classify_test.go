@@ -10,16 +10,16 @@ func TestClassifyReadOnly(t *testing.T) {
 		"git remote -v",
 		"ls -la",
 		"cat f.txt",
-		"go test ./...",
-		"go build ./...",
-		"go vet ./...",
-		"go mod download -x",
+		"go list ./...",
+		"go env GOPATH",
+		"go version",
+		"go mod verify",
 		"go fmt -l",
 		"gofmt -l .",
 		"echo hi",
 		"find . -name '*.go'",
 		"env",
-		"env FOO=1 go test ./...",
+		"env FOO=1 go version",
 		"date",
 	} {
 		ro, dang, reason := Classify(c)
@@ -54,6 +54,10 @@ func TestClassifyDangerous(t *testing.T) {
 		{"kill -9 -1", "杀全部"},
 		{"echo x > /etc/passwd", "敏感路径"},
 		{"find / -delete", "find"},
+		{"cat .env", "敏感文件"},
+		{"head .codeclaw/config.yaml", "敏感文件"},
+		{"rg token .", "批量"},
+		{"grep -R token .", "批量"},
 	}
 	for _, c := range cases {
 		ro, dang, reason := Classify(c.cmd)
@@ -72,7 +76,18 @@ func TestClassifyNotJudged(t *testing.T) {
 		"git commit -m x",
 		"git push --force-with-lease",
 		"go run .",
+		"go test ./...",
+		"go build ./...",
+		"go vet ./...",
+		"go mod download -x",
+		"go env -w GOPROXY=off",
 		"go fmt",
+		"git branch feature",
+		"git tag v1.0.0",
+		"git diff --ext-diff",
+		"git show --textconv HEAD:file.bin",
+		"echo hi > result.txt",
+		"sort input.txt -o output.txt",
 		"curl https://example.com",
 		"node server.js",
 		"make build",
@@ -92,7 +107,7 @@ func TestClassifySegments(t *testing.T) {
 		ro, dang bool
 	}{
 		{"ls && rm -rf /", false, true},          // 一段危险即危险
-		{"cat a | grep x", true, false},          // 全部只读才算只读
+		{"cat a | head -n 1", true, false},       // 全部只读才算只读
 		{"git status && echo done", true, false}, // 混合只读
 		{"git status && npm test", false, false}, // 只读 + 未知 → 不判定
 		{"echo hi > /dev/null", true, false},     // 丢弃输出不算危险

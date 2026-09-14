@@ -53,6 +53,31 @@ func TestBoundary(t *testing.T) {
 	}
 }
 
+func TestFilesOmitsSensitiveCredentialsButDirectReadRemainsPossible(t *testing.T) {
+	w := testWorkspace(t)
+	for _, p := range []string{"main.go", ".env", ".env.local", ".npmrc", ".env.example"} {
+		put(t, w, p, p)
+	}
+	files, err := w.Files(".")
+	if err != nil {
+		t.Fatal(err)
+	}
+	joined := strings.Join(files, "\n")
+	for _, hidden := range []string{".env\n", ".env.local", ".npmrc"} {
+		if strings.Contains(joined+"\n", hidden) {
+			t.Fatalf("bulk search exposed sensitive file %q: %v", hidden, files)
+		}
+	}
+	for _, visible := range []string{"main.go", ".env.example"} {
+		if !strings.Contains(joined, visible) {
+			t.Fatalf("expected %q in safe file list: %v", visible, files)
+		}
+	}
+	if b, err := w.ReadFile(".env"); err != nil || string(b) != ".env" {
+		t.Fatalf("explicitly approved direct reads must remain possible: %q %v", b, err)
+	}
+}
+
 func TestJournalUndoAfterReopenAndUserConflict(t *testing.T) {
 	root, journal := t.TempDir(), t.TempDir()
 	w, err := Open(root, journal)

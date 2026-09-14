@@ -65,7 +65,8 @@ type Manager struct {
 
 	// 前缀缓存：system() 里有记忆召回这类每次都可能变的内容，如果每轮都重算，
 	// 提示词前缀就每轮都变——provider 的 prompt cache 全部失效，长会话里这是最大的隐性成本。
-	// 因此只在「会话首轮 / 压缩后 / 换会话」这三个时刻刷新。
+	// 因此只在「会话首轮 / 新用户 turn / 压缩后 / 换会话」刷新；同一 turn 内的
+	// tool/assistant 重建继续命中缓存，兼顾召回新鲜度与 provider prompt cache。
 	sysCache []message.Message
 	sysDirty bool
 }
@@ -140,7 +141,13 @@ func (m *Manager) Build(ctx context.Context) ([]message.Message, error) {
 
 // Record 记录一条消息到会话（assistant 消息带用量）。
 func (m *Manager) Record(msg message.Message, u model.Usage) error {
-	return m.Session().AppendWithUsage(msg, u)
+	if err := m.Session().AppendWithUsage(msg, u); err != nil {
+		return err
+	}
+	if msg.Role == message.RoleUser {
+		m.InvalidateSystem()
+	}
+	return nil
 }
 
 // ShouldCompact 判断上一次调用的 prompt 用量是否超阈值；同时记下真值供估算校准。

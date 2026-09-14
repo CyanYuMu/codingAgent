@@ -285,6 +285,24 @@ func TestInvalidateSystemRefreshes(t *testing.T) {
 	}
 }
 
+func TestNewUserTurnRefreshesSystemOnce(t *testing.T) {
+	s, _ := session.New("s1", &session.MemoryStorage{})
+	calls := 0
+	cm := New(s, nil, 100000, 1000, countingSystem(&calls))
+	_, _ = cm.Build(context.Background())
+	_ = cm.Record(ctxMsg(message.RoleAssistant, "same turn"), model.Usage{})
+	_, _ = cm.Build(context.Background())
+	if calls != 1 {
+		t.Fatalf("assistant/tool 阶段不应刷新前缀：%d", calls)
+	}
+	_ = cm.Record(ctxMsg(message.RoleUser, "next turn"), model.Usage{})
+	_, _ = cm.Build(context.Background())
+	_, _ = cm.Build(context.Background())
+	if calls != 2 {
+		t.Fatalf("每个新用户 turn 应恰好刷新一次前缀：%d", calls)
+	}
+}
+
 func TestCompactInvalidatesSystem(t *testing.T) {
 	s, _ := session.New("s1", &session.MemoryStorage{})
 	calls := 0

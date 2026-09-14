@@ -14,12 +14,12 @@ import (
 	"einoclaw-build/internal/subagent"
 )
 
-// headlessApprover：-p 模式没有弹窗，需要审批的调用一律拒绝并说明（用 --yolo 放行）。
+// headlessApprover：-p 模式没有弹窗，需要审批的调用一律拒绝并说明。
 type headlessApprover struct{}
 
 func (headlessApprover) Approve(context.Context, message.ToolCall) (bool, error) { return false, nil }
 func (headlessApprover) DenyReason() string {
-	return "tool denied: headless mode cannot prompt for approval (run with --yolo or set approval_mode)"
+	return "tool denied: headless mode cannot prompt for approval (use --yolo only for non-dangerous calls, or run interactively)"
 }
 
 // maxAutoContinue headless 下因后台作业结果自动续跑的上限：够把结果综合完，又不会在 CI 里无限循环。

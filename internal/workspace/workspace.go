@@ -134,6 +134,27 @@ func protected(part string) bool {
 	return false
 }
 
+// SensitivePath marks workspace files whose contents commonly contain live
+// credentials. They remain readable after explicit approval, but bulk search
+// omits them and direct read/bash classification can require HITL.
+func SensitivePath(path string) bool {
+	clean := filepath.ToSlash(filepath.Clean(path))
+	parts := strings.Split(strings.ToLower(clean), "/")
+	for i, part := range parts {
+		if part == ".codeclaw" && i+1 < len(parts) && (parts[i+1] == "config.yaml" || parts[i+1] == "config.yml") {
+			return true
+		}
+		switch part {
+		case ".npmrc", ".pypirc", ".netrc", "id_rsa", "id_ed25519", "credentials.json", "service-account.json":
+			return true
+		}
+		if part == ".env" || (strings.HasPrefix(part, ".env.") && part != ".env.example" && part != ".env.sample" && part != ".env.template") {
+			return true
+		}
+	}
+	return false
+}
+
 func Hash(data []byte) string { h := sha256.Sum256(data); return hex.EncodeToString(h[:]) }
 
 func (w *Workspace) ReadFile(path string) ([]byte, error) {
@@ -190,6 +211,9 @@ func (w *Workspace) files(path string, includeLinks bool) ([]string, error) {
 			return nil
 		}
 		if !d.IsDir() {
+			if !includeLinks && SensitivePath(path) {
+				return nil // safe search never sweeps credentials into model context
+			}
 			out = append(out, filepath.FromSlash(path))
 			if len(out) > 20000 {
 				return fmt.Errorf("workspace exceeds 20000 files; narrow the search")

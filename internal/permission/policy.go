@@ -15,7 +15,7 @@ type Mode string
 const (
 	ModeAlwaysAsk Mode = "always-ask" // 只有 read 自动放行
 	ModeWrite     Mode = "write"      // read/write 放行，exec 询问
-	ModeYolo      Mode = "yolo"       // 全放行（默认）
+	ModeYolo      Mode = "yolo"       // 除 deny 与高风险 Override 外放行
 )
 
 // Decision 审批结果。

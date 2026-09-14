@@ -69,6 +69,14 @@ func (*readFileTool) Required() []string       { return []string{"file_path"} }
 func (*readFileTool) Tier() permission.Tier    { return permission.TierRead }
 func (*readFileTool) Concurrency() Concurrency { return ConcurrencyShared }
 
+func (*readFileTool) Decision(args map[string]any) permission.ToolDecision {
+	path, _ := args["file_path"].(string)
+	if !strings.Contains(path, "://") && workspace.SensitivePath(path) {
+		return permission.ToolDecision{Tier: permission.TierRead, Override: true, Reason: "读取可能包含凭据的敏感文件 " + path}
+	}
+	return permission.ToolDecision{Tier: permission.TierRead}
+}
+
 const defaultReadLines = 300
 
 func (t *readFileTool) Execute(ctx context.Context, args map[string]any, sink *runtime.Sink) error {

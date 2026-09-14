@@ -78,10 +78,21 @@ func (e *Executor) Execute(ctx context.Context, call message.ToolCall) Result {
 		return Result{Content: "tool not found: " + call.Name, IsError: true}
 	}
 	var args map[string]any
-	if call.Args != "" {
+	if call.Args == "" {
+		args = map[string]any{}
+	} else {
 		if err := json.Unmarshal([]byte(call.Args), &args); err != nil || args == nil {
 			return Result{Content: "invalid tool arguments: expected JSON object", IsError: true}
 		}
+	}
+	var validationErr error
+	if validator, ok := t.(RuntimeArgumentValidator); ok {
+		validationErr = validator.ValidateToolArguments(args)
+	} else {
+		validationErr = validateArguments(t, args)
+	}
+	if validationErr != nil {
+		return Result{Content: "invalid tool arguments: " + validationErr.Error(), IsError: true}
 	}
 	if ctx.Err() != nil {
 		return Result{Content: ctx.Err().Error(), IsError: true}

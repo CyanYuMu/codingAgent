@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"os"
@@ -43,7 +44,7 @@ type subagentConfig struct {
 	ApprovalEscalation bool          `yaml:"approval_escalation"` // headless 子 agent 的 Prompt 决策升级到父弹窗
 	DefaultTimeout     time.Duration `yaml:"default_timeout"`
 	DefaultMaxTurns    int           `yaml:"default_max_turns"`
-	SoftBudget         int           `yaml:"soft_budget"`         // 累计模型请求软预算上限；0 = 关闭护栏
+	SoftBudget         int           `yaml:"soft_budget"`         // 累计模型请求软预算上限；0/未配置用默认值
 	MaxRecursionDepth  int           `yaml:"max_recursion_depth"` // 委派递归深度上限
 	MinTaskChars       int           `yaml:"min_task_chars"`      // 任务描述最短长度（拒绝一句话派发）
 	Background         *bool         `yaml:"background"`          // 是否允许 task background:true；默认 true
@@ -57,7 +58,7 @@ type memoryConfig struct {
 	Global      *bool `yaml:"global"`        // 是否启用 <Home>/memory/global.db；默认启用
 	RecallTopK  int   `yaml:"recall_top_k"`  // 每轮注入几条
 	MaxPerScope int   `yaml:"max_per_scope"` // 每个作用域的条数上限
-	ProjectMap  *bool `yaml:"project_map"`   // 会话首轮注入项目地图（P10.4）
+	ProjectMap  *bool `yaml:"project_map"`   // 新用户 turn 注入项目地图（P10.4）
 	ReadNotes   *bool `yaml:"read_notes"`    // read_file 命中未变更文件时用笔记顶替内容（默认关）
 }
 
@@ -156,26 +157,107 @@ func loadConfigFrom(files []string) (config, error) {
 			return cfg, err
 		}
 		var layer config
-		if err := yaml.Unmarshal(data, &layer); err != nil {
+		dec := yaml.NewDecoder(bytes.NewReader(data))
+		dec.KnownFields(true)
+		if err := dec.Decode(&layer); err != nil {
 			return cfg, fmt.Errorf("%s: %w", p, err)
 		}
-		// Capabilities belong to the user, never the repository.
+		// Capabilities belong to the trusted user slot, never the repository.
 		if i == 0 {
 			cfg.Sandbox, cfg.LSP = layer.Sandbox, layer.LSP
-		} else if layer.Sandbox.Mode != "" || len(layer.Sandbox.ReadRoots) > 0 || len(layer.Sandbox.Env) > 0 || layer.LSP.Command != "" || len(layer.LSP.Args) > 0 || layer.LSP.LanguageID != "" || layer.LSP.Timeout != 0 {
-			return cfg, fmt.Errorf("%s: sandbox/lsp capabilities are user-only; move them to the user config", p)
+		} else {
+			if layer.Sandbox.Mode != "" || len(layer.Sandbox.ReadRoots) > 0 || len(layer.Sandbox.Env) > 0 || layer.LSP.Command != "" || len(layer.LSP.Args) > 0 || layer.LSP.LanguageID != "" || layer.LSP.Timeout != 0 ||
+				len(layer.Models) > 0 || len(layer.MCPServers) > 0 || len(layer.Permissions.Allow) > 0 || len(layer.Skills.CustomDirectories) > 0 {
+				return cfg, fmt.Errorf("%s: models, mcp_servers, permissions.allow, skills.custom_directories, sandbox and lsp are user-only capabilities", p)
+			}
+			if layer.ApprovalMode != "" && approvalRisk(layer.ApprovalMode) > approvalRisk(effectiveApprovalMode(cfg.ApprovalMode)) {
+				return cfg, fmt.Errorf("%s: project approval_mode %q cannot relax user mode %q", p, layer.ApprovalMode, effectiveApprovalMode(cfg.ApprovalMode))
+			}
 		}
 		mergeConfig(&cfg, layer)
 		found = true
 	}
 	if !found || len(cfg.Models) == 0 || cfg.Models[0].APIKey == "" {
-		return cfg, errors.New("未找到模型配置：请在 ~/.codeclaw/config.yaml 或 <项目>/.codeclaw/config.yaml 填入 models（参考 example.yaml）")
+		return cfg, errors.New("未找到模型配置：请在用户级 ~/.codeclaw/config.yaml 填入 models（参考 example.yaml）")
 	}
 	applyDefaults(&cfg)
-	if cfg.Sandbox.Mode != "required" && cfg.Sandbox.Mode != "off" {
-		return cfg, fmt.Errorf("sandbox.mode must be required or off")
+	if err := validateConfig(cfg); err != nil {
+		return cfg, err
 	}
 	return cfg, nil
+}
+
+func effectiveApprovalMode(mode string) string {
+	if mode == "" {
+		return "write"
+	}
+	return mode
+}
+
+func approvalRisk(mode string) int {
+	switch effectiveApprovalMode(mode) {
+	case "always-ask":
+		return 0
+	case "write":
+		return 1
+	case "yolo":
+		return 2
+	default:
+		return 100 // invalid values never pass the monotonic safety check
+	}
+}
+
+func validateConfig(cfg config) error {
+	if cfg.Sandbox.Mode != "required" && cfg.Sandbox.Mode != "off" {
+		return fmt.Errorf("sandbox.mode must be required or off")
+	}
+	if cfg.ApprovalMode != "always-ask" && cfg.ApprovalMode != "write" && cfg.ApprovalMode != "yolo" {
+		return fmt.Errorf("approval_mode must be always-ask, write or yolo")
+	}
+	if cfg.DelegationMode != "conservative" && cfg.DelegationMode != "preferred" && cfg.DelegationMode != "always" {
+		return fmt.Errorf("delegation_mode must be conservative, preferred or always")
+	}
+	if cfg.Models[0].ContextWindow <= 0 || cfg.Models[0].ContextWindow > 10_000_000 {
+		return fmt.Errorf("models[0].context_window must be between 1 and 10000000")
+	}
+	if cfg.Subagent.MaxConcurrency < 1 || cfg.Subagent.MaxConcurrency > 64 {
+		return fmt.Errorf("subagent.max_concurrency must be between 1 and 64")
+	}
+	if cfg.Subagent.DefaultTimeout <= 0 || cfg.Subagent.DefaultTimeout > 24*time.Hour {
+		return fmt.Errorf("subagent.default_timeout must be between 1ns and 24h")
+	}
+	if cfg.Subagent.DefaultMaxTurns < 1 || cfg.Subagent.DefaultMaxTurns > 1000 {
+		return fmt.Errorf("subagent.default_max_turns must be between 1 and 1000")
+	}
+	if cfg.Subagent.SoftBudget < 0 || cfg.Subagent.SoftBudget > 100_000 {
+		return fmt.Errorf("subagent.soft_budget must be between 0 and 100000")
+	}
+	if cfg.Subagent.MaxRecursionDepth < 1 || cfg.Subagent.MaxRecursionDepth > 16 {
+		return fmt.Errorf("subagent.max_recursion_depth must be between 1 and 16")
+	}
+	if cfg.Subagent.MinTaskChars < 1 || cfg.Subagent.MinTaskChars > 10_000 {
+		return fmt.Errorf("subagent.min_task_chars must be between 1 and 10000")
+	}
+	if cfg.Memory.RecallTopK < 1 || cfg.Memory.RecallTopK > 100 {
+		return fmt.Errorf("memory.recall_top_k must be between 1 and 100")
+	}
+	if cfg.Memory.MaxPerScope < 1 || cfg.Memory.MaxPerScope > 1_000_000 {
+		return fmt.Errorf("memory.max_per_scope must be between 1 and 1000000")
+	}
+	if cfg.Bash.Timeout <= 0 || cfg.Bash.Timeout > 600*time.Second {
+		return fmt.Errorf("bash.timeout must be between 1ns and 600s")
+	}
+	for _, raw := range append(append(append([]string{}, cfg.Permissions.Allow...), cfg.Permissions.Ask...), cfg.Permissions.Deny...) {
+		if _, err := permission.ParseRule(raw); err != nil {
+			return fmt.Errorf("permissions: %w", err)
+		}
+	}
+	for i, srv := range cfg.MCPServers {
+		if srv.Name == "" || srv.Command == "" {
+			return fmt.Errorf("mcp_servers[%d] requires name and command", i)
+		}
+	}
+	return nil
 }
 
 // mergeConfig 把 src 的非零字段覆盖进 dst；MCP servers 累加。
@@ -322,7 +404,7 @@ func applyDefaults(cfg *config) {
 	}
 }
 
-// parseRules 把配置原文解析成规则集；坏条目不致命（告警跳过）。
+// parseRules 把配置原文解析成规则集；生产加载已先做 fail-closed 校验。
 func (c config) parseRules() (permission.Rules, []error) {
 	var out permission.Rules
 	var errs []error

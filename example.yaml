@@ -1,14 +1,14 @@
 # codeclaw 配置模板
 # 三层配置（后者覆盖前者）：
 #   1. ~/.codeclaw/config.yaml          用户级（推荐放 models 与 api_key）
-#   2. <项目>/.codeclaw/config.yaml     项目级（审批/委派/MCP 等项目约定）
+#   2. <项目>/.codeclaw/config.yaml     项目级（只能收紧审批；不能授予模型/MCP/allow 等能力）
 #   3. ./config.yaml                    仓库内 legacy（向后兼容）
 # 数据目录：$CODECLAW_HOME 或 ~/.codeclaw；每个项目的会话/产物/记忆在 ~/.codeclaw/projects/<encoded-cwd>/
 
 # 审批模式：控制哪些工具需要弹出「人机审批」窗口
 #   write      —— read/write 放行，exec（bash 执行命令等）询问（默认）
 #   always-ask —— 只有 read 放行，write/exec 都询问
-#   yolo       —— 全部放行（无弹窗；命令行 --yolo 可临时强制）
+#   yolo       —— 普通调用放行；deny 与危险 Override 仍拦截/审批
 approval_mode: write
 
 # 生产运行时：默认 sandbox.mode=required，禁止进程联网。
@@ -28,7 +28,7 @@ delegation_mode: preferred
 # 审批规则（P11）：tool(args*) 通配语法，* 匹配任意序列，不带括号 = 该工具全部参数。
 # deny 在任何模式（含 yolo）都生效；allow 压过 tier×mode；ask 升级为询问。
 # 三层配置的规则按「列表追加」合并（用户 deny 不会被项目 allow 顶掉）。
-# 另有 bash 内置分类器：只读命令（git status/go test）免审批；危险命令（rm -rf/curl|sh/sudo）
+# 另有 bash 内置分类器：只读命令（git status/go list）免审批；危险命令（rm -rf/curl|sh/sudo）
 # 强制弹窗（yolo 下也拦）。
 permissions:
   allow: ["bash(git status*)", "bash(go test*)", "bash(go build*)", "read(**)"]
@@ -61,7 +61,7 @@ subagent:
   approval_escalation: false  # true：子 agent 需要审批时升级到主界面弹窗（带 [子 agent X] 标签）；false：直接拒绝并说明
   default_timeout: 10m        # 单个子 agent wall-clock 超时
   default_max_turns: 50       # 单个子 agent 单轮工具循环上限
-  soft_budget: 200            # 累计模型请求软预算：越界注入收尾通知，1.5× 强制 yield，宽限后硬杀；0 = 关闭护栏
+  soft_budget: 200            # 累计模型请求软预算：越界注入收尾通知，1.5× 强制 yield，宽限后硬杀；0/未配置用默认 200
   max_recursion_depth: 2      # 委派递归深度上限（子 agent 再派子 agent）
   min_task_chars: 40          # 任务描述最短长度（拒绝一句话派发）
   background: true            # 允许 task 的 background:true（长任务转后台，完成后结果自动送回会话）
@@ -75,7 +75,7 @@ memory:
   global: true          # 除项目库外再开 <Home>/memory/global.db，放"用户偏好"这类跨项目事实
   recall_top_k: 5       # 每轮注入几条记忆
   max_per_scope: 500    # 每个作用域的条数上限（超限按 重要性×新鲜度×可信度 淘汰最低的）
-  # project_map: true   # 会话首轮注入项目地图（P10.4）
+  # project_map: true   # 每个新用户 turn 刷新项目地图（同一 turn 内复用）
   # read_notes: false   # read_file 命中未变更文件时用笔记顶替内容；默认关（摘要冒充内容会让模型基于旧信息改代码）
 
 models:
@@ -102,7 +102,7 @@ models:
   #   api_key: sk-xxxxxxxxxxxxxxxx
   #   base_url: https://api.openai.com/v1
 
-# 外部 MCP server（stdio）；其工具归一为 mcp__<name>_<tool>，默认按 write tier 审批
+# 外部 MCP server（stdio，仅用户级配置）；其工具归一为 mcp__<name>_<tool>，默认按 exec tier 审批
 # mcp_servers:
 #   - name: filesystem
 #     command: npx

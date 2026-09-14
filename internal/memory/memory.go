@@ -321,7 +321,9 @@ func (s *Store) evictOverflow() error {
 		return nil
 	}
 	var n int
-	if err := s.db.QueryRow(`SELECT count(*) FROM memories WHERE scope=? AND project_id=?`,
+	// 失效/被取代条目为审计历史，不占活跃记忆配额。否则反复 forget 会让
+	// count 永久超限，而候选查询又排除了 veracity=0，最终把新写入的活跃事实误删。
+	if err := s.db.QueryRow(`SELECT count(*) FROM memories WHERE scope=? AND project_id=? AND veracity>0`,
 		s.scope, s.projectID).Scan(&n); err != nil {
 		return err
 	}

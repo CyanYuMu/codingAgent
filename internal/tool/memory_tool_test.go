@@ -7,8 +7,24 @@ import (
 	"testing"
 
 	"einoclaw-build/internal/memory"
+	"einoclaw-build/internal/permission"
 	"einoclaw-build/internal/runtime"
 )
+
+func TestMemoryMutationDecisionRequiresApproval(t *testing.T) {
+	p, g := openStores(t)
+	rememberDecision := NewRememberTool(p, g).(Decisioner)
+	if got := rememberDecision.Decision(map[string]any{"content": "project fact"}); got.Policy != permission.PolicyPrompt || got.Override {
+		t.Fatalf("项目记忆应默认询问：%+v", got)
+	}
+	if got := rememberDecision.Decision(map[string]any{"content": "preference", "scope": "global"}); !got.Override {
+		t.Fatalf("全局记忆应在 yolo 下也强制询问：%+v", got)
+	}
+	forgetDecision := NewForgetTool(p, g).(Decisioner)
+	if got := forgetDecision.Decision(map[string]any{"ref": "1", "scope": "global"}); !got.Override {
+		t.Fatalf("失效全局记忆应强制询问：%+v", got)
+	}
+}
 
 func openStores(t *testing.T) (project, global *memory.Store) {
 	t.Helper()
