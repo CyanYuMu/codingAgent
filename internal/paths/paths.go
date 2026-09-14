@@ -192,7 +192,21 @@ func UserAgentsDir() (string, error) {
 	return filepath.Join(home, "agents"), nil
 }
 
+// UserSkillsDir = <Home>/skills：用户级 SKILL.md 目录。
+func UserSkillsDir() (string, error) {
+	home, err := Home()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(home, "skills"), nil
+}
+
 // ProjectAgentsDir = <cwd>/.codeclaw/agents ：项目级子 agent 定义（优先级高于用户级）。
 func ProjectAgentsDir(cwd string) string {
 	return filepath.Join(cwd, ".codeclaw", "agents")
+}
+
+// ProjectSkillsDir = <cwd>/.codeclaw/skills：当前目录的项目级 skill 根。
+func ProjectSkillsDir(cwd string) string {
+	return filepath.Join(cwd, ".codeclaw", "skills")
 }
