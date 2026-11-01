@@ -29,6 +29,7 @@ import (
 	"einoclaw-build/internal/tool"
 	"einoclaw-build/internal/tui"
 	"einoclaw-build/internal/verification"
+	"einoclaw-build/internal/webui"
 	"einoclaw-build/internal/workspace"
 )
 
@@ -192,7 +193,12 @@ func main() {
 	yolo := flag.Bool("yolo", false, "强制 approval_mode=yolo")
 	prompt := flag.String("p", "", "headless：执行一个提示词后退出（事件打印到 stdout）")
 	waitJobs := flag.Duration("wait-jobs", 0, "headless：等后台作业结算的上限（默认取 subagent.default_timeout）")
+	webAddr := flag.String("web", "", "启动本地网页端，如 127.0.0.1:8080")
+	webAssets := flag.String("web-assets", "web/dist", "React 构建产物目录")
 	flag.Parse()
+	if *webAddr != "" && *prompt != "" {
+		log.Fatal("--web 与 -p 不能同时使用")
+	}
 
 	cwd := *cwdFlag
 	if cwd == "" {
@@ -356,7 +362,11 @@ func main() {
 	// 审批器：TUI 弹窗三态（允许/拒绝/本会话允许）；「本会话允许」经闭包接到 exec.AllowSession
 	var sessionAllowFn func(string)
 	var approver tool.Approver = headlessApprover{}
-	if *prompt == "" {
+	var webServer *webui.Server
+	if *webAddr != "" {
+		webServer = webui.New()
+		approver = webServer
+	} else if *prompt == "" {
 		approver = tui.NewApprover(func(name string) {
 			if sessionAllowFn != nil {
 				sessionAllowFn(name)
@@ -465,6 +475,13 @@ func main() {
 			log.Print(err)
 		}
 	}()
+
+	if webServer != nil {
+		if err := runWeb(webServer, *webAddr, *webAssets, cwd, cfg, ag, cmgr, sessMgr, store, mgr, skillMgr); err != nil {
+			log.Print(err)
+		}
+		return
+	}
 
 	if *prompt != "" {
 		wait := *waitJobs
