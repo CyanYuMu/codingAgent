@@ -47,7 +47,7 @@ func (h hubTool) Description() string {
 	return "与其它 agent 协调：看名册、发消息、收消息、等事件、查/取消后台作业。你的地址是 " + h.self + "；主 agent 是 Main。\n" +
 		"- list：列出可寻址的 peer（名字、agent、状态、当前工具）。只能用名册里的确切名字，不要自己编。\n" +
 		"- send：给某个 peer 发一句话（to + text）。不阻塞；对方在跑就作为提示注入它的下一步，已结束就把它唤醒续跑。\n" +
-		"- inbox：把发给你的消息一次性取走（不阻塞）。\n" +
+		"- inbox：查看发给你的消息（不阻塞）；子 agent 会在下一步调用模型前写入会话并确认消费。\n" +
 		"- wait：完全没事可做时才用（可选 timeout 秒、ids 指定关注的作业）；一有消息或作业结束就返回。\n" +
 		"- jobs：后台作业快照；已结束的作业结果会随这次调用一起给你（之后不会再单独送一遍）。\n" +
 		"- cancel：按 ids 取消后台作业。\n" +
@@ -90,7 +90,7 @@ func (h hubTool) Execute(ctx context.Context, args map[string]any, sink *runtime
 		sink.Write([]byte(res))
 		return nil
 	case "inbox":
-		sink.Write([]byte(renderMails(h.mgr.box(h.self).drainSession(h.scope()))))
+		sink.Write([]byte(renderMails(h.incoming())))
 		return nil
 	case "wait":
 		sink.Write([]byte(h.wait(ctx, stringsOf(args["ids"]), waitDuration(args))))
@@ -116,7 +116,7 @@ func (h hubTool) wait(ctx context.Context, ids []string, d time.Duration) string
 	ticker := time.NewTicker(hubWaitPoll)
 	defer ticker.Stop()
 	for {
-		if mails := box.drainSession(h.scope()); len(mails) > 0 {
+		if mails := h.incoming(); len(mails) > 0 {
 			return "收到消息：\n" + renderMails(mails)
 		}
 		if done := h.settledAmong(ids); done != "" {
@@ -131,6 +131,16 @@ func (h hubTool) wait(ctx context.Context, ids []string, d time.Duration) string
 			return "等待被取消。"
 		}
 	}
+}
+
+// 子 agent 的收件箱只能在 sidecar 写入成功后确认消费。
+// wait/inbox 可查看它，下一步的 ingress hook 负责持久化；Main 的调用结果本身承载消息。
+func (h hubTool) incoming() []Mail {
+	box := h.mgr.box(h.self)
+	if h.self == MainName {
+		return box.drainSession(h.scope())
+	}
+	return box.peek(h.scope())
 }
 
 // settledAmong 检查关注的作业（ids 为空 = 全部后台作业）是否有已结束的；有就消费投递并返回结果。

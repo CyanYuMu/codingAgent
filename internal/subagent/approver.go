@@ -13,7 +13,7 @@ type denyApprover struct{}
 func (denyApprover) Approve(context.Context, message.ToolCall) (bool, error) { return false, nil }
 
 func (denyApprover) DenyReason() string {
-	return "tool denied: headless subagent cannot prompt for approval (enable subagent.approval_escalation to ask the user)"
+	return "headless subagent cannot prompt for approval; forced approval still applies in yolo mode. Use a scoped tool, or an interactive parent with subagent.approval_escalation enabled; do not repeat the same denied call"
 }
 
 // labeledApprover 把子 agent 的审批升级到父审批器，调用名带标签供弹窗显示「谁在请求」。

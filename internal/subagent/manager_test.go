@@ -193,7 +193,7 @@ func TestParentCancelIsAborted(t *testing.T) {
 
 func TestHeadlessDeniesPromptByDefault(t *testing.T) {
 	// sleep 不在只读白名单 → exec tier → AlwaysAsk + 无升级 → 拒绝并说明（echo 是只读的，不再触发审批）
-	m := &scriptModel{steps: []model.ModelEvent{call("c1", "bash", `{"command":"sleep 0.1"}`), {Text: "end"}}}
+	m := &scriptModel{steps: []model.ModelEvent{call("c1", "bash", `{"command":"sleep 0.1"}`), call("c2", "yield", `{"data":"command denied"}`)}}
 	o := baseOpts(m, t.TempDir())
 	o.Mode = permission.ModeAlwaysAsk
 	r := runOne(t, NewManager(o), context.Background(), one("explorer", "x"))
@@ -270,7 +270,7 @@ func TestReadOnlySubagentKeepsSkillToolAndIndex(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	m := &scriptModel{}
+	m := &scriptModel{steps: []model.ModelEvent{call("c1", "yield", `{"data":"reviewed"}`)}}
 	o := baseOpts(m, dir)
 	o.Defs[0].ReadOnly = true
 	o.WorkerTools = func(cwd string, store *runtime.ArtifactStore) *tool.Registry {
@@ -310,14 +310,14 @@ func TestRunBatchOrderAndDefaultNames(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(rs) != 2 || rs[0].Status != StatusCompleted || rs[1].Status != StatusCompleted || rs[0].Yielded {
+	if len(rs) != 2 || rs[0].Status != StatusFailed || rs[1].Status != StatusFailed || rs[0].Yielded {
 		t.Fatalf("results = %+v", rs)
 	}
 	if rs[0].Name != "explorer-1" || rs[1].Name != "explorer-2" {
 		t.Fatalf("names = %q %q", rs[0].Name, rs[1].Name)
 	}
 	out := renderResult(rs[0])
-	if !strings.Contains(out, "[未显式 yield") || !strings.Contains(out, "转录: history://") {
+	if !strings.Contains(out, "[failed]") || !strings.Contains(out, "[partial] idle") || !strings.Contains(out, "转录: history://") {
 		t.Fatalf("render = %s", out)
 	}
 }
@@ -339,7 +339,7 @@ func TestMemorySidecarWhenNoSessionDir(t *testing.T) {
 	o := baseOpts(&scriptModel{}, t.TempDir())
 	o.SessionDir = ""
 	r := runOne(t, NewManager(o), context.Background(), one("explorer", "x"))
-	if r.Status != StatusCompleted || r.SessionFile != "" {
+	if r.Status != StatusFailed || r.SessionFile != "" {
 		t.Fatalf("result = %+v", r)
 	}
 }
@@ -490,7 +490,7 @@ func TestDeliverRouting(t *testing.T) {
 	if len(mgr.TakeMainInbox()) != 0 {
 		t.Fatal("取件应是一次性的")
 	}
-	// 发给运行中的：作为 steering 注入
+	// 发给运行中的：写入统一收件箱
 	run := newRun("Live", "explorer", 1)
 	mgr.register(run)
 	run.setStatus(StatusRunning)
@@ -498,13 +498,9 @@ func TestDeliverRouting(t *testing.T) {
 	if err != nil || !strings.Contains(receipt, "已送达") {
 		t.Fatalf("receipt=%q err=%v", receipt, err)
 	}
-	select {
-	case msg := <-run.steer:
-		if !strings.Contains(messageText(msg), "[hub from Main] 改用接口 B") {
-			t.Fatalf("steer 消息 = %q", messageText(msg))
-		}
-	default:
-		t.Fatal("消息没进 steer 队列")
+	mails = mgr.box(run.Name()).peek("")
+	if len(mails) != 1 || mails[0].Text != "改用接口 B" {
+		t.Fatalf("peer mailbox = %+v", mails)
 	}
 }
 

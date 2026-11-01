@@ -24,6 +24,7 @@ const (
 	EventCompaction                     // 上下文已压缩（threshold | mid-turn | overflow）
 	EventRetry                          // 模型瞬时错误，退避后重试
 	EventTerminated                     // 终止型工具（如 yield）结束了本次 run
+	EventModelRequest                   // 模型请求即将发起（包括重试）
 )
 
 // AgentEvent 是 agent 执行过程中吐出的流式事件。

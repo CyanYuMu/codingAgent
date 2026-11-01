@@ -4,6 +4,7 @@ import (
 	"sort"
 	"sync"
 
+	"einoclaw-build/internal/message"
 	"einoclaw-build/internal/model"
 )
 
@@ -11,6 +12,16 @@ import (
 type Registry struct {
 	mu    sync.RWMutex
 	tools map[string]Tool
+}
+
+// RestoreReadState restores only verified read-before-edit fingerprints, never
+// read-dedup ranges. Historical tool results are checked against current bytes.
+func (r *Registry) RestoreReadState(history []message.Message) {
+	for _, t := range r.List() {
+		if restorer, ok := t.(interface{ RestoreReadState([]message.Message) }); ok {
+			restorer.RestoreReadState(history)
+		}
+	}
 }
 
 func NewRegistry() *Registry {

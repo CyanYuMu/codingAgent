@@ -2,6 +2,9 @@ package model
 
 import (
 	"errors"
+	"fmt"
+	"io"
+	"net/url"
 	"testing"
 )
 
@@ -18,6 +21,17 @@ func TestIsContextOverflow(t *testing.T) {
 	}
 	if IsContextOverflow(errors.New("rate limit exceeded")) || IsContextOverflow(nil) {
 		t.Error("false positive")
+	}
+}
+
+func TestRequestTransportEOFIsRetryable(t *testing.T) {
+	for _, err := range []error{io.EOF, io.ErrUnexpectedEOF, fmt.Errorf("create stream: %w", &url.Error{Op: "Post", URL: "https://example.invalid/v1/responses", Err: io.EOF}), errors.New(`failed to create streaming response: Post "https://example.invalid/v1/responses": EOF`)} {
+		if !IsRetryable(err) {
+			t.Fatalf("transport EOF should retry: %v", err)
+		}
+	}
+	if IsRetryable(errors.New("context_length_exceeded: EOF")) {
+		t.Fatal("overflow must use compaction, not transient retry")
 	}
 }
 

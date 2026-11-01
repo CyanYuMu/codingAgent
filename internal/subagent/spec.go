@@ -50,7 +50,7 @@ const (
 	StatusIdle              // turn 结束但没 terminal yield，等提醒/唤醒
 	StatusBudgetStop        // 越过 1.5× 软预算，当前 turn 已停，正在被逼 yield
 	StatusCompleted         // terminal yield 且校验通过（或 permissive 放行）
-	StatusFailed            // yield error / strict 校验失败 / 不可恢复错误 / 未知 agent
+	StatusFailed            // 未 terminal yield / yield error / strict 校验失败 / 不可恢复错误 / 未知 agent
 	StatusKilled            // 预算宽限耗尽后硬杀
 	StatusTimeout           // wall-clock 超时
 	StatusAborted           // 父取消 / 用户中断 / hub cancel
@@ -121,7 +121,7 @@ type Result struct {
 	Sections map[string][]any // 增量分段（按提交序）
 	Text     string           // 最后一段 assistant 文本（失败/未 yield 时的 partial）
 	Err      error
-	Warning  string // schema 放行 / 未 yield / 预算强制收尾等非致命说明
+	Warning  string // schema 放行 / 预算强制收尾等非致命说明
 
 	Usage         model.Usage
 	Requests      int // 模型调用次数

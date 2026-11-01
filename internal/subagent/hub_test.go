@@ -48,20 +48,17 @@ func TestHubSendAndInbox(t *testing.T) {
 	if err != nil || !strings.Contains(out, "已送达 Main") {
 		t.Fatalf("out=%q err=%v", out, err)
 	}
-	// Main → 运行中的子 agent：进它的 steering 队列
+	// Main → 运行中的子 agent：进入 wait 共用的收件箱
 	out, err = execHub(t, NewHubTool(mgr, MainName), map[string]any{
 		"op": "send", "to": "Scout", "text": "按这个签名来"})
 	if err != nil || !strings.Contains(out, "已送达 Scout") {
 		t.Fatalf("out=%q err=%v", out, err)
 	}
-	select {
-	case msg := <-scout.steer:
-		if !strings.Contains(messageText(msg), "按这个签名来") {
-			t.Fatalf("steer = %q", messageText(msg))
-		}
-	default:
-		t.Fatal("没进 steer 队列")
+	mails := mgr.box("Scout").peek("")
+	if len(mails) != 1 || !strings.Contains(mails[0].Text, "按这个签名来") {
+		t.Fatalf("peer mailbox = %+v", mails)
 	}
+
 	// Main 收件箱
 	out, err = execHub(t, NewHubTool(mgr, MainName), map[string]any{"op": "inbox"})
 	if err != nil || !strings.Contains(out, "来自 Scout") {

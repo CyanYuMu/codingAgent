@@ -59,7 +59,10 @@ const alwaysDelegation = `
 `
 
 const preferredDelegation = `
-多文件改动、独立调查、验证、测试是委派的 strong candidate，优先委派并行；小任务可自己做。子 agent 的结果需要验收。
+小任务直接完成；只有真正独立、能并行推进的工作才委派。不要为了包装一个小 CLI 而把互相等待的核心与入口拆成两个 worker。
+委派契约只写目标、边界、必要接口和验收条件，避免复制整份实现方案。子 agent 的结果需要验收。
+验证集中执行一次 verify；通过后若没有新修改或新风险，不要反复跑同一套测试。只读 reviewer 负责静态审查，必要的运行证据由主 agent 一次性提供，不要来回转交长测试脚本。
+恢复会话时会重新校验历史已读文件的指纹；上下文仍有内容且校验一致时可直接编辑，内容缺失、已变更或工具提示过期时先 read_file，不能猜测。
 `
 
 // buildInstruction 按委派模式生成系统提示词。
@@ -432,6 +435,13 @@ func main() {
 			log.Printf("记忆召回失败: %v", err)
 			return msgs
 		}
+		refs := make([]map[string]any, 0, len(mems))
+		for _, mem := range mems {
+			refs = append(refs, map[string]any{"id": mem.ID, "scope": mem.Scope, "kind": mem.Kind})
+		}
+		if err := cmgr.RecordAudit("memory_recall", map[string]any{"top_k": cfg.Memory.RecallTopK, "selected": refs}); err != nil {
+			log.Printf("记忆召回审计写入失败: %v", err)
+		}
 		if len(mems) > 0 {
 			msgs = append(msgs, message.NewSystemMessage(renderMemories(mems)))
 		}
@@ -444,6 +454,9 @@ func main() {
 		return msgs
 	}
 	cmgr = agentctx.New(s, summ, cfg.Models[0].ContextWindow, 16384, system)
+	if history, err := s.Replay(); err == nil {
+		mainRegistry.RestoreReadState(history)
+	}
 	ag := agent.New("codeclaw", m, mainRegistry, exec, cmgr)
 	ag.SetCompletionCheck(verifier.CheckCompletion)
 

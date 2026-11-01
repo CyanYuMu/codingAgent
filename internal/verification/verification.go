@@ -97,7 +97,7 @@ func (v *Service) Run(ctx context.Context) (Report, error) {
 		start := time.Now()
 		cctx, cancel := context.WithTimeout(ctx, v.cfg.Timeout)
 		sink := runtime.NewSink(4000, 4000)
-		cmd, e := v.sandbox.Command(cctx, v.w.Path(), "bash", "--noprofile", "--norc", "-c", command)
+		cmd, e := v.sandbox.Command(cctx, v.w.Path(), "bash", "--noprofile", "--norc", "-e", "-o", "pipefail", "-c", command)
 		if e == nil {
 			cmd.Stdout = sink
 			cmd.Stderr = sink

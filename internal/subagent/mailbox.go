@@ -16,8 +16,8 @@ type Mail struct {
 	At         time.Time
 }
 
-// mailbox 是一个收件人的信箱。运行中的子 agent 收到消息是直接注入它的 steering 通道的，
-// 信箱只服务两种情况：主 agent（没有 Run，靠 TUI/headless 取件）与还没被取走的历史消息。
+// mailbox 是 peer 消息的唯一收件队列，wake 只负责通知，msgs 才是真相源。
+// 子 agent 在下一步构建模型输入前记录到 sidecar，成功后 ack；wait 不抢先消费。
 type mailbox struct {
 	mu   sync.Mutex
 	msgs []Mail

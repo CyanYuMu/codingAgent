@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -137,7 +138,7 @@ func configPaths(cwd string) []string {
 	if p, err := paths.UserConfigPath(); err == nil {
 		out[0] = p
 	}
-	out = append(out, paths.ProjectConfigPath(cwd), "config.yaml")
+	out = append(out, paths.ProjectConfigPath(cwd), filepath.Join(cwd, "config.yaml"))
 	return out
 }
 

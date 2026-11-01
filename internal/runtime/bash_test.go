@@ -65,6 +65,31 @@ func TestBashExecuteEcho(t *testing.T) {
 	}
 }
 
+func TestBashPipelineFailureSurvivesOutputFiltering(t *testing.T) {
+	for _, scoped := range []bool{false, true} {
+		b := NewBash(t.TempDir())
+		if scoped {
+			s, err := NewProcessSandbox(b.CWD(), SandboxConfig{Mode: "off"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer s.Close()
+			b.SetSandbox(s)
+		}
+		sink := NewSink(1000, 1000)
+		defer sink.Close()
+		if err := b.Execute(context.Background(), "printf FAIL; false | cat", sink); err == nil {
+			t.Fatal("pipeline failure was masked")
+		}
+		if !strings.Contains(sink.Result(), "FAIL") {
+			t.Fatal("failure output lost")
+		}
+		if err := b.Execute(context.Background(), "false | cat || true", sink); err != nil {
+			t.Fatal("explicit error handling should work", err)
+		}
+	}
+}
+
 func TestSanitizeEnvDropsSecrets(t *testing.T) {
 	base := []string{
 		"PATH=/usr/bin", "HOME=/home/u", "LANG=C",

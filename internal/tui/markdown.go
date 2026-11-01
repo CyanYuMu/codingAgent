@@ -15,7 +15,7 @@ var (
 )
 
 func initMarkdown(w int) {
-	wrapWidth := max(40, w-4)
+	wrapWidth := max(1, w-4)
 	if glamourRenderer != nil && glamourWidth == wrapWidth {
 		return
 	}
@@ -93,11 +93,15 @@ func renderThinking(content string, width int) []string {
 // streamingMarkdown 保存当前流式消息的增量渲染状态。
 type streamingMarkdown struct {
 	width              int
+	lastContent        string
+	lastWidth          int
+	lastRender         []string
 	stablePrefix       string // 已确认安全、已缓存渲染的文本前缀
 	stablePrefixRender string // stablePrefix 对应的已渲染文本
 }
 
 func (s *streamingMarkdown) Reset() {
+	s.lastContent, s.lastRender = "", nil
 	s.width = 0
 	s.stablePrefix = ""
 	s.stablePrefixRender = ""
@@ -105,6 +109,16 @@ func (s *streamingMarkdown) Reset() {
 
 // Render 渲染 Markdown，复用缓存的稳定前缀，只重渲染变动尾部。
 func (s *streamingMarkdown) Render(content string, width int) []string {
+	if s.lastRender != nil && s.lastContent == content && s.lastWidth == width {
+		return append([]string(nil), s.lastRender...)
+	}
+	lines := s.render(content, width)
+	s.lastContent, s.lastWidth = content, width
+	s.lastRender = append([]string(nil), lines...)
+	return lines
+}
+
+func (s *streamingMarkdown) render(content string, width int) []string {
 	initMarkdown(width)
 	if glamourRenderer == nil {
 		return strings.Split(content, "\n")

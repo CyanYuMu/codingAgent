@@ -2,6 +2,7 @@ package subagent
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -69,8 +70,88 @@ func TestLadderRemindsThreeTimesThenStops(t *testing.T) {
 			t.Fatalf("转录里缺 %s", want)
 		}
 	}
-	if r.Status != StatusCompleted || r.Yielded || !strings.Contains(r.Warning, "未 yield") {
-		t.Fatalf("无 schema 时应 completed 但标注未 yield：%+v", r)
+	if r.Status != StatusFailed || r.Yielded || r.Err == nil || !strings.Contains(r.Err.Error(), "仍未通过 yield") {
+		t.Fatalf("无 schema 时未 yield 也必须失败：%+v", r)
+	}
+	if r.Text == "" || !strings.Contains(tr, `"status":"failed"`) {
+		t.Fatalf("失败应保留部分文本并写入真实终态：%+v\n%s", r, tr)
+	}
+	output, err := os.ReadFile(r.OutputFile)
+	if err != nil || !strings.Contains(string(output), "status: failed") || !strings.Contains(string(output), r.Text) {
+		t.Fatalf("失败产物应保留部分文本：%s, %v", output, err)
+	}
+}
+
+// noisyModel 在每次响应前发出大量增量，填满无人读取的 UI 通道。
+type noisyModel struct {
+	inner model.Model
+	err   error
+}
+
+func (m noisyModel) Stream(ctx context.Context, msgs []message.Message, tools []model.ToolSpec) (model.ModelStream, error) {
+	s, err := m.inner.Stream(ctx, msgs, tools)
+	if err != nil {
+		return nil, err
+	}
+	return &noisyStream{ModelStream: s, remaining: 128, err: m.err}, nil
+}
+
+type noisyStream struct {
+	model.ModelStream
+	remaining int
+	err       error
+}
+
+func (s *noisyStream) Recv() (model.ModelEvent, error) {
+	if s.remaining > 0 {
+		s.remaining--
+		return model.ModelEvent{Thinking: "delta"}, nil
+	}
+	if s.err != nil {
+		return model.ModelEvent{}, s.err
+	}
+	return s.ModelStream.Recv()
+}
+
+func blockedUI(t *testing.T) *bus.Bus {
+	t.Helper()
+	b := bus.New()
+	for _, channel := range []string{ChEvent, ChProgress, ChLifecycle} {
+		_, cancel := b.Subscribe(channel, 1)
+		t.Cleanup(cancel) // 整次运行不读取订阅，所有后续 UI 事件都会被丢弃。
+	}
+	return b
+}
+
+func TestBlockedUIDoesNotLoseBudgetAccounting(t *testing.T) {
+	o := baseOpts(noisyModel{inner: &toolAwareModel{yieldWhenForced: true}}, t.TempDir())
+	o.Bus = blockedUI(t)
+	o.Defs[0].SoftBudget = 4
+	o.Defs[0].MaxTurns = 50
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	r := runOne(t, NewManager(o), ctx, one("explorer", "x"))
+	if r.Status != StatusCompleted || !r.Yielded || !r.BudgetStopped || r.Requests != 7 {
+		t.Fatalf("UI 丢事件不能影响停机线和强制提交：%+v", r)
+	}
+	if r.Usage.TotalTokens != r.Requests*15 {
+		t.Fatalf("用量应完整记账：%+v", r)
+	}
+}
+
+func TestBlockedUIDoesNotLoseStreamError(t *testing.T) {
+	want := errors.New("stream failed after deltas")
+	inner := &scriptModel{}
+	o := baseOpts(noisyModel{inner: inner, err: want}, t.TempDir())
+	o.Bus = blockedUI(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	r := runOne(t, NewManager(o), ctx, one("explorer", "x"))
+	if r.Status != StatusFailed || !errors.Is(r.Err, want) || r.Reminders != 0 || r.Requests != 1 {
+		t.Fatalf("流错误必须直接结算失败：%+v", r)
+	}
+	if inner.calls != 1 {
+		t.Fatalf("不可恢复错误后不应再请求模型：%d", inner.calls)
 	}
 }
 
@@ -95,6 +176,16 @@ func TestLadderExhaustedWithSchemaFails(t *testing.T) {
 	}
 	if r.Text == "" {
 		t.Fatal("失败也要把最后文本带回去")
+	}
+}
+
+func TestIncrementalYieldWithoutFinalYieldFails(t *testing.T) {
+	o := baseOpts(&scriptModel{steps: []model.ModelEvent{
+		call("c1", "yield", `{"section":"findings","data":{"file":"a.go"}}`),
+	}}, t.TempDir())
+	r := runOne(t, NewManager(o), context.Background(), one("explorer", "x"))
+	if r.Status != StatusFailed || r.Yielded || r.Err == nil || len(r.Sections["findings"]) != 1 {
+		t.Fatalf("增量提交不能替代终止提交，部分产出应保留：%+v", r)
 	}
 }
 

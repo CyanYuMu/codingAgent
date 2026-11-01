@@ -131,8 +131,17 @@ func TestCompactWritesFirstKeptAndRebuilds(t *testing.T) {
 	}
 	// 压缩条目只追加一条，不重追加保留消息
 	es, _ := s.Entries()
-	if es[len(es)-1].Type != session.EntryCompaction || es[len(es)-1].Compaction.TokensBefore == 0 {
-		t.Fatalf("last entry = %+v", es[len(es)-1])
+	compacts := 0
+	for _, e := range es {
+		if e.Type == session.EntryCompaction {
+			compacts++
+			if e.Compaction.TokensBefore == 0 {
+				t.Fatal("missing token estimate")
+			}
+		}
+	}
+	if compacts != 1 {
+		t.Fatalf("compactions=%d", compacts)
 	}
 }
 

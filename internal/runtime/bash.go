@@ -61,7 +61,7 @@ func (b *Bash) Execute(ctx context.Context, command string, sink *Sink) error {
 	if b.sandbox != nil {
 		ctx2, cancel := context.WithTimeout(ctx, b.timeout)
 		defer cancel()
-		cmd, err := b.sandbox.Command(ctx2, b.cwd, "bash", "--noprofile", "--norc", "-c", command)
+		cmd, err := b.sandbox.Command(ctx2, b.cwd, "bash", "--noprofile", "--norc", "-o", "pipefail", "-c", command)
 		if err != nil {
 			return err
 		}
@@ -84,7 +84,7 @@ func (b *Bash) Execute(ctx context.Context, command string, sink *Sink) error {
 	ctx2, cancel := context.WithTimeout(ctx, b.timeout)
 	defer cancel()
 
-	cmd := exec.CommandContext(ctx2, "bash", "-c", command)
+	cmd := exec.CommandContext(ctx2, "bash", "--noprofile", "--norc", "-o", "pipefail", "-c", command)
 	cmd.Dir = b.cwd
 	cmd.Env = SanitizeEnv(nonInteractiveEnv())
 	cmd.Stdout = sink

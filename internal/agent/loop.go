@@ -14,6 +14,7 @@ import (
 // Run 执行一次 run：以 cc 为真相源循环「重建输入 → 模型 → 记录 → 工具 → 记录」，流式吐出 AgentEvent。
 // steer 通道非阻塞接收中途注入的修正消息（记录为用户消息，下一步模型调用会看到）。
 // 调用方须在 Run 前把本轮用户消息 Record 进 cc。
+// 返回的通道仅供展示，慢消费者可能丢事件；控制与结算请使用 RunObserved。
 func (a *Agent) Run(ctx context.Context, steer <-chan message.Message) <-chan AgentEvent {
 	ch := make(chan AgentEvent, 16)
 	go func() {
@@ -22,28 +23,48 @@ func (a *Agent) Run(ctx context.Context, steer <-chan message.Message) <-chan Ag
 			select {
 			case ch <- e:
 			case <-time.After(time.Second):
-				// 消费者 1s 没读才丢弃；持久化已在循环内完成，丢事件只影响渲染
+				// 消费者 1s 没读才丢弃；循环继续持久化，控制方不应依赖此通道。
 			}
 		}
-		emit(AgentEvent{Type: EventAgentStart})
-		emit(AgentEvent{Type: EventTurnStart})
-		a.loop(ctx, steer, emit)
-		emit(AgentEvent{Type: EventTurnEnd})
-		emit(AgentEvent{Type: EventAgentEnd})
+		a.RunObserved(ctx, steer, emit)
 	}()
 	return ch
 }
 
-func (a *Agent) loop(ctx context.Context, steer <-chan message.Message, emit func(AgentEvent)) {
+// RunObserved 同步运行一个 turn，按执行顺序可靠地调用 observe，不经过可丢弃的展示通道。
+// 预算、错误结算等控制逻辑应使用此入口；observe 必须及时返回，且不能等待本次运行结束。
+// 返回时所有工具、会话写入和回调均已结束。调用方须先记录用户消息。
+func (a *Agent) RunObserved(ctx context.Context, steer <-chan message.Message, observe func(AgentEvent)) {
+	a.runAudited(ctx, steer, observe)
+}
+
+func (a *Agent) loop(ctx context.Context, steer <-chan message.Message, emit func(AgentEvent)) (reason string) {
+	reason = "error"
 	var lastUsage model.Usage
 	retries := 0
 	completionRetries := 0
 	for step := 0; step < a.maxIterations; step++ {
+		if ctx.Err() != nil {
+			return "canceled"
+		}
+		if a.beforeStep != nil {
+			if err := a.beforeStep(ctx); err != nil {
+				emit(AgentEvent{Type: EventError, Err: err})
+				return
+			}
+		}
 		// steering：非阻塞取修正，记录为用户消息
 		if steer != nil {
 			select {
-			case sm := <-steer:
-				_ = a.cc.Record(sm, model.Usage{})
+			case sm, ok := <-steer:
+				if !ok {
+					steer = nil
+					break
+				}
+				if err := a.cc.Record(sm, model.Usage{}); err != nil {
+					emit(AgentEvent{Type: EventError, Err: err})
+					return
+				}
 			default:
 			}
 		}
@@ -59,6 +80,10 @@ func (a *Agent) loop(ctx context.Context, steer <-chan message.Message, emit fun
 		if err != nil {
 			emit(AgentEvent{Type: EventError, Err: err})
 			return
+		}
+		emit(AgentEvent{Type: EventModelRequest})
+		if ctx.Err() != nil {
+			return "canceled"
 		}
 		stream, err := a.model.Stream(ctx, msgs, a.tools.Specs())
 		if err != nil {
@@ -102,7 +127,7 @@ func (a *Agent) loop(ctx context.Context, steer <-chan message.Message, emit fun
 					continue
 				}
 			}
-			return // 无工具调用，turn 结束
+			return "completed" // 无工具调用，turn 结束
 		}
 		// 三档中断「跳过」：已取消则不启动工具（回放时悬空调用会被合成 interrupted 结果）
 		if ctx.Err() != nil {
@@ -126,12 +151,13 @@ func (a *Agent) loop(ctx context.Context, steer <-chan message.Message, emit fun
 		}
 		if terminated != "" {
 			emit(AgentEvent{Type: EventTerminated, Terminated: &TerminatedInfo{ToolName: terminated}})
-			return
+			return "terminated"
 		}
 	}
 	if a.completionCheck != nil {
 		emit(AgentEvent{Type: EventError, Err: fmt.Errorf("iteration limit reached before completion (%d steps)", a.maxIterations)})
 	}
+	return "iteration_limit"
 }
 
 // compactionReason 合成压缩事件 reason：触发点:方式（prune / summary），

@@ -19,7 +19,7 @@ type headlessApprover struct{}
 
 func (headlessApprover) Approve(context.Context, message.ToolCall) (bool, error) { return false, nil }
 func (headlessApprover) DenyReason() string {
-	return "tool denied: headless mode cannot prompt for approval (use --yolo only for non-dangerous calls, or run interactively)"
+	return "headless mode cannot prompt for approval; forced approval still applies in yolo mode. Use a scoped tool or run interactively for approval; do not repeat the same denied call"
 }
 
 // maxAutoContinue headless 下因后台作业结果自动续跑的上限：够把结果综合完，又不会在 CI 里无限循环。
@@ -28,6 +28,8 @@ const maxAutoContinue = 3
 // runHeadless 执行一个提示词，并在后台作业结算后自动续跑（最多 maxAutoContinue 轮）；返回退出码。
 func runHeadless(ctx context.Context, ag *agent.Agent, cmgr *agentctx.Manager, mgr *subagent.Manager,
 	prompt string, waitJobs time.Duration) int {
+	stopProgress := startHeadlessProgress(ctx, mgr, os.Stdout, 2*time.Second)
+	defer stopProgress()
 	code := runOnce(ctx, ag, cmgr, prompt)
 	for i := 0; i < maxAutoContinue; i++ {
 		jobs, mails := waitDeliveries(ctx, mgr, waitJobs)
@@ -98,7 +100,11 @@ func runOnce(ctx context.Context, ag *agent.Agent, cmgr *agentctx.Manager, promp
 func runRecordedOnce(ctx context.Context, ag *agent.Agent) int {
 	var final strings.Builder
 	code := 0
-	for ev := range ag.Run(ctx, nil) {
+	activity := &mainActivity{}
+	stop := activity.watch(ctx, os.Stdout, 10*time.Second)
+	defer stop()
+	ag.RunObserved(ctx, nil, func(ev agent.AgentEvent) {
+		activity.observe(ev)
 		switch ev.Type {
 		case agent.EventMessageUpdate:
 			if ev.Update.Text != "" {
@@ -130,7 +136,7 @@ func runRecordedOnce(ctx context.Context, ag *agent.Agent) int {
 			fmt.Fprintf(os.Stderr, "error: %v\n", ev.Err)
 			code = 1
 		}
-	}
+	})
 	return code
 }
 

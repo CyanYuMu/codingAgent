@@ -13,7 +13,7 @@
 | # | 决策点 | 结论 | 理由 |
 |---|---|---|---|
 | 1 | **强制 yield 怎么实现** | 阶梯最后一次重试把子 agent 的工具集换成 **只有 yield 的注册表**（不改 `model.Model` 接口、不用 provider 的 tool choice） | provider 无关、fake model 可测；eino 的 `WithAgenticToolChoice` 留作 M4 可选增强 |
-| 2 | **子 agent 始终必须 yield** | 是。turn 结束但没 terminal yield = idle，注入提醒 ≤3 次；阶梯耗尽后：有 outputSchema → `failed`，无 schema → `completed` 且 `Yielded=false`（结果标 `[未 yield]`） | 结构化产出是父 agent 验收的前提；无 schema 的探索型任务不该因为形式问题判失败 |
+| 2 | **子 agent 始终必须 yield** | 是。turn 结束但没 terminal yield = idle，注入提醒 ≤3 次；阶梯耗尽后：无论是否有 outputSchema 均为 `failed`，保留部分文本和产物供诊断或续跑 | terminal yield 是显式完成协议；纯文本或增量提交不能作为完成依据 |
 | 3 | **yield 的线格式** | 扁平三参数 `yield(data?, error?, section?)`，**不用顶层 `anyOf`** | 顶层组合子在 strict provider 上会让整个工具定义被拒（oh-my-pi 注释里的实测坑）；扁平参数对 qwen/deepseek/openai 都安全 |
 | 4 | **data 的 wire schema** | 由 outputSchema **递归去掉 `required`** 派生（保留 type/properties/items/enum/description），另加 `additionalProperties: true`；真正的校验（含 required）在工具内做 | 模型能看见目标形状，增量分段又不会在线格式上非法 |
 | 5 | **schema 校验失败处置** | 工具内反馈 issue 并要求重试，≤3 次；`permissive`（默认）第 4 次接受并打 warning，`strict` 判 `failed` | 对齐 oh-my-pi `MAX_SCHEMA_RETRIES=3` + schemaMode |
@@ -74,7 +74,7 @@
 3. **协作**：两个子 agent 通过 `hub send` 确认接口契约（A 定 signature，B 收到后按同一 signature 实现），产出一致。
 4. **schema 闭环**：outputSchema 要求 `{findings:[], verdict}` 时，第一次 yield 给错形状 → 工具返回 issue 与剩余重试次数 → 第二次通过；`strict` 模式下 3 次都错 → `failed` 且带 `schema_violation`。
 5. **追问已完成的子 agent**：`/agent Reviewer 再核对一下 X` → parked 的 Reviewer 被唤醒续跑，补充结论以 async-result 回到主会话。
-6. **idle 提醒**：脚本化 fake model 永不调 yield → 恰好 3 次提醒（最后一次工具集只有 yield），随后 `completed(未 yield)` 或 `failed`（有 schema）。
+6. **idle 提醒**：脚本化 fake model 永不调 yield → 恰好 3 次提醒（最后一次工具集只有 yield），随后统一 `failed`（不论是否有 schema）。
 7. **软预算**：`soft_budget: 4` 的 agent 不停调工具 → 第 4 次请求后收到收尾通知；第 6 次（1.5×）当前 turn 被停并强制 yield；仍不 yield 则 5 次请求后 `killed`。
 8. **frontmatter 发现**：在 `<project>/.codeclaw/agents/reviewer.md` 放一个同名定义 → `task` 工具描述里的 reviewer 换成项目版；写坏一个文件只告警，其它 agent 照常可用。
 9. **预检**：一行 prompt（<40 字符）派发被拒绝并说明要写 Target/Change/Acceptance；`explorer`（read_only）拿不到 write/bash；深度 2 的子 agent 没有 `task` 工具。
@@ -398,8 +398,7 @@ stateDiagram-v2
     pending --> running: acquire
     running --> idle: turn 结束但无 terminal yield
     idle --> running: 注入提醒（≤3）/ hub send 唤醒
-    idle --> completed: 阶梯耗尽且无 schema（Yielded=false）
-    idle --> failed: 阶梯耗尽且有 schema
+    idle --> failed: 阶梯耗尽且无 terminal yield（不论是否有 schema）
     running --> completed: terminal yield 且校验通过（或 permissive override）
     running --> failed: yield error / strict 校验失败 / 不可恢复错误 / panic
     running --> timeout: wall-clock 超时
@@ -415,7 +414,7 @@ stateDiagram-v2
     parked --> running: hub send / Revive()
 ```
 
-判定优先级（与 M1 一致，新增两条）：父 ctx 取消 → `aborted`；`runCtx` 超时 → `timeout`；硬杀 → `killed`；`runErr` → `failed`；yield error → `failed`（`Err = errors.New(yield.Error)`）；strict 且 schema 未过 → `failed`；terminal yield → `completed`；阶梯耗尽 → 有 schema `failed` / 无 schema `completed(Yielded=false)`。
+判定优先级（与 M1 一致，新增两条）：父 ctx 取消 → `aborted`；`runCtx` 超时 → `timeout`；硬杀 → `killed`；`runErr` → `failed`；yield error → `failed`（`Err = errors.New(yield.Error)`）；strict 且 schema 未过 → `failed`；terminal yield → `completed`；阶梯耗尽 → 统一 `failed`（保留部分产物）。
 
 ### 5.4 Result 扩展
 
@@ -428,7 +427,7 @@ type Result struct {
     Sections map[string][]any
     Text     string   // 最后一段 assistant 文本（partial）
     Err      error
-    Warning  string   // schema override / 未 yield 等
+    Warning  string   // schema override / 预算强制收尾等
     Usage    model.Usage
     Requests, ToolCalls, Reminders int
     BudgetStopped bool
@@ -640,7 +639,7 @@ subagent:
 | schema | `Validate` 正例反例（嵌套 object/array/enum/required）；`deriveDataSchema` 去 required 且保留结构；`sectionSchema` 命中数组 items |
 | yield 三态 | terminal 终止；incremental 不终止且累积；error yield → failed；data+error 同时 → 退回；空结果 3 次后 abort |
 | schema 重试 | 错 3 次后：permissive 接受 + warning；strict → failed(schema_violation)；第 2 次改对 → completed |
-| 阶梯 | 永不 yield → 恰好 3 次提醒；第 3 次的工具定义只有 yield；耗尽后无 schema=completed(未 yield) / 有 schema=failed |
+| 阶梯 | 永不 yield → 恰好 3 次提醒；第 3 次的工具定义只有 yield；耗尽后统一 failed，保留部分文本与产物 |
 | 预算 | soft=4：第 4 次请求后 steer 收到通知；第 6 次 turn 被停并进入强制 yield；强制后 yield → completed(BudgetStopped=true)；仍不 yield → killed |
 | 状态机 | timeout / 父取消 / panic recover / hub cancel 各自的状态与 partial 保留 |
 | bus | 多订阅者各收一份；缓冲满丢弃不阻塞；unsubscribe 后 Publish 不 panic |
@@ -666,3 +665,7 @@ subagent:
 ---
 
 依据：`my_code_agent` 现状代码（`internal/subagent/{manager,task,yield,approver,spec}.go`、`internal/agent/{loop,agent,event}.go`、`internal/tool/{tool,executor,registry}.go`、`internal/tui/tui.go`、`cmd/agent/{main,headless,config}.go`）；oh-my-pi `docs/{agent-hub,task-agent-discovery}.md`、`packages/coding-agent/src/tools/yield.ts`、`src/task/executor.ts`（`SOFT_REQUEST_BUDGET` / `BUDGET_STOP_GRACE_REQUESTS` / `MAX_YIELD_RETRIES` / yield ladder）、`src/prompts/tools/{hub,async-result,task-async-contract}.md`；Claude Code 的 Agent + `run_in_background` + SendMessage 行为面；einoclaw `docs/子Agent与后台任务.md`。
+
+### 控制事件与展示事件的边界（2026-11-01）
+
+子 agent driver 通过同步 `Agent.RunObserved` 回调先记录请求用量、工具进度、错误并判定预算，再向 UI 总线发布。UI 总线允许丢事件；预算与结算不依赖该总线或 `Agent.Run` 的可丢弃展示通道。不可恢复错误直接结算，不再进入 idle 提醒。

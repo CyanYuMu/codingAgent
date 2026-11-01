@@ -237,11 +237,21 @@ func (m *Manager) drive(parent context.Context, r *Run, rs *runtimeSet) Result {
 			reg, exec, iters = rs.yieldOnly, rs.yieldExec, forcedTurnIterations
 		}
 		sub := agent.New(def.Name, m.runModel, reg, exec, rs.cc)
+		sub.SetBeforeStep(func(context.Context) error { return m.recordPeerMail(r, rs.cc) })
 		sub.SetMaxIterations(iters)
-		// 必须把事件通道读到关闭：agent.Run 的 goroutine 在那之后才结束，否则下一 turn 会与它并发写同一 session
-		m.consume(r, def, sub.Run(turnCtx, r.steer))
+		// 控制逻辑同步记账，再向可丢弃的 UI 总线发布；不能依赖 Run 的展示通道。
+		// RunObserved 返回时本轮写入已全部结束，下一 turn 不会并发写同一 session。
+		sub.RunObserved(turnCtx, r.steer, func(ev agent.AgentEvent) {
+			m.observe(r, def, ev)
+		})
 		cancelTurn()
 
+		r.mu.Lock()
+		runErr := r.runErr
+		r.mu.Unlock()
+		if runErr != nil {
+			break // 不可恢复错误直接结算，不再提醒或重新调用模型。
+		}
 		if _, _, _, terminal := rs.ys.Snapshot(); terminal {
 			break
 		}
@@ -271,40 +281,38 @@ func (m *Manager) drive(parent context.Context, r *Run, rs *runtimeSet) Result {
 	return m.settle(parent, runCtx, r, rs)
 }
 
-// consume 消费一个 turn 的事件：记账、进度发布、预算判定。
-func (m *Manager) consume(r *Run, def AgentDef, events <-chan agent.AgentEvent) {
-	for ev := range events {
-		switch ev.Type {
-		case agent.EventMessageEnd:
-			r.mu.Lock()
-			r.requests++
-			r.usage = r.usage.Add(ev.Ended.Usage)
-			if ev.Ended.Usage.PromptTokens > 0 {
-				r.contextTokens = ev.Ended.Usage.PromptTokens
-			}
-			if txt := textOf(ev.Ended.Message); strings.TrimSpace(txt) != "" {
-				r.lastText = txt
-			}
-			r.mu.Unlock()
-			m.checkBudget(r, def)
-		case agent.EventToolStart:
-			r.mu.Lock()
-			r.toolCalls++
-			r.currentTool = ev.ToolStart.Name
-			r.mu.Unlock()
-		case agent.EventToolEnd:
-			r.mu.Lock()
-			r.currentTool = ""
-			r.mu.Unlock()
-		case agent.EventError:
-			r.mu.Lock()
-			r.runErr = ev.Err
-			r.mu.Unlock()
+// observe 在执行路径内可靠地记账和判定预算，UI 发布仅负责观测。
+func (m *Manager) observe(r *Run, def AgentDef, ev agent.AgentEvent) {
+	switch ev.Type {
+	case agent.EventMessageEnd:
+		r.mu.Lock()
+		r.requests++
+		r.usage = r.usage.Add(ev.Ended.Usage)
+		if ev.Ended.Usage.PromptTokens > 0 {
+			r.contextTokens = ev.Ended.Usage.PromptTokens
 		}
-		m.publishProgress(r)
-		if m.o.Bus != nil {
-			m.o.Bus.Publish(ChEvent, SubEvent{RunID: r.id, Name: r.name, Event: ev})
+		if txt := textOf(ev.Ended.Message); strings.TrimSpace(txt) != "" {
+			r.lastText = txt
 		}
+		r.mu.Unlock()
+		m.checkBudget(r, def)
+	case agent.EventToolStart:
+		r.mu.Lock()
+		r.toolCalls++
+		r.currentTool = ev.ToolStart.Name
+		r.mu.Unlock()
+	case agent.EventToolEnd:
+		r.mu.Lock()
+		r.currentTool = ""
+		r.mu.Unlock()
+	case agent.EventError:
+		r.mu.Lock()
+		r.runErr = ev.Err
+		r.mu.Unlock()
+	}
+	m.publishProgress(r)
+	if m.o.Bus != nil {
+		m.o.Bus.Publish(ChEvent, SubEvent{RunID: r.id, Name: r.name, Event: ev})
 	}
 }
 
@@ -371,8 +379,8 @@ func (m *Manager) settle(parent, runCtx context.Context, r *Run, rs *runtimeSet)
 		res.Status = StatusFailed
 		res.Err = fmt.Errorf("提醒 %d 次后仍未通过 yield 提交结构化产出", res.Reminders)
 	default:
-		res.Status = StatusCompleted
-		res.Warning = fmt.Sprintf("提醒 %d 次后仍未 yield，以下是最后一段输出（可能不是完整结论）", res.Reminders)
+		res.Status = StatusFailed
+		res.Err = fmt.Errorf("提醒 %d 次后仍未通过 yield 提交产出", res.Reminders)
 	}
 
 	if m.o.Notes != nil {

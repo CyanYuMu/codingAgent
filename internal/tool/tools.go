@@ -329,8 +329,10 @@ type bashTool struct {
 	bash *runtime.Bash
 }
 
-func (bashTool) Name() string        { return "bash" }
-func (bashTool) Description() string { return "执行 shell 命令" }
+func (bashTool) Name() string { return "bash" }
+func (bashTool) Description() string {
+	return "执行 shell 命令（默认 pipefail：管道中任一命令失败会反馈失败；预期的非零退出请显式处理）。仓库验收优先用 verify，避免用分号串联命令掩盖测试退出码。"
+}
 func (bashTool) Parameters() map[string]any {
 	return map[string]any{"command": map[string]any{"type": "string"}}
 }

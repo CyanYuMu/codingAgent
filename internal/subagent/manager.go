@@ -12,6 +12,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"einoclaw-build/internal/agent"
 	"einoclaw-build/internal/bus"
 	agentctx "einoclaw-build/internal/context"
 	"einoclaw-build/internal/memory"
@@ -231,7 +232,7 @@ func (m *Manager) Cancel(names []string) int {
 
 // Deliver 投递一条 hub 消息，返回给发送方的送达回执。三种去向：
 //   - Main：进主信箱，由 TUI/headless 取走并注入主会话
-//   - 运行中的子 agent：作为 steering 注入它的下一步
+//   - 运行中的子 agent：统一入箱，唤醒 wait，下一步持久化注入
 //   - 已结束的子 agent：唤醒续跑（后台作业），结果按 async-result 回投
 func (m *Manager) Deliver(from, to, text, replyTo string) (string, error) {
 	sessionID := m.CurrentSessionID()
@@ -263,10 +264,21 @@ func (m *Manager) Deliver(from, to, text, replyTo string) (string, error) {
 		}
 		return fmt.Sprintf("%s 已结束，已唤醒它续跑（作业 %s）；结果完成后会自动送到你这里", to, job.ID), nil
 	}
-	if !r.Steer(message.NewUserMessage(formatMail(mail))) {
-		return "", fmt.Errorf("%s 的消息队列已满，稍后再试", to)
-	}
+	// 与 hub wait 共用单一收件箱；下一步持久化进 sidecar 后才确认消费。
+	m.box(to).push(mail)
 	return "已送达 " + to, nil
+}
+
+func (m *Manager) recordPeerMail(r *Run, cc agent.Context) error {
+	_, sessionID := r.deliveryRoute()
+	box := m.box(r.Name())
+	for _, mail := range box.peek(sessionID) {
+		if err := cc.Record(message.NewUserMessage(formatMail(mail)), model.Usage{}); err != nil {
+			return fmt.Errorf("record peer message %s: %w", mail.DeliveryID, err)
+		}
+		box.ack([]string{mail.DeliveryID})
+	}
+	return nil
 }
 
 // Send 是 Deliver 的简化入口（TUI 的 /agent 用）。
@@ -474,6 +486,9 @@ func (m *Manager) buildRuntime(def AgentDef, name string, depth int, sess *sessi
 	}
 	ys := NewYieldState()
 	tools, yieldOnly := m.buildTools(def, name, depth, store, ys, schema, mode, sessionID)
+	if history, err := sess.Replay(); err == nil {
+		tools.RestoreReadState(history)
+	}
 
 	var approver tool.Approver = denyApprover{}
 	if m.o.Escalate && m.o.Approver != nil {

@@ -33,6 +33,7 @@ type Agent struct {
 	maxRetries      int           // 瞬时错误重试上限
 	retryBase       time.Duration // 退避基数：base·2^(n-1)
 	completionCheck func(context.Context) error
+	beforeStep      func(context.Context) error // 宿主在构建下一步输入前持久化外部消息
 }
 
 // New 创建一个 Agent。调用方负责在 Run 前把用户消息 Record 进 cc。
@@ -51,6 +52,10 @@ func (a *Agent) Registry() *tool.Registry { return a.tools }
 
 // SetCompletionCheck installs a host gate; it must not execute unapproved tools.
 func (a *Agent) SetCompletionCheck(check func(context.Context) error) { a.completionCheck = check }
+
+// SetBeforeStep installs a synchronous ingress hook. It must not invoke tools.
+// Return an error to stop the run without silently losing an incoming message.
+func (a *Agent) SetBeforeStep(hook func(context.Context) error) { a.beforeStep = hook }
 
 // SetMaxIterations 覆盖工具循环上限（子 agent 用，0 表示不覆盖）。
 func (a *Agent) SetMaxIterations(n int) {

@@ -16,6 +16,14 @@ func writeYAML(t *testing.T, dir, name, body string) string {
 	return p
 }
 
+func TestLegacyConfigFollowsExplicitWorkspace(t *testing.T) {
+	dir := t.TempDir()
+	paths := configPaths(dir)
+	if got := paths[len(paths)-1]; got != filepath.Join(dir, "config.yaml") {
+		t.Fatalf("legacy config = %s", got)
+	}
+}
+
 func TestMergeLaterLayerOverridesNonZero(t *testing.T) {
 	dir := t.TempDir()
 	user := writeYAML(t, dir, "user.yaml", "approval_mode: yolo\ndelegation_mode: always\nmodels:\n  - provider: deepseek\n    api_key: k\n    model_id: m\n")

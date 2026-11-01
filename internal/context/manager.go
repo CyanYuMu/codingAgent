@@ -2,6 +2,9 @@ package context
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -134,9 +137,23 @@ func (m *Manager) Build(ctx context.Context) ([]message.Message, error) {
 		return nil, err
 	}
 	prefix := m.systemPrefix(ctx)
+	encoded, err := json.Marshal(prefix)
+	if err != nil {
+		return nil, err
+	}
+	digest := sha256.Sum256(encoded)
+	if err := m.RecordAudit("model_input", map[string]any{"system_sha256": hex.EncodeToString(digest[:]), "system_messages": len(prefix), "history_messages": len(hist)}); err != nil {
+		return nil, err
+	}
 	out := make([]message.Message, 0, len(prefix)+len(hist))
 	out = append(out, prefix...)
 	return append(out, hist...), nil
+}
+
+// RecordAudit persists non-model metadata. System/credential bodies are never
+// duplicated into these events; model_input records a digest and counts only.
+func (m *Manager) RecordAudit(kind string, data any) error {
+	return m.Session().AppendCustom(kind, data)
 }
 
 // Record 记录一条消息到会话（assistant 消息带用量）。

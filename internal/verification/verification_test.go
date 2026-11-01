@@ -72,3 +72,13 @@ func TestMutatingAndCancelledChecksCannotPass(t *testing.T) {
 		t.Fatalf("cancelled verification: %+v %v", r, err)
 	}
 }
+
+func TestVerificationDoesNotMaskPipelineOrSequenceFailure(t *testing.T) {
+	for _, cmd := range []string{"printf FAIL; false | cat", "false; printf falsely-successful"} {
+		v, _ := setup(t, cmd)
+		r, err := v.Run(context.Background())
+		if err != nil || r.Passed || len(r.Checks) != 1 || r.Checks[0].Passed {
+			t.Fatalf("%s: %+v %v", cmd, r, err)
+		}
+	}
+}

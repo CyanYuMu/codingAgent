@@ -1,6 +1,10 @@
 package model
 
-import "strings"
+import (
+	"errors"
+	"io"
+	"strings"
+)
 
 // 溢出错误的特征串（各 provider 的措辞不同，按子串匹配）。
 var overflowMarkers = []string{
@@ -36,7 +40,15 @@ func IsRetryable(err error) bool {
 	if err == nil || IsContextOverflow(err) {
 		return false
 	}
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+		return true
+	}
 	s := strings.ToLower(err.Error())
+	// Some provider adapters flatten a wrapped url.Error into text. A bare
+	// transport EOF at request creation is still a transient disconnect.
+	if strings.TrimSpace(s) == "eof" || strings.HasSuffix(strings.TrimSpace(s), ": eof") {
+		return true
+	}
 	for _, m := range retryMarkers {
 		if strings.Contains(s, m) {
 			return true

@@ -127,6 +127,22 @@ go test ./...
 
 常用命令：`/new` 新会话 · `/sessions` 列会话 · `/resume <id>` 恢复 · `/agent <Name> <文本>` 唤醒 parked 子 agent · `ctrl+a` Agent Hub 面板 · `ctrl+e` steering 注入。
 
+TUI 启动页使用青蓝／紫色 CODECLAW 电路字标，窄窗口自动切换紧凑布局。顶部显示运行／审批状态，输入框随内容增高（最多 5 行）。
+
+| 操作 | 快捷键 |
+|---|---|
+| 发送 / 换行 | `Enter` / `Ctrl+J`（或终端支持的 `Shift+Enter`） |
+| 中断当前运行，保留界面 | `Esc`（Hub 打开时先关闭面板；审批中表示拒绝） |
+| 注入修正 / 退出 | `Ctrl+E` / `Ctrl+C` |
+| 翻阅历史 / 回到最新输出 | 滚轮、`PgUp`、`PgDown` / `Ctrl+End` |
+| 补全命令 / 查看帮助 | `Tab` / `/help` |
+| 查看长审批参数 | 审批中使用滚轮、`PgUp`、`PgDown` 或上下方向键 |
+
+翻阅历史时，新输出保持当前阅读位置；发送消息或按 `Ctrl+End` 恢复跟随。`Tab` 补全唯一匹配，多个匹配时显示候选命令（包含可由用户调用的 skills）。
+
+
+持久化 CLI 的并发与数据保护回归样例见 [examples/kvnote](examples/kvnote/README.md)，可运行 `go test -race ./examples/kvnote`。运行审计、消息唤醒和安全恢复设计见 [可靠性说明](docs/specs/2026-11-01-runtime-reliability.md)。
+
 ## 配置要点
 
 ```yaml
